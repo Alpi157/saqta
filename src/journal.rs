@@ -199,7 +199,7 @@ fn json_temp(p: &Path, value: &impl Serialize) -> io::Result<(PathBuf, File)> {
     file.write_all(&bytes)?;
     Ok((temp, file))
 }
-fn json_write(p: &Path, value: &impl Serialize) -> io::Result<()> {
+pub fn json_write(p: &Path, value: &impl Serialize) -> io::Result<()> {
     let (temp, _file) = json_temp(p, value)?;
     fs::rename(temp, p)
 }

@@ -1,4 +1,5 @@
 mod capture;
+mod codex;
 mod doctor;
 mod exec;
 mod filter;
@@ -23,7 +24,9 @@ fn main() {
         hook::run();
         return;
     }
-    let undo = std::env::args_os().nth(1).is_some_and(|s| s == "undo");
+    let undo = std::env::args_os()
+        .nth(1)
+        .is_some_and(|s| s == "undo" || s == "init" || s == "uninstall");
     if undo {
         sys::ignore_sigpipe();
     } else if std::env::args_os().nth(1).is_none_or(|s| s != "exec") {
@@ -134,8 +137,28 @@ fn main() {
                         .action(clap::ArgAction::SetTrue),
                 ),
         );
+    let cli = cli.subcommand(clap::Command::new("status"));
+    let cli = ["init", "uninstall"].into_iter().fold(cli, |cli, name| {
+        cli.subcommand(
+            clap::Command::new(name)
+                .arg(
+                    clap::Arg::new("codex")
+                        .long("codex")
+                        .required(true)
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    clap::Arg::new("project").value_parser(clap::value_parser!(std::path::PathBuf)),
+                ),
+        )
+    });
     let m = cli.get_matches();
     let result = match m.subcommand() {
+        Some(("status", _)) => codex::status(),
+        Some((name @ ("init" | "uninstall"), m)) => codex::configure(
+            m.get_one::<std::path::PathBuf>("project"),
+            name == "uninstall",
+        ),
         Some(("doctor", m)) => doctor::run(m.get_flag("json")),
         Some(("exec", m)) => exec::run(m),
         Some(("log", m)) => journal::log(
