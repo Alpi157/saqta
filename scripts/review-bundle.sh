@@ -48,7 +48,7 @@ check() {  # check <name> <command...>: run, keep full output, record PASS or FA
 check fmt cargo fmt --all -- --check
 check clippy cargo clippy --all-targets --locked -- -D warnings
 check test cargo test --locked
-if [[ "$milestone" == m2-capture* ]]; then check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture; fi
+if [[ "$milestone" == m2-capture* || "$milestone" == m2b-undo* ]]; then check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture; fi
 doctor_check() {
   local doctor_dir
   mkdir -p target/saqta-tests
