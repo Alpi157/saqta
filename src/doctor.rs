@@ -71,7 +71,11 @@ pub fn run(json_output: bool) -> Result<i32> {
         Err(e) => {
             add(
                 "functional probe",
-                "fail",
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    "warn"
+                } else {
+                    "fail"
+                },
                 if e.raw_os_error() == Some(libc::EBUSY) {
                     "already running under a seccomp supervisor".into()
                 } else {
@@ -176,6 +180,16 @@ pub fn run(json_output: bool) -> Result<i32> {
             format!("cannot create home: {e}; commands can still run"),
         ),
     }
+    if inside_sandbox() {
+        match capture_probe() {
+            Ok(()) => add("inside Codex sandbox", "ok", "capture works".into()),
+            Err(e) => add(
+                "inside Codex sandbox",
+                "fail",
+                format!("capture doesn't work: {e:#}"),
+            ),
+        }
+    }
     let failed = checks.iter().any(|c| c["status"] == "fail");
     let note = "sudo and other setuid programs don't work inside protected commands (no_new_privs)";
     if json_output {
@@ -195,6 +209,94 @@ pub fn run(json_output: bool) -> Result<i32> {
         println!("note: {note}");
     }
     Ok(if failed { 1 } else { 0 })
+}
+
+fn inside_sandbox() -> bool {
+    let pid1 = fs::read("/proc/1/comm").unwrap_or_default();
+    let home = std::env::var_os("SAQTA_HOME").map(std::path::PathBuf::from);
+    let separate = home.is_some_and(|p| {
+        let escaped = crate::journal::display(&p);
+        fs::read_to_string("/proc/self/mountinfo")
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.split_whitespace().nth(4) == Some(escaped.as_str()))
+    });
+    separate || (!pid1.is_empty() && !matches!(pid1.as_slice(), b"init\n" | b"systemd\n"))
+}
+fn capture_probe() -> Result<()> {
+    use anyhow::{Context, bail};
+    let base = std::env::current_dir()?.join(".saqta-doctor");
+    fs::create_dir_all(&base)?;
+    let dir = base.join(format!(
+        "probe-{}-{}",
+        std::process::id(),
+        crate::journal::now()
+    ));
+    fs::create_dir(&dir)?;
+    let result = (|| -> Result<()> {
+        let path = dir.join("sample");
+        let content = format!("saqta doctor {}", crate::journal::now()).into_bytes();
+        fs::write(&path, &content)?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .arg("exec")
+            .arg("--")
+            .arg("/bin/rm")
+            .arg(&path)
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "probe command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let home = paths::home()?;
+        // Read plain logs only. A wrapped doctor cannot write to SAQTA_HOME.
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(home.join("cmd"))? {
+            if let Some(id) = entry?
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        for id in ids.into_iter().take(5) {
+            let record = crate::journal::load(&home, id)?;
+            for effect in &record.effects {
+                if effect.path == crate::journal::display(&path)
+                    && effect.op == "delete"
+                    && effect.note.kept == "created earlier"
+                    && record
+                        .effects
+                        .iter()
+                        .any(|e| e.path == effect.path && e.op == "create")
+                    && !path.exists()
+                {
+                    // An outer supervisor correctly needs no pre-image for a file
+                    // created by this same command. Both real captures must exist.
+                    return Ok(());
+                }
+                if effect.path == crate::journal::display(&path) && !effect.quarantine.is_empty() {
+                    let kept = home
+                        .join("q/main")
+                        .join(record.meta.id.to_string())
+                        .join(&effect.quarantine);
+                    if fs::read(kept).context("read probe pre-image")? == content {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        bail!(
+            "no matching pre-image; {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })();
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir(&base);
+    result
 }
 
 // Linux linux/magic.h; libc does not expose the 9p magic.

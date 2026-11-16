@@ -10,6 +10,8 @@ pub fn home() -> io::Result<PathBuf> {
     };
     let p = std::path::absolute(p)?;
     // The creation mode applies only to new directories. Never chmod an existing home.
-    DirBuilder::new().recursive(true).mode(0o700).create(&p)?;
+    if !p.is_dir() {
+        DirBuilder::new().recursive(true).mode(0o700).create(&p)?;
+    }
     Ok(p)
 }
