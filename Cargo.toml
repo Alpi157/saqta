@@ -1,0 +1,11 @@
+[package]
+name = "saqta"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+libc = "0.2"
+clap = "4"
+anyhow = "1"
+serde_json = "1"
