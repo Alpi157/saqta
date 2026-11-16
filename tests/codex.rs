@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
+    os::unix::process::ExitStatusExt,
     path::Path,
     process::{Command, Output, Stdio},
 };
@@ -205,24 +206,82 @@ const PID_NAMESPACE: &[&str] = &[
     "--mount-proc",
 ];
 const MOUNT_NAMESPACE: &[&str] = &["--user", "--map-root-user", "--mount"];
+// util-linux 2.37.2 ignores INT and TERM before forking its namespace child.
+const OLD_UNSHARE_SIGNALS: &str = "import os,signal,sys; signal.signal(signal.SIGINT,signal.SIG_IGN); signal.signal(signal.SIGTERM,signal.SIG_IGN); os.execvp(sys.argv[1],sys.argv[1:])";
+// Establish the test's requested signal dispositions, then make W exactly PID 1.
+const DEFAULT_SIGNALS: &str = "import os,signal,sys; signal.signal(signal.SIGINT,signal.SIG_DFL); signal.signal(signal.SIGTERM,signal.SIG_DFL); os.execv(sys.argv[1],sys.argv[1:])";
 #[test]
 fn pid_one_namespace_finishes_journal() {
-    let s = Sandbox::new("pid-one");
-    if !namespace_available(&s, PID_NAMESPACE, "unprivileged PID namespace") {
+    let mut s = Sandbox::new("pid-one");
+    if !namespace_available(&s, PID_NAMESPACE, "unprivileged PID namespace") || !python(&s) {
         return;
     }
-    for (script, code) in [
-        ("printf foreground > file", 0),
-        ("printf background > file; sleep 10 >/dev/null 2>&1 &", 0),
-        ("printf signal > file; kill -TERM $$", 143),
-    ] {
-        let mut c = s.command("unshare");
-        c.args([
-            "--user",
-            "--map-root-user",
-            "--pid",
-            "--fork",
-            "--mount-proc",
+    for no_sync in [false, true] {
+        s.env.insert(
+            "SAQTA_NO_SYNC_WAKE".into(),
+            if no_sync { "1" } else { "0" }.into(),
+        );
+        for old_unshare in [false, true] {
+            for (script, code) in [
+                ("printf foreground > file", 0),
+                ("printf background > file; sleep 10 >/dev/null 2>&1 &", 0),
+                ("printf signal > file; kill -TERM $$", 143),
+            ] {
+                let mut c = if old_unshare {
+                    let mut c = s.command("python3");
+                    c.args(["-c", OLD_UNSHARE_SIGNALS, "unshare"]);
+                    c
+                } else {
+                    s.command("unshare")
+                };
+                c.args(PID_NAMESPACE).args([
+                    "python3",
+                    "-c",
+                    DEFAULT_SIGNALS,
+                    BIN,
+                    "exec",
+                    "--shell",
+                    "/bin/bash",
+                    "-c",
+                    script,
+                ]);
+                let o = run(c);
+                assert_eq!(
+                    o.status.code(),
+                    Some(code),
+                    "no_sync={no_sync}, old_unshare={old_unshare}, script={script}, stderr={}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                let id = last_id(&s);
+                let record = shown(&s, id);
+                assert_eq!(record["status"], "finished");
+                assert_eq!(record["exit_status"], code);
+                note(format!(
+                    "PID 1: no_sync={no_sync}, old_unshare={old_unshare}, exit={code}, journal finished"
+                ));
+            }
+        }
+    }
+}
+#[test]
+fn inherited_ignored_term_is_preserved_without_namespaces() {
+    let mut s = Sandbox::new("ignored-term");
+    if !python(&s) {
+        return;
+    }
+    for no_sync in [false, true] {
+        s.env.insert(
+            "SAQTA_NO_SYNC_WAKE".into(),
+            if no_sync { "1" } else { "0" }.into(),
+        );
+        let script = "printf before; kill -TERM $$; printf after";
+        let mut direct = s.command("python3");
+        direct.args(["-c", OLD_UNSHARE_SIGNALS, "/bin/bash", "-c", script]);
+        let a = run(direct);
+        let mut wrapped = s.command("python3");
+        wrapped.args([
+            "-c",
+            OLD_UNSHARE_SIGNALS,
             BIN,
             "exec",
             "--shell",
@@ -230,9 +289,35 @@ fn pid_one_namespace_finishes_journal() {
             "-c",
             script,
         ]);
-        assert_eq!(run(c).status.code(), Some(code));
-        let id = last_id(&s);
-        assert_eq!(shown(&s, id)["status"], "finished");
+        let b = run(wrapped);
+        assert_eq!(a.status.code(), Some(0));
+        assert_eq!(b.status.code(), Some(0));
+        assert_eq!((a.stdout, a.stderr), (b.stdout, b.stderr));
+        let record = shown(&s, last_id(&s));
+        assert_eq!(record["status"], "finished");
+        assert_eq!(record["exit_status"], 0);
+
+        // The namespace fixture's repair must work even on hosts that block namespaces.
+        let mut restored = s.command("python3");
+        restored.args([
+            "-c",
+            OLD_UNSHARE_SIGNALS,
+            "python3",
+            "-c",
+            DEFAULT_SIGNALS,
+            BIN,
+            "exec",
+            "--shell",
+            "/bin/bash",
+            "-c",
+            script,
+        ]);
+        let o = run(restored);
+        assert_eq!(o.status.signal(), Some(libc::SIGTERM));
+        assert_eq!(o.stdout, b"before");
+        let record = shown(&s, last_id(&s));
+        assert_eq!(record["status"], "finished");
+        assert_eq!(record["exit_status"], 143);
     }
 }
 #[test]
