@@ -187,40 +187,36 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 const RESOLVE_IN_ROOT: u64 = 0x10;
 pub fn open_target_parent(root: i32, path: &CStr) -> io::Result<OwnedFd> {
-    let how = OpenHow {
-        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-        mode: 0,
-        resolve: RESOLVE_IN_ROOT,
-    };
-    // SAFETY: path and how are live; root is the tracee's pinned root directory.
-    let fd = cv(unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root,
-            path.as_ptr(),
-            &how,
-            size_of::<OpenHow>(),
-        ) as i32
-    })?;
-    // SAFETY: a successful openat2 returns a fresh descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    open_parent(root, path, RESOLVE_IN_ROOT)
 }
 pub fn open_restore_parent(root: i32, path: &CStr) -> io::Result<OwnedFd> {
+    open_parent(root, path, RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH)
+}
+fn open_parent(root: i32, path: &CStr, resolve: u64) -> io::Result<OwnedFd> {
     let how = OpenHow {
         flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         mode: 0,
-        resolve: RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        resolve,
     };
-    // SAFETY: path and how are live; how's size matches the Linux open_how ABI.
-    let fd = cv(unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root,
-            path.as_ptr(),
-            &how,
-            size_of::<OpenHow>(),
-        ) as i32
-    })?;
+    let mut retries = 0;
+    let fd = loop {
+        // SAFETY: path and how are live; how's size matches the Linux open_how ABI.
+        match cv(unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root,
+                path.as_ptr(),
+                &how,
+                size_of::<OpenHow>(),
+            ) as i32
+        }) {
+            Ok(fd) => break fd,
+            // openat2 documents EAGAIN when concurrent renames prevent proving
+            // that '..' stays beneath the root. Retry with identical restrictions.
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && retries < 7 => retries += 1,
+            Err(e) => return Err(e),
+        }
+    };
     // SAFETY: the successful syscall returned a new owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }

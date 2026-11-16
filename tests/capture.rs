@@ -93,6 +93,427 @@ fn dirty_git_checkout_and_clean_restore_entire_repository() {
     assert_eq!(fs::read(p.join("unstaged")).unwrap(), b"committed\n");
     restore_exact(&s, &p, &before);
 }
+
+// The recovery map is the public way to locate displaced versions. Check bytes
+// there rather than accepting a success message as proof that both survived.
+fn displaced_for(s: &Sandbox, id: u64, path: &Path) -> Vec<PathBuf> {
+    let q = PathBuf::from(&s.env[OsStr::new("SAQTA_HOME")]).join("q/main");
+    let mut kept = Vec::new();
+    for entry in fs::read_dir(q).unwrap() {
+        let entry = entry.unwrap();
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&format!("undo-{id}-"))
+        {
+            continue;
+        }
+        let folder = entry.path();
+        let map = fs::read_to_string(folder.join("recovery.log")).unwrap();
+        for line in map.lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            // These fixtures use ASCII paths without percent escapes.
+            if fields.len() == 3
+                && fields[1].as_bytes() == bytes(path)
+                && fields[0].parse::<u64>().is_ok()
+            {
+                kept.push(folder.join(fields[0]));
+            }
+        }
+    }
+    kept
+}
+
+#[test]
+fn git_status_after_command_does_not_block_undo() {
+    use std::os::unix::fs::MetadataExt;
+    let (s, p) = capture_fixture("git_status_undo");
+    if s.command("git").arg("--version").output().is_err() {
+        note("SKIP: git is missing");
+        return;
+    }
+    let git = |args: &[&str]| {
+        let mut c = s.command("git");
+        c.current_dir(&p).arg("--no-optional-locks").args(args);
+        run(c)
+    };
+    assert_success(&git(&["init", "-q"]));
+    assert_success(&git(&["config", "user.email", "fixture@example.invalid"]));
+    assert_success(&git(&["config", "user.name", "Fixture"]));
+    fs::write(p.join("tracked"), b"committed\n").unwrap();
+    fs::write(p.join("staged"), b"committed\n").unwrap();
+    fs::write(p.join(".gitignore"), b".env\n").unwrap();
+    assert_success(&git(&["add", "."]));
+    assert_success(&git(&["commit", "-qm", "fixture"]));
+    fs::write(p.join("tracked"), b"dirty working bytes\0\xff").unwrap();
+    fs::write(p.join("staged"), b"staged bytes\n").unwrap();
+    assert_success(&git(&["add", "staged"]));
+    fs::write(p.join("staged"), b"unstaged bytes\n").unwrap();
+    fs::write(p.join("untracked"), b"untracked\n").unwrap();
+    fs::write(p.join(".env"), b"decoy secret\n").unwrap();
+    let before = tree_hash(&p);
+    let original_index = fs::read(p.join(".git/index")).unwrap();
+    assert_success(&script(
+        &s,
+        &p,
+        "git --no-optional-locks checkout -- . && git --no-optional-locks clean -fdx",
+    ));
+    let index_inode = fs::metadata(p.join(".git/index")).unwrap().ino();
+    // This deliberately enables index.lock only in this isolated fixture to
+    // reproduce a user's routine Git refresh outside Saqta.
+    let mut status = s.command("git");
+    status
+        .current_dir(&p)
+        .env("GIT_OPTIONAL_LOCKS", "1")
+        .args(["status", "--porcelain"]);
+    assert_success(&run(status));
+    assert_ne!(
+        fs::metadata(p.join(".git/index")).unwrap().ino(),
+        index_inode,
+        "git status must actually rewrite the index for this regression"
+    );
+    let refreshed = fs::read(p.join(".git/index")).unwrap();
+    let id = last_id(&s);
+    let result = undo(&s, id);
+    assert_success(&result);
+    let output = String::from_utf8_lossy(&result.stdout);
+    assert_eq!(output.matches("kept the newer git index in ").count(), 1);
+    assert!(output.contains("(git rewrites it on commands like git status)"));
+    assert_tree(&before, &p);
+    assert_eq!(fs::read(p.join(".git/index")).unwrap(), original_index);
+    assert!(
+        displaced_for(&s, id, &p.join(".git/index"))
+            .iter()
+            .any(|path| fs::read(path).unwrap() == refreshed)
+    );
+}
+
+#[test]
+fn user_edit_after_command_refuses_then_force_keeps_both() {
+    let (s, p) = capture_fixture("force_keeps_both");
+    let path = p.join("file");
+    fs::write(&path, b"original\0\xff").unwrap();
+    fs::write(p.join("other"), b"also restore").unwrap();
+    let before = tree_hash(&p);
+    assert_success(&script(&s, &p, "echo command > file; rm other"));
+    let id = last_id(&s);
+    let newer = b"new user work\0\xfe\n";
+    fs::write(&path, newer).unwrap();
+    let changed = tree_hash(&p);
+    let result = undo(&s, id);
+    assert!(!result.status.success());
+    let message = String::from_utf8_lossy(&result.stderr);
+    assert!(message.contains(&path.display().to_string()));
+    assert!(message.contains("refusing to overwrite newer work"));
+    assert!(message.contains(&format!("Run `saqta undo {id} --force` to restore anyway.")));
+    assert!(message.contains("Every newer version is moved to "));
+    assert!(message.trim_end().ends_with("first, so nothing is lost."));
+    let suggested_folder = message
+        .split("Every newer version is moved to ")
+        .nth(1)
+        .unwrap()
+        .split(" first,")
+        .next()
+        .unwrap();
+    assert_tree(&changed, &p);
+    assert!(displaced_for(&s, id, &path).is_empty());
+    let result = run(s.saqta(&["undo", &id.to_string(), "--force"]));
+    assert_success(&result);
+    assert!(String::from_utf8_lossy(&result.stdout).contains("displaced versions kept in "));
+    assert!(String::from_utf8_lossy(&result.stdout).contains(suggested_folder));
+    assert_tree(&before, &p);
+    assert!(
+        displaced_for(&s, id, &path)
+            .iter()
+            .any(|path| fs::read(path).unwrap() == newer)
+    );
+}
+
+#[test]
+fn worktree_git_index_conflict_keeps_newer_version() {
+    let (s, p) = capture_fixture("worktree_index");
+    fs::create_dir_all(p.join(".git/worktrees/topic")).unwrap();
+    let index = p.join(".git/worktrees/topic/index");
+    fs::write(&index, b"original index").unwrap();
+    let before = tree_hash(&p);
+    assert_success(&script(&s, &p, "rm .git/worktrees/topic/index"));
+    let id = last_id(&s);
+    fs::write(&index, b"newer index").unwrap();
+    let result = undo(&s, id);
+    assert_success(&result);
+    assert_tree(&before, &p);
+    assert!(
+        displaced_for(&s, id, &index)
+            .iter()
+            .any(|p| fs::read(p).unwrap() == b"newer index")
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout)
+            .matches("kept the newer git index in ")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn force_keeps_recreated_directory_and_its_new_children() {
+    let (s, p) = capture_fixture("force_directory");
+    sample(&p);
+    let before = tree_hash(&p);
+    assert_success(&script(&s, &p, "rm -rf tree"));
+    let id = last_id(&s);
+    fs::create_dir(p.join("tree")).unwrap();
+    fs::write(p.join("tree/new"), b"new user work").unwrap();
+    symlink("../outside", p.join("tree/link")).unwrap();
+    let result = run(s.saqta(&["undo", &id.to_string(), "--force"]));
+    assert_success(&result);
+    assert_tree(&before, &p);
+    let saved = displaced_for(&s, id, &p.join("tree"));
+    assert_eq!(saved.len(), 1);
+    assert_eq!(fs::read(saved[0].join("new")).unwrap(), b"new user work");
+    assert_eq!(
+        fs::read_link(saved[0].join("link")).unwrap(),
+        Path::new("../outside")
+    );
+}
+
+#[test]
+fn force_keeps_edited_rename_input_before_moving_it_back() {
+    let (s, p) = capture_fixture("force_rename");
+    sample(&p);
+    assert_success(&script(&s, &p, "mv tree moved"));
+    let id = last_id(&s);
+    // Adding an immediate child changes the moved directory's recorded state.
+    fs::write(p.join("moved/new"), b"new user work").unwrap();
+    let result = run(s.saqta(&["undo", &id.to_string(), "--force"]));
+    assert_success(&result);
+    assert!(!p.join("moved").exists());
+    assert_eq!(fs::read(p.join("tree/new")).unwrap(), b"new user work");
+    let saved = displaced_for(&s, id, &p.join("moved"));
+    assert_eq!(saved.len(), 1);
+    assert_eq!(fs::read(saved[0].join("new")).unwrap(), b"new user work");
+    assert_eq!(
+        fs::read(saved[0].join("nested/file")).unwrap(),
+        b"original\0bytes\xff\n"
+    );
+}
+
+#[test]
+fn dry_run_reports_conflicts_without_changes() {
+    let (s, p) = capture_fixture("dry_run_conflicts");
+    for i in 0..12 {
+        fs::write(p.join(format!("file{i:02}")), b"original").unwrap();
+    }
+    assert_success(&script(&s, &p, "rm file*"));
+    let id = last_id(&s);
+    for i in 0..12 {
+        fs::write(p.join(format!("file{i:02}")), b"new user bytes").unwrap();
+    }
+    let before = tree_hash(&p);
+    for flags in [&["--dry-run"][..], &["--dry-run", "--force"][..]] {
+        let mut command = s.saqta(&["undo", &id.to_string()]);
+        let result = run({
+            command.args(flags);
+            command
+        });
+        assert_success(&result);
+        let output = String::from_utf8_lossy(&result.stdout);
+        assert!(output.contains("+2 more"));
+        assert!(output.contains("with --force, would keep newer entries"));
+        assert!(output.contains("would restore deleted files: 12"));
+        assert_tree(&before, &p);
+        assert!(displaced_for(&s, id, &p.join("file00")).is_empty());
+    }
+    let refused = undo(&s, id);
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("file09"));
+    assert!(!message.contains("file10"));
+    assert!(message.contains("+2 more"));
+    assert_tree(&before, &p);
+}
+
+#[test]
+fn undo_survives_closed_stdout() {
+    for verbose in [false, true] {
+        let (s, p) = capture_fixture("undo_closed_stdout");
+        for program in ["bash", "head"] {
+            if s.command(program).arg("--version").output().is_err() {
+                note(format!("SKIP: {program} is missing for the pipefail test"));
+                return;
+            }
+        }
+        // Verbose output exceeds pipe capacity. The first line is flushed
+        // before restoration starts, so head closes while work remains.
+        for i in 0..500 {
+            fs::write(
+                p.join(format!("file{i:04}-{}", "x".repeat(80))),
+                format!("original {i}\0\n"),
+            )
+            .unwrap();
+        }
+        let before = tree_hash(&p);
+        assert_success(&script(&s, &p, "rm file*"));
+        let id = last_id(&s);
+        let text = if verbose {
+            "saqta undo \"$1\" --verbose | head -1"
+        } else {
+            "saqta undo \"$1\" | head -1"
+        };
+        let mut command = s.command("bash");
+        command.args(["-o", "pipefail", "-c", text, "pipe-test", &id.to_string()]);
+        let started = Instant::now();
+        let result = run(command);
+        note(format!(
+            "500-file undo with closed stdout, verbose={verbose}: {:?}",
+            started.elapsed()
+        ));
+        // pipefail checks Saqta's status too, rather than only head's status.
+        assert_success(&result);
+        assert_eq!(String::from_utf8_lossy(&result.stdout).lines().count(), 1);
+        assert!(
+            result.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_tree(&before, &p);
+        assert_eq!(shown(&s, id)["undone"], true);
+        let home = PathBuf::from(&s.env[OsStr::new("SAQTA_HOME")]);
+        assert!(!home.join(format!("cmd/{id}/undo-in-progress")).exists());
+    }
+}
+
+#[test]
+fn undo_prints_summary_by_default_and_everything_with_verbose() {
+    for verbose in [false, true] {
+        let (s, p) = capture_fixture("undo_summary");
+        fs::create_dir(p.join("removed")).unwrap();
+        for i in 0..15 {
+            fs::write(
+                p.join(format!("removed/file{i:02}")),
+                format!("original {i}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(p.join("modified"), b"original\0\xff").unwrap();
+        fs::write(p.join("rename-from"), b"rename original").unwrap();
+        let before = tree_hash(&p);
+        assert_success(&script(
+            &s,
+            &p,
+            "rm -rf removed; printf changed > modified; : > created; mv rename-from rename-to",
+        ));
+        let id = last_id(&s);
+        let record = shown(&s, id);
+        let effects = record["effects"].as_array().unwrap();
+        assert_eq!(effects.len(), 19);
+        let after = tree_hash(&p);
+        for dry_run in [true, false] {
+            let mut command = s.saqta(&["undo", &id.to_string()]);
+            if verbose {
+                command.arg("--verbose");
+            }
+            if dry_run {
+                command.arg("--dry-run");
+            }
+            let result = run(command);
+            assert_success(&result);
+            assert!(result.stderr.is_empty());
+            let text = String::from_utf8(result.stdout).unwrap();
+            let labels = if dry_run {
+                [
+                    "would restore deleted files: 15",
+                    "would restore modified files: 1",
+                    "would remove created paths: 1",
+                    "would recreate directories: 1",
+                    "would reverse renames: 1",
+                ]
+            } else {
+                [
+                    "restored deleted files: 15",
+                    "restored modified files: 1",
+                    "removed created paths: 1",
+                    "recreated directories: 1",
+                    "reversed renames: 1",
+                ]
+            };
+            for label in labels {
+                assert!(text.lines().any(|line| line == label), "{text}");
+            }
+            assert!(text.contains("elapsed: "));
+            let examples = text
+                .lines()
+                .filter(|line| line.starts_with("example path: "))
+                .count();
+            assert_eq!(examples, if verbose { 0 } else { 10 }, "{text}");
+            for effect in effects {
+                let line = format!(
+                    "{} {} {}",
+                    if dry_run { "would undo" } else { "restored" },
+                    effect["op"].as_str().unwrap(),
+                    effect["path"].as_str().unwrap()
+                );
+                assert_eq!(
+                    text.lines().any(|printed| printed == line),
+                    verbose,
+                    "{line}\n{text}"
+                );
+            }
+            if dry_run {
+                assert!(text.contains("would keep displaced versions in "));
+                assert_tree(&after, &p);
+                assert_eq!(shown(&s, id)["undone"], false);
+            } else {
+                assert!(text.contains("displaced versions kept in "));
+                assert_tree(&before, &p);
+                assert_eq!(shown(&s, id)["undone"], true);
+            }
+        }
+    }
+}
+
+#[test]
+fn undo_reports_every_unprotected_item_in_summary() {
+    let (mut s, p) = capture_fixture("undo_unprotected_summary");
+    s.env.insert("SAQTA_MAX_COPY".into(), "1".into());
+    for i in 0..12 {
+        fs::write(p.join(format!("file{i:02}")), b"larger than copy limit").unwrap();
+    }
+    assert_success(&script(
+        &s,
+        &p,
+        "for path in file*; do printf replaced > \"$path\"; done",
+    ));
+    let id = last_id(&s);
+    let after = tree_hash(&p);
+    for dry_run in [true, false] {
+        let mut command = s.saqta(&["undo", &id.to_string()]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let result = run(command);
+        assert_success(&result);
+        let text = String::from_utf8(result.stdout).unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("could not restore "))
+                .count(),
+            12,
+            "{text}"
+        );
+        for i in 0..12 {
+            assert!(
+                text.contains(&format!(
+                    "could not restore {}: not protected:",
+                    p.join(format!("file{i:02}")).display()
+                )),
+                "{text}"
+            );
+        }
+        assert_tree(&after, &p);
+    }
+}
+
 #[test]
 fn sed_rename_over_fifty_files() {
     let (s, p) = capture_fixture("sed_fifty");
@@ -566,6 +987,13 @@ fn symlink_parent_substitution_refuses_undo() {
     let o = undo(&s, id);
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("changed after"));
+    assert_tree(&before, &p);
+    let forced = run(s.saqta(&["undo", &id.to_string(), "--force"]));
+    assert!(!forced.status.success());
+    assert!(
+        String::from_utf8_lossy(&forced.stderr)
+            .contains("cannot bypass directory traversal checks")
+    );
     assert_tree(&before, &p);
 }
 #[test]
