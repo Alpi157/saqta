@@ -123,7 +123,17 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
         Ok(h)
     }) {
         Ok(h) => h,
-        Err(_) => {
+        Err(err) => {
+            if err.raw_os_error() == Some(libc::EROFS) {
+                let location = env::var_os("SAQTA_HOME").unwrap_or_else(|| "Saqta home".into());
+                let mut message = b"[saqta] not protected here: ".to_vec();
+                message.extend_from_slice(location.as_bytes());
+                message.extend_from_slice(
+                    b" is read-only (run `saqta init --codex` in this project)\n",
+                );
+                sys::write(2, &message);
+                p.execute();
+            }
             if crate::sys::probe(&crate::filter::program())
                 .is_err_and(|e| e.raw_os_error() == Some(libc::EBUSY))
             {

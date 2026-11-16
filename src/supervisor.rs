@@ -255,7 +255,8 @@ fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut
                     b"supervisor: background tasks remain\n"
                 },
             );
-            if hup {
+            if hup || sys::parent_pid() == 1 {
+                // PID 1 exiting destroys this namespace, including S.
                 capture.finish(status);
             } else {
                 capture.snapshot();

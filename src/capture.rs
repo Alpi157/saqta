@@ -653,7 +653,13 @@ impl Capture {
                 }
                 Ok(())
             }
-            Err(_) => self.keep_copy(p, e, false),
+            Err(err) => {
+                self.keep_copy(p, e, false)?;
+                if err.raw_os_error() == Some(libc::EXDEV) {
+                    e.note.kept = "copied (cross-mount)".into();
+                }
+                Ok(())
+            }
         }
     }
     fn copy_to(&self, p: &Resolved, q: &str) -> io::Result<()> {
