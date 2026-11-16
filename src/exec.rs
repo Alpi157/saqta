@@ -93,6 +93,14 @@ pub fn fallback(p: &Prepared, strict: bool, reason: &[u8]) -> ! {
     }
     p.execute()
 }
+/// Require both the marker and an active filter, as for nested exec.
+pub fn is_supervised() -> bool {
+    env::var_os("SAQTA_SUPERVISED").is_some()
+        && std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_default()
+            .lines()
+            .any(|s| s.split_whitespace().eq(["Seccomp:", "2"]))
+}
 pub fn run(m: &clap::ArgMatches) -> Result<i32> {
     let args = if let Some(c) = m.get_one::<OsString>("command") {
         vec![
@@ -108,12 +116,7 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
             .unwrap_or_default()
     };
     let p = Prepared::new(args.clone())?;
-    if env::var_os("SAQTA_SUPERVISED").is_some()
-        && std::fs::read_to_string("/proc/self/status")
-            .unwrap_or_default()
-            .lines()
-            .any(|s| s.split_whitespace().eq(["Seccomp:", "2"]))
-    {
+    if is_supervised() {
         p.execute();
     }
     let strict = env::var_os("SAQTA_STRICT").is_some_and(|s| s == "1");

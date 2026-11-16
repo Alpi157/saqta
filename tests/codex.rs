@@ -5,7 +5,7 @@ use std::{
     fs,
     io::Write,
     path::Path,
-    process::{Output, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 fn hook(s: &Sandbox, payload: &Value, off: bool) -> Output {
@@ -172,6 +172,38 @@ fn init_refuses_non_repo_and_saqta() {
             .success()
     );
 }
+// Probe only namespace setup. A protected-command failure must never turn into SKIP.
+fn probe_namespace(mut command: Command, flags: &[&str]) -> Result<(), String> {
+    let output = command.args(flags).arg("/bin/true").output();
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "{}: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("unshare is missing: {e}"))
+        }
+        Err(e) => panic!("could not start namespace probe: {e}"),
+    }
+}
+fn namespace_available(s: &Sandbox, flags: &[&str], capability: &str) -> bool {
+    match probe_namespace(s.command("unshare"), flags) {
+        Ok(()) => true,
+        Err(reason) => {
+            note(format!("SKIP: {capability} unavailable: {reason}"));
+            false
+        }
+    }
+}
+const PID_NAMESPACE: &[&str] = &[
+    "--user",
+    "--map-root-user",
+    "--pid",
+    "--fork",
+    "--mount-proc",
+];
 #[test]
 fn pid_one_namespace_finishes_journal() {
     let s = Sandbox::new("pid-one");
@@ -363,7 +395,8 @@ fn doctor_inside_wrapped_command_checks_actual_capture() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["name"] == "inside Codex sandbox" && c["advice"] == "capture works")
+            .any(|c| c["name"] == "inside Codex sandbox" && c["advice"] == "capture works"),
+        "doctor omitted the actual capture check: {v}"
     );
     assert!(!s.dir.join(".saqta-doctor").exists());
 }
@@ -452,4 +485,33 @@ fn uninstall_keeps_new_foreign_hook_bytes() {
     assert_eq!(v["hooks"]["PreToolUse"], json!([foreign]));
     let fragment = serde_json::to_string_pretty(&foreign).unwrap();
     assert!(fragment.contains("preserve"));
+}
+
+#[test]
+fn doctor_inside_systemd_named_namespace_checks_actual_capture() {
+    let s = Sandbox::new("doctor-systemd");
+    if !namespace_available(
+        &s,
+        PID_NAMESPACE,
+        "PID namespace for systemd doctor reproduction",
+    ) || !python(&s)
+    {
+        return;
+    }
+    // Model the VM's /proc/1/comm without altering the host's process name.
+    let setup = "import ctypes,subprocess,sys; l=ctypes.CDLL(None,use_errno=True); assert l.prctl(15,ctypes.c_char_p(b'systemd'),0,0,0)==0; sys.exit(subprocess.run([sys.argv[1],'exec','--',sys.argv[1],'doctor','--json']).returncode)";
+    let mut c = s.command("unshare");
+    c.args(PID_NAMESPACE).args(["python3", "-c", setup, BIN]);
+    let o = run(c);
+    assert_success(&o);
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "inside Codex sandbox" && c["advice"] == "capture works"),
+        "doctor skipped capture on systemd host: {v}"
+    );
+    assert!(!s.dir.join(".saqta-doctor").exists());
 }

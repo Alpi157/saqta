@@ -221,7 +221,12 @@ fn inside_sandbox() -> bool {
             .lines()
             .any(|l| l.split_whitespace().nth(4) == Some(escaped.as_str()))
     });
-    separate || (!pid1.is_empty() && !matches!(pid1.as_slice(), b"init\n" | b"systemd\n"))
+    needs_capture_probe(crate::exec::is_supervised(), &pid1, separate)
+}
+fn needs_capture_probe(supervised: bool, pid1: &[u8], separate_home_mount: bool) -> bool {
+    supervised
+        || separate_home_mount
+        || (!pid1.is_empty() && !matches!(pid1, b"init\n" | b"systemd\n"))
 }
 fn capture_probe() -> Result<()> {
     use anyhow::{Context, bail};
@@ -316,6 +321,16 @@ fn filesystem_name(kind: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{V9FS_MAGIC, filesystem_name};
+    #[test]
+    fn supervised_doctor_probes_on_a_systemd_host() {
+        // GitHub-hosted VMs use systemd as PID 1 and do not bind SAQTA_HOME.
+        for pid1 in [b"systemd\n".as_slice(), b"init\n", b""] {
+            assert!(super::needs_capture_probe(true, pid1, false));
+            assert!(!super::needs_capture_probe(false, pid1, false));
+        }
+        assert!(super::needs_capture_probe(false, b"systemd\n", true));
+        assert!(super::needs_capture_probe(false, b"saqta\n", false));
+    }
     #[test]
     fn filesystem_names_and_unknown_magic() {
         for (magic, name) in [
