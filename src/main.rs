@@ -1,6 +1,7 @@
-// These dependencies are wired into the following module commits.
-use libc as _;
 use serde_json as _;
+
+#[allow(dead_code)]
+mod sys;
 
 fn main() {
     let cli = clap::Command::new("saqta")
