@@ -1,10 +1,8 @@
-use serde_json as _;
-
+mod doctor;
 mod exec;
 mod filter;
 mod paths;
 mod supervisor;
-#[allow(dead_code)]
 mod sys;
 
 fn main() {
@@ -53,7 +51,7 @@ fn main() {
         );
     let m = cli.get_matches();
     let result = match m.subcommand() {
-        Some(("doctor", _)) => Err(anyhow::anyhow!("doctor is not implemented yet")),
+        Some(("doctor", m)) => doctor::run(m.get_flag("json")),
         Some(("exec", m)) => exec::run(m),
         _ => Ok(125),
     };
