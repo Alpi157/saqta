@@ -204,24 +204,11 @@ const PID_NAMESPACE: &[&str] = &[
     "--fork",
     "--mount-proc",
 ];
+const MOUNT_NAMESPACE: &[&str] = &["--user", "--map-root-user", "--mount"];
 #[test]
 fn pid_one_namespace_finishes_journal() {
     let s = Sandbox::new("pid-one");
-    let mut probe = s.command("unshare");
-    probe.args([
-        "--user",
-        "--map-root-user",
-        "--pid",
-        "--fork",
-        "--mount-proc",
-        "true",
-    ]);
-    let o = run(probe);
-    if !o.status.success() {
-        note(format!(
-            "SKIP: unprivileged PID namespace unavailable: {}",
-            String::from_utf8_lossy(&o.stderr)
-        ));
+    if !namespace_available(&s, PID_NAMESPACE, "unprivileged PID namespace") {
         return;
     }
     for (script, code) in [
@@ -249,16 +236,29 @@ fn pid_one_namespace_finishes_journal() {
     }
 }
 #[test]
+fn namespace_probe_reports_uid_map_denial() {
+    let s = Sandbox::new("namespace-denied");
+    // Exercise Ubuntu 24.04's failure text on every machine, without creating a namespace.
+    let mut denied = s.command("/bin/sh");
+    denied.args(["-c", "printf '%s\\n' 'unshare: write failed /proc/self/uid_map: Operation not permitted' >&2; exit 1", "sh"]);
+    let reason = probe_namespace(denied, MOUNT_NAMESPACE).unwrap_err();
+    assert!(reason.contains("exit status: 1"), "{reason}");
+    assert!(
+        reason.contains("write failed /proc/self/uid_map: Operation not permitted"),
+        "{reason}"
+    );
+    let mut unexpected = s.command("/bin/sh");
+    unexpected.args(["-c", "exit 77", "sh"]);
+    assert!(
+        probe_namespace(unexpected, MOUNT_NAMESPACE)
+            .unwrap_err()
+            .contains("77")
+    );
+}
+#[test]
 fn separate_bind_mount_five_thousand_deletes_restore() {
     let (s, p) = capture_fixture("bind-delete");
-    let mut probe = s.command("unshare");
-    probe.args(["--user", "--map-root-user", "--mount", "true"]);
-    let o = run(probe);
-    if !o.status.success() {
-        note(format!(
-            "SKIP: unprivileged mount namespace unavailable: {}",
-            String::from_utf8_lossy(&o.stderr)
-        ));
+    if !namespace_available(&s, MOUNT_NAMESPACE, "unprivileged mount namespace") {
         return;
     }
     let data = p.join("files");
@@ -314,18 +314,29 @@ fn separate_bind_mount_five_thousand_deletes_restore() {
 fn readonly_home_has_one_line_and_runs_command() {
     let s = Sandbox::new("readonly-home");
     let home = std::path::PathBuf::from(&s.env[std::ffi::OsStr::new("SAQTA_HOME")]);
+    if !namespace_available(
+        &s,
+        MOUNT_NAMESPACE,
+        "unprivileged mount namespace for read-only bind",
+    ) {
+        return;
+    }
     let mut c = s.command("unshare");
     c.args(["--user","--map-root-user","--mount","/bin/bash","-c",r#"mount --bind "$1" "$1" && mount -o remount,bind,ro "$1" || exit 77; "$2" exec -- /bin/sh -c 'exit 7'"#,"sh"]).arg(&home).arg(BIN);
     let o = run(c);
-    if o.status.code() == Some(77) || String::from_utf8_lossy(&o.stderr).contains("unshare failed")
-    {
+    if o.status.code() == Some(77) {
         note(format!(
             "SKIP: read-only bind mount unavailable: {}",
             String::from_utf8_lossy(&o.stderr)
         ));
         return;
     }
-    assert_eq!(o.status.code(), Some(7));
+    assert_eq!(
+        o.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&o.stderr),
         format!(
