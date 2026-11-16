@@ -12,7 +12,9 @@ saqta undo 1 --dry-run
 saqta undo 1
 ```
 
-Undo runs in your own terminal. It refuses while a command's background tree is running, after a previous undo, or when a touched path has changed since the command. It preserves displaced current files under the undo quarantine with a recovery map. `log` and `show` also accept `--json`.
+Undo runs in your own terminal. It refuses while a command's background tree is running, after a previous undo, or when a touched path has changed since the command. `saqta undo 1 --force` restores despite newer paths and keeps displaced entries under the printed undo folder with a recovery map. `--dry-run` lists conflicts and the proposed changes. A refreshed `.git/index` or `.git/worktrees/*/index` never blocks undo: Saqta keeps the newer index and restores the matching pre-command index. Existing M2 journals need no migration. `log` shows local time and duration; `log` and `show` also accept `--json` with raw nanoseconds.
+
+Undo prints category counts, elapsed time, up to ten example paths, every unprotected item and the location of displaced versions. `--verbose` lists every effect, including with `--dry-run`. Closing stdout, for example with `saqta undo 1 | head -1`, silences further output and lets the full restore finish.
 
 The default store is `$XDG_DATA_HOME/saqta` or `$HOME/.local/share/saqta`. `SAQTA_HOME` overrides it. `SAQTA_MAX_COPY` limits individual copies in bytes, defaulting to 256 MiB. Hard-linked captures have no size limit. Failed captures are reported in the journal as not protected. Kernel and volatile filesystems are skipped. Pure append opens without creation or truncation bypass capture.
 
