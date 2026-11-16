@@ -342,6 +342,71 @@ impl Capture {
             linked: BTreeMap::new(),
         })
     }
+    /// Capture exactly one patch-named entry. Patches replace entries, so retain copies.
+    pub fn patch_path(&mut self, path: &Path, update: bool) -> io::Result<()> {
+        let mut ancestor = path.parent().unwrap_or(Path::new("/"));
+        let mut tail = path.file_name().map(PathBuf::from).unwrap_or_default();
+        let normalized = loop {
+            match fs::canonicalize(ancestor) {
+                Ok(base) => break crate::hook::normalize(&base.join(&tail)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    if let Some(name) = ancestor.file_name() {
+                        tail = PathBuf::from(name).join(tail);
+                    }
+                    if let Some(parent) = ancestor.parent() {
+                        ancestor = parent;
+                    } else {
+                        break crate::hook::normalize(path);
+                    }
+                }
+                Err(_) => break crate::hook::normalize(path),
+            }
+        };
+        let resolved = resolve(sys::pid() as u32, libc::AT_FDCWD, path.as_os_str(), false);
+        let denied = self.denied_path(&normalized, Kind::Delete, false)
+            || resolved
+                .as_ref()
+                .is_ok_and(|p| self.denied(p, Kind::Delete));
+        let mut e = Effect {
+            seq: 0,
+            time_ns: journal::now(),
+            pid: sys::pid() as u32,
+            op: "create".into(),
+            path: journal::display(&normalized),
+            path2: String::new(),
+            quarantine: String::new(),
+            flags: 0,
+            note: Detail::default(),
+        };
+        if denied {
+            e.op = "not protected".into();
+            e.note.message = "deny floor: patch path".into();
+        } else {
+            match resolved {
+                Ok(p) => {
+                    e.path = journal::display(&p.path);
+                    e.note.before = p.state();
+                    if p.stat.is_some() {
+                        e.op = if update { "modify" } else { "delete" }.into();
+                        if let Err(err) = self.keep_copy(&p, &mut e, false) {
+                            e.op = "not protected".into();
+                            e.note.message = err.to_string();
+                        }
+                    }
+                }
+                Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(err) => {
+                    e.op = "not protected".into();
+                    e.note.message = err.to_string();
+                }
+            }
+        }
+        if e.op == "not protected" {
+            crate::hook::log(&e.note.message);
+        }
+        self.journal.append(e)?;
+        Ok(())
+    }
     pub fn handle(&mut self, listener: i32, n: &sys::Notification) {
         self.complete(n.pid);
         let observed: Vec<_> = self
@@ -425,7 +490,9 @@ impl Capture {
         {
             return true;
         }
-        path == self.user_home.join(".codex/config.toml")
+        (matches!(name, Some("config.toml" | "hooks.json"))
+            && path.parent().and_then(Path::file_name) == Some(OsStr::new(".codex")))
+            || path == self.user_home.join(".codex/config.toml")
             || path == self.user_home.join(".codex/hooks.json")
     }
     fn effect(

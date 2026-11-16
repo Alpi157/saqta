@@ -660,6 +660,35 @@ pub fn probe(bpf: &[libc::sock_filter]) -> io::Result<bool> {
     }
 }
 
+/// Read the login shell through the reentrant passwd interface.
+pub fn login_shell() -> std::path::PathBuf {
+    let mut buf = vec![0u8; 65536];
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    // SAFETY: all output storage is writable and remains alive while pw_shell is read.
+    unsafe {
+        if libc::getpwuid_r(
+            libc::getuid(),
+            entry.as_mut_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        ) == 0
+            && !result.is_null()
+        {
+            let shell = std::ffi::CStr::from_ptr((*result).pw_shell).to_bytes();
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::path::Path::new(std::ffi::OsStr::from_bytes(shell));
+            if matches!(
+                path.file_name().and_then(|s| s.to_str()),
+                Some("bash" | "zsh")
+            ) {
+                return path.to_path_buf();
+            }
+        }
+    }
+    "/bin/bash".into()
+}
 pub fn parent_pid() -> i32 {
     // SAFETY: getppid has no arguments or memory requirements.
     unsafe { libc::getppid() }
