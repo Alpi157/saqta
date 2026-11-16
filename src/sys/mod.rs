@@ -660,6 +660,11 @@ pub fn probe(bpf: &[libc::sock_filter]) -> io::Result<bool> {
     }
 }
 
+pub fn parent_pid() -> i32 {
+    // SAFETY: getppid has no arguments or memory requirements.
+    unsafe { libc::getppid() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
