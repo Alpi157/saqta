@@ -48,7 +48,21 @@ check() {  # check <name> <command...>: run, keep full output, record PASS or FA
 check fmt cargo fmt --all -- --check
 check clippy cargo clippy --all-targets --locked -- -D warnings
 check test cargo test --locked
-if cargo run -q --locked -- doctor --help >/dev/null 2>&1; then check doctor cargo run -q --locked -- doctor; fi
+if [[ "$milestone" == m2-capture* ]]; then check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture; fi
+doctor_check() {
+  local doctor_dir
+  mkdir -p target/saqta-tests
+  doctor_dir=$(mktemp -d "$root/target/saqta-tests/review-doctor.XXXXXX") || return 1
+  env HOME="$doctor_dir/HOME" XDG_DATA_HOME="$doctor_dir/data" \
+    XDG_CONFIG_HOME="$doctor_dir/config" XDG_STATE_HOME="$doctor_dir/state" \
+    SAQTA_HOME="$doctor_dir/saqta" \
+    CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+    cargo run -q --locked -- doctor
+  local rc=$?
+  rm -rf -- "$doctor_dir"
+  return "$rc"
+}
+if cargo run -q --locked -- doctor --help >/dev/null 2>&1; then check doctor doctor_check; fi
 if command -v cargo-deny >/dev/null 2>&1; then check deny cargo deny --offline check; fi
 
 # Source and history. Include the current working tree so uncommitted work is reviewable.
