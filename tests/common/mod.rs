@@ -260,3 +260,105 @@ pub fn bytes(path: &Path) -> &[u8] {
 pub fn note(message: impl std::fmt::Display) {
     writeln!(std::io::stdout(), "{message}").unwrap();
 }
+
+// Per-entry tree digests make mismatches name the exact byte path. Directory
+// allocation sizes and mtimes are not part of the user-visible file snapshot.
+pub fn tree_hash(root: &Path) -> BTreeMap<Vec<u8>, u64> {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+        os::unix::fs::MetadataExt,
+    };
+    fn visit(root: &Path, p: &Path, out: &mut BTreeMap<Vec<u8>, u64>) {
+        let m = fs::symlink_metadata(p).unwrap();
+        let mut hash = DefaultHasher::new();
+        m.mode().hash(&mut hash);
+        if !m.is_dir() {
+            m.size().hash(&mut hash);
+            m.mtime().hash(&mut hash);
+            m.mtime_nsec().hash(&mut hash);
+        }
+        if m.is_file() {
+            let mut file = fs::File::open(p).unwrap();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = file.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                hash.write(&buf[..n]);
+            }
+        } else if m.file_type().is_symlink() {
+            fs::read_link(p)
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .hash(&mut hash);
+        }
+        out.insert(
+            p.strip_prefix(root)
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            hash.finish(),
+        );
+        if m.is_dir() {
+            for e in fs::read_dir(p).unwrap() {
+                visit(root, &e.unwrap().path(), out);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+pub fn assert_tree(before: &BTreeMap<Vec<u8>, u64>, root: &Path) {
+    let after = tree_hash(root);
+    let different: Vec<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|p| before.get(*p) != after.get(*p))
+        .map(|p| OsStr::from_bytes(p).to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(*before, after, "different paths: {different:?}");
+}
+pub fn capture_fixture(name: &str) -> (Sandbox, PathBuf) {
+    let s = Sandbox::new(name);
+    let project = PathBuf::from(&s.env[OsStr::new("HOME")]).join("project");
+    fs::create_dir(&project).unwrap();
+    (s, project)
+}
+pub fn script(s: &Sandbox, project: &Path, text: &str) -> Output {
+    let mut c = s.exec(&["-c", text]);
+    c.current_dir(project);
+    run(c)
+}
+pub fn last_id(s: &Sandbox) -> u64 {
+    let o = run(s.saqta(&["log", "--json"]));
+    assert_success(&o);
+    let log: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    log[0]["id"].as_u64().unwrap()
+}
+pub fn undo(s: &Sandbox, id: u64) -> Output {
+    run(s.saqta(&["undo", &id.to_string()]))
+}
+pub fn shown(s: &Sandbox, id: u64) -> serde_json::Value {
+    let o = run(s.saqta(&["show", &id.to_string(), "--json"]));
+    assert_success(&o);
+    serde_json::from_slice(&o.stdout).unwrap()
+}
+pub fn python(s: &Sandbox) -> bool {
+    if s.command("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        true
+    } else {
+        note("SKIP: python3 is missing for raw syscall test");
+        false
+    }
+}
