@@ -1,87 +1,104 @@
-# M2b undo R1: report
+# M3 Codex: report
 
 ## What works now (5 lines max)
-
-Undo finishes through closed stdout in both default and verbose modes.
-Default output summarizes counts, elapsed time, ten examples at most and all unprotected items.
---verbose lists every effect; dry-run uses the same summary and verbose options.
-Git index retention, --force, deterministic undo folders and M2 journal compatibility remain intact.
-Log, show and doctor keep default SIGPIPE. No dependencies were added.
+Project-local Codex hooks wrap Bash and capture apply_patch pre-images.
+Init, uninstall and status manage project settings and installation ownership.
+PID 1 writes complete journals before returning foreground or detached status.
+Separate bind mounts use bounded copies; doctor exercises real capture.
+Changes are on m3-codex and remain uncommitted for review.
 
 ## How it works
+`src/hook.rs` reads one JSON event. Bash commands become one shell argument to
+an absolute Saqta executable. `quote` escapes single quotes without interpreting
+the command. The login shell comes from `sys::login_shell` and getpwuid_r.
+Errors go to hook.log. The hook returns zero and leaves the original call alone.
 
-`src/restore.rs::run` checks all post-states and retained pre-images before restoring. It separates exact `.git/index` and `.git/worktrees/*/index` paths from other conflicts. The exception does not apply to index.lock, ordinary files named index or deeper paths. Unsafe parent traversal remains a refusal even with --force.
+The patch hook parses the four pathname headers, resolves relative names from
+payload cwd, and calls `Capture::patch_path` in `src/capture.rs`. It uses M2's
+bounded copy and effect writer, without a supervisor or SQLite in the hook.
+Updates use modify effects; removals and overwritten destinations use delete
+effects; absent paths use create effects. A hook-reference sidecar holds session
+and tool-use IDs. PostToolUse finds that sidecar, reopens the journal with
+`Journal::reopen`, and writes post-state and end. Missing posts stay incomplete.
+Deny-floor paths get a not-protected effect and a hook log reason.
 
-`Undo::save_current` moves a displaced entry into the private undo folder after syncing its recovery map. It prints the required explanation when retaining a newer Git index. Forced undo uses this same path. A conflicting recreated directory is retained before its original directory is recreated. `keep_move_input` retains conflicting rename/exchange inputs and builds independent working copies using directory fds, so reversing the move cannot consume the retained version. Existing shared-inode restoration keeps independent backups.
+`src/supervisor.rs` detects W as namespace PID 1 through S's parent PID. It calls
+`Capture::finish` before sending even detached status. The existing
+`sys::reraise` fallback handles PID 1 ignoring a default-action signal. A real
+namespace test checks TERM becomes exit 143. `keep_link` labels EXDEV copy
+fallbacks explicitly and uses the existing copy-size limit.
 
-The folder is `q/main/undo-<id>-<command start_ns>`. Its deterministic name makes the path offered by a refusal or dry-run match the subsequent forced undo. Creation is exclusive; an existing folder is never reused. Completion prints the folder containing displaced versions and recovery.log. Partial failure leaves the existing in-progress marker and recovery instructions.
+`src/codex.rs` manages project hooks, writable roots, excludes and the project
+list. toml_edit is the only new runtime dependency, explicitly approved in the
+milestone. proptest is a permitted test dependency, with only its std feature.
+No deny.toml exception was needed. Installation receipts store original and
+installed bytes. A flock serializes installations. Registry writes use atomic
+rename. Uninstall validates every proposed change before applying any, restores
+original bytes for unchanged files, and removes proved owned spans or hook
+entries from subsequently edited files. It refuses ambiguous changes.
 
-`src/main.rs` explicitly ignores SIGPIPE for undo, leaves exec handling intact and restores default SIGPIPE for log, show and doctor. Internal supervisors keep their existing socket signal handling. `sys::local_time` calls localtime_r. Log reads end_ns from the existing end record, displays duration in seconds and leaves raw start_ns, end_ns and duration_ns in JSON. Human commands are shortened to the terminal width or COLUMNS, defaulting to 120 columns; narrow tables omit secondary columns. Show displays effect/retention counts and uses a dash for absent retained versions. The journal files and SQLite schema are unchanged.
-
-`src/output.rs::Progress` writes and flushes each line without propagating output errors. After the first write or flush error it disables further output. Undo uses this helper for progress, Git index retention messages, dry-run, summaries and recovery locations. Its fatal error message also uses the helper on stderr. A closed stdout cannot panic, change undo status or stop restoration.
-
-`restore::Summary` counts successfully reversed effects in five categories: deleted files, modified files (including size-only effects), created paths, directories and renames (including exchanges). Failed syscall intents are excluded. It retains only ten distinct example paths. `--verbose` replaces examples with every effect while keeping the final counts and elapsed time. Dry-run reports the corresponding planned counts without restoring. Every recorded unprotected item is reported before restoration, so a later filesystem failure cannot hide the remaining diagnostics. Filesystem errors still stop undo with recovery instructions; output errors do not.
-
-An unrestricted packaging run also exposed transient EAGAIN in the unchanged renamed-cwd test during parallel capture. The documented openat2 retry case matches its `..` paths. `src/sys/files.rs::open_parent` now retries only EAGAIN, at most eight attempts, using identical root, path and restrictions. Capture and restore share this thin wrapper. Exhaustion still returns an error; no checks were relaxed.
+Doctor creates and deletes a small sample in `.saqta-doctor/`. It checks the
+pre-image bytes when it launches a new supervisor. When already supervised, the
+sample is new to that command, so it checks the actual creation and deletion
+capture records instead. It reads plain journals without modifying the store.
 
 ## Acceptance checklist
-
 | # | Item | Result | Proven by (test name or command) |
 |---|---|---|---|
-| 1 | Git status refresh does not block undo; original tree and index restored, refreshed index retained | PASS | `git_status_after_command_does_not_block_undo` |
-| 1a | Worktree indexes get the same rule; exact component boundaries only | PASS | `worktree_git_index_conflict_keeps_newer_version`, `restore::tests::git_index_exception_has_exact_component_boundaries` |
-| 1b | Existing M2 journal works with the fixed binary without migration | PASS | `python3 target/m2b-legacy-check.py`; baseline binary built from main e21a2b0; details below |
-| 2 | Other conflicts refuse before changes, list at most ten paths, explain --force and retention | PASS | `user_edit_after_command_refuses_then_force_keeps_both`, `dry_run_reports_conflicts_without_changes` |
-| 2a | Force restores saved bytes and retains the user's newer bytes with a printed recovery location | PASS | `user_edit_after_command_refuses_then_force_keeps_both` |
-| 2b | Dry-run and dry-run --force report conflicts without restoring | PASS | `dry_run_reports_conflicts_without_changes`, existing dry-run test |
-| 2c | Forced directory/rename conflicts retain newer entries; parent symlinks remain forbidden | PASS | `force_keeps_recreated_directory_and_its_new_children`, `force_keeps_edited_rename_input_before_moving_it_back`, `symlink_parent_substitution_refuses_undo` |
-| 3 | Piped log/show terminate without panic text, including show piped to head -20 | PASS | `piped_log_and_show_exit_quietly`; existing `sigpipe_is_default_in_command` |
-| 4 | Local time, aligned columns, duration, shortened single-line commands and raw JSON nanoseconds | PASS | `log_shows_local_time_and_json_keeps_nanoseconds`, including 120- and 80-column output |
-| 4a | Show has one-line counts and dashes when no version was kept | PASS | `piped_log_and_show_exit_quietly` checks a creation-only record |
-| 5 | All existing tests still pass; forced proc-memory run included | PASS | `cargo test --locked`: 98 tests; `SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture`: 56 tests |
-| 6 | Report, 2 to 4 commit plan, ADR under 300 words and review bundle | PASS | This report; ADR 0006 is 297 words; `scripts/review-bundle.sh m2b-undo-r1` |
-| R1.1 | Closed stdout cannot interrupt undo or cause an output panic; default and verbose producer exit 0 | PASS | `undo_survives_closed_stdout`: 500 files per mode, Bash pipefail, byte-exact trees, undone marker and no in-progress marker |
-| R1.2 | All output errors stop further writing without escaping, including flush errors | PASS | `output::tests::output_stops_after_write_or_flush_failure`: BrokenPipe and Other errors, both write and flush failures |
-| R1.3 | Five counts, elapsed time, ten examples at most, retained location and full verbose effects in real/dry-run modes | PASS | `undo_prints_summary_by_default_and_everything_with_verbose`: 19 effects across all five categories |
-| R1.4 | Every unprotected item is printed beyond the ten-example limit | PASS | `undo_reports_every_unprotected_item_in_summary`: 12 unprotected files, both dry-run and real undo |
-
-
-The review-bundle script includes the forced proc-memory suite for m2b-undo and m2b-undo-r1. Formatting, clippy with warnings denied, the full test suite, the forced suite, doctor and dependency checks are recorded in the bundle. Conditional environment skips are printed rather than hidden. The initial M2b sandbox bundle passed the functional checks but cargo-deny could not lock its read-only advisory cache. An offline audit with cache access passed advisories, bans, licenses and sources. An unrestricted packaging run then exposed the transient parent-resolution failure described above. That bounded-retry fix remains in R1. The R1 bundle includes the full and forced suites after the output changes. No dependencies changed. The existing dry-run conflict test now checks the exact planned deletion count instead of the old per-effect output text; all conflict and no-change assertions remain.
+| 1 | Bash rewrite, exact output envelope, fail-open, off switch, repeated wrapping | PASS | hook_rewrite_and_fail_open; raw_garbage_hook_is_silent_and_successful |
+| 2 | Patch add, update, delete, move, session matching and undo | PASS | patch_add_update_delete_move_and_undo |
+| 3 | Patch deny floor and missing post become incomplete | PASS | patch_deny_floor_and_missing_post |
+| 4 | PID 1 foreground, background and signal journals complete | PASS, real namespaces available | pid_one_namespace_finishes_journal |
+| 5 | Cross-mount copies and 5,000-file byte-for-byte restore | PASS, real bind mount available | separate_bind_mount_five_thousand_deletes_restore |
+| 6 | EROFS fails open with the specified single line | PASS | readonly_home_has_one_line_and_runs_command |
+| 7 | Init merges hooks and commented config, backups, idempotence, exact uninstall | PASS | init_uninstall_exact_roundtrip_and_idempotence |
+| 8 | Default git root, tracked warnings, excludes, broken output | PASS | default_project_tracked_settings_and_closed_output |
+| 9 | Refuse outside git and in Saqta itself | PASS | init_refuses_non_repo_and_saqta |
+| 10 | Preserve later settings and hooks at uninstall | PASS for proved ownership; ambiguous edits refuse | uninstall_preserves_later_comments; uninstall_keeps_new_foreign_hook_bytes |
+| 11 | Status checks current hooks, writable root and recent commands | PASS | init_uninstall_exact_roundtrip_and_idempotence |
+| 12 | Doctor checks actual capture when already supervised | PASS | doctor_inside_wrapped_command_checks_actual_capture; existing doctor tests |
+| 13 | Quoting with arbitrary NUL-free bytes, Unicode, heredocs and shell syntax | PASS, 128 generated cases | hook::tests::quoting_matches_bash; real_hook_shell_cases |
+| 14 | All existing tests and forced proc-memory fallback | PASS | cargo test --locked; SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture |
+| 15 | Formatting, clippy, dependency policy, docs and bundle | See bundle checks | scripts/review-bundle.sh m3-codex |
 
 ## Decisions
-
-[ADR 0006: undo safety](../docs/decisions/0006-undo-safety.md) specifies the Git index exception, force retention, stable exclusive undo folders and compatibility with M2 journals. R1 adds the SIGPIPE/output policy for undo and future release/gc commands, summaries and verbose mode. It is 297 words. [ADR 0007: bounded parent resolution retry](../docs/decisions/0007-bounded-parent-resolution-retry.md) records the incidental EAGAIN fix found by review checks. No prior capture or journal decisions were reversed.
+[0008 Codex integration](../docs/decisions/0008-codex-integration.md): local hooks,
+namespace finish ordering and settings ownership. Prior decisions remain in place.
 
 ## Measurements
-
-Machine: x86_64 WSL2, Ubuntu 24.04.1 LTS, kernel `6.18.58.1-microsoft-standard-WSL2`, rustc/cargo 1.100.0.
-
-In the initial M2b compatibility check, a binary built from unchanged main e21a2b0 captured a dirty Git fixture with 1,000 untracked files, staged and unstaged changes, and an ignored .env. Git status outside Saqta replaced the index. The baseline binary refused undo with exit 125 and changed no project entries. The fixed binary restored the full tree with exit 0. File bytes, modes and mtimes matched, including .git/index. The refreshed index matched its retained copy byte for byte. Meta, child, end, effects.log, outcomes.log and post.log were byte-identical before and after fixed undo.
-
-That baseline capture took 0.210 s; fixed undo took 0.138 s. These are single debug-build sanity measurements, not performance targets. The driver and evidence remain in `target/m2b-legacy-check.py` and `target/m2b-legacy-check.json`; the disposable fixture remains under target/saqta-tests for inspection. The log/show pipe regression uses 600 effects and 999 command records so output exceeds pipe capacity.
-
-R1 adds two 500-file restore runs through head -1. In the full debug suite, default undo finished in 77.2 ms and verbose undo in 64.3 ms, with byte-exact trees and producer exit 0 in both cases. The initial progress line is flushed before restoration; verbose output would exceed pipe capacity. These are sanity measurements, not performance limits. The summary fixture checks 15 deleted files, one modified file, one creation, one removed directory and one rename. A separate fixture verifies that all 12 unprotected paths are reported, rather than stopping at ten.
+WSL2 x86_64, kernel 6.18.58.1-microsoft-standard-WSL2, Rust and Cargo 1.100.0.
+Bash hook wall time: 1.76 to 3.70 ms across local test runs.
+5,000 cross-mount deletes plus undo: 1.60 to 2.27 seconds across local runs.
+Existing 200-sample exec check: direct median 3.40 ms, p95 3.85 ms;
+Saqta median 6.67 ms, p95 8.79 ms. These are development-build measurements.
+Final check logs and their measurements are in the review bundle.
 
 ## Known gaps and risks
-
-- The user's actual 65,899-file journal is not available here. Compatibility was checked against a real journal produced by main, with its original journal files left unchanged.
-- --force authorizes restoring despite newer work. Inspect the printed folder and recovery.log to retrieve displaced versions. Missing pre-images, unsafe parent traversal, live trees and damaged journals remain refusals.
-- Rename-only effects do not contain an independent snapshot of their source bytes. Forced undo reverses the move with the available source and retains an independent version. Size-only growth effects restore the recorded length using the available prefix. Force cannot reconstruct bytes that M2 never captured.
-- Existing M2 limits remain: post-state checks compare metadata rather than content hashes, concurrent external writers can race undo, and hard-link topology may change. Nonempty directories and special entries cannot be copied across filesystems by the displaced-entry fallback; a failure retains the available versions and requires manual recovery.
-- Power-loss durability is not promised. Power loss, filesystem errors or explicit process termination can still require reviewing the in-progress marker and recovery map. Closing stdout no longer interrupts undo; further output is discarded after its first error.
-- This sandbox cannot mount tmpfs or bind the Unix socket fixture. The M1 bare i386 probe is terminated by the outer sandbox. Those existing scenarios print explicit SKIP reasons; FIFO and the remaining checks run.
+- Real Codex trust-screen interaction was not automated. The integration uses
+  the payload and trust behavior measured by the user.
+- An ambiguous later settings edit can require manual review before uninstall.
+  Saqta leaves the settings and installation receipt intact in this case.
+- JSON hook formatting can change at init. Unchanged settings round-trip exactly.
+  Symlinked project Codex settings are refused to avoid changing another location.
+- Patch capture only records named entries. It does not remove unnamed parent
+  directories made by a patch applier. Nonregular files that cannot be copied
+  and files above SAQTA_MAX_COPY are logged as not protected.
+- M2's races with unrelated writers and lack of power-loss durability remain.
+- Codex stopping or quitting can leave commands alive. Inside PID namespaces,
+  background jobs die with the namespace. The hooks cannot change either fact.
+- Existing environment skips remain explicit: Unix socket creation in this
+  sandbox, the old direct tmpfs mount fixture, and bare i386 execution. The new
+  user-namespace PID and bind-mount tests ran successfully rather than skipping.
 
 ## Questions for review
-
-- Check the narrow Git path exception and the ordering of recovery-map writes, retention and replacement.
-- Review retention of forced rename/exchange inputs and the exclusive deterministic undo folder.
-- Check that every undo output path uses Progress, including fatal stderr, and that summary examples never suppress unprotected diagnostics.
-- Validate the fixed binary against the user's preserved command 1 journal before using it for the real rescue.
+Review hook payload compatibility against the measured Codex 0.169 behavior.
+Review the installation ownership receipt and conservative refusal behavior.
+No commits will be made until the user says review passed.
 
 ## Commit plan
-
-Review passed. The user authorized the three commits below. Each staged tree was validated before committing, with shared CLI/test files split between the first two commits. Nothing was pushed.
-
-1. `restore: preserve both versions and finish undo after output failure`: undo and --force/--verbose CLI, Progress helper, undo SIGPIPE policy, summaries, retention/output tests, bounded parent-resolution retries and ADRs 0006/0007.
-2. `cli: format command history and handle read-only broken pipes`: local-time and terminal-width wrappers, read-only SIGPIPE setup, log/show formatting and output regression tests.
-3. `docs: report M2b R1 validation and package the forced memory run`: README, review-bundle update and this report.
+1. `exec: finish journals before PID 1 returns and label cross-mount copies`
+2. `codex: capture Bash and patch hooks with M2 journals`
+3. `codex: manage project hooks, settings and protection status`
+4. `doctor: verify real capture inside the Codex sandbox`
+5. `codex: add integration tests, documentation and review checks`
+Each commit will build and pass its relevant tests. This is a proposed plan only.
