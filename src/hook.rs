@@ -169,3 +169,44 @@ fn handle() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::{
+        ffi::OsString,
+        os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+        process::Command,
+    };
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn quoting_matches_bash(bytes in prop::collection::vec(1u8..=255, 0..512), variant in 0usize..4) {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/saqta-tests").join(format!("quoting-{}-{}", std::process::id(), journal::now()));
+            fs::create_dir_all(&dir).unwrap();
+            let fake = dir.join("fake saqta ' binary");
+            fs::write(&fake, b"#!/bin/sh\nshift\nshift\nshell=$1\nshift\nexec \"$shell\" \"$@\"\n").unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut original = b"printf '%s' ".to_vec(); original.extend(quote(&bytes));
+            original.extend_from_slice(match variant {
+                0 => b"; printf 'stderr\\n' >&2; exit 9",
+                1 => b"\ncat <<'EOF_SAQTA'\n$hello `literal` \\ ' \" & ; unicode: \xce\xbb\nEOF_SAQTA\n",
+                2 => b"; x='a$b'; printf '%s' \"$x\"; true & wait",
+                _ => b"; printf '%s' 'quote '\\'' backslash \\'; exit 0",
+            });
+            let mut wrapped = quote(fake.as_os_str().as_bytes());
+            wrapped.extend_from_slice(b" exec --shell /bin/bash -c "); wrapped.extend(quote(&original));
+            let run = |script| {
+                let mut c = Command::new("/bin/bash");
+                c.args(["-lc"]).arg(OsString::from_vec(script)).current_dir(&dir);
+                for key in ["HOME","XDG_DATA_HOME","XDG_CONFIG_HOME","XDG_STATE_HOME","SAQTA_HOME"] { c.env(key,dir.join(key)); }
+                c.output().unwrap()
+            };
+            let a=run(original); let b=run(wrapped);
+            fs::remove_dir_all(&dir).unwrap();
+            prop_assert_eq!((a.stdout,a.stderr,a.status.code()),(b.stdout,b.stderr,b.status.code()));
+        }
+    }
+}
