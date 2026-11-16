@@ -133,8 +133,39 @@ pub fn disposition(sig: i32, handler: usize) {
     }
     let _ = action(sig, Some(&a));
 }
+pub fn default_sigpipe() {
+    disposition(libc::SIGPIPE, libc::SIG_DFL);
+}
 pub fn ignore_sigpipe() {
     disposition(libc::SIGPIPE, libc::SIG_IGN);
+}
+
+pub fn terminal_columns() -> Option<usize> {
+    // SAFETY: winsize is a C integer struct and zero is a valid representation.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: size is writable; ioctl validates stdout and the request.
+    let result = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
+    (result == 0 && size.ws_col > 0).then_some(size.ws_col as usize)
+}
+
+pub fn local_time(ns: u64) -> io::Result<String> {
+    let seconds: libc::time_t = (ns / 1_000_000_000).try_into().map_err(io::Error::other)?;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: seconds is readable and local points to writable storage for tm.
+    if unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) }.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful localtime_r initialized local.
+    let local = unsafe { local.assume_init() };
+    Ok(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        local.tm_year + 1900,
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec
+    ))
 }
 fn mask(signals: &[i32]) -> libc::sigset_t {
     // SAFETY: the local mask is initialized before use.

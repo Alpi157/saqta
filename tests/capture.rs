@@ -334,6 +334,58 @@ fn dry_run_reports_conflicts_without_changes() {
 }
 
 #[test]
+fn piped_log_and_show_exit_quietly() {
+    let (s, p) = capture_fixture("piped_output");
+    if s.command("head").arg("--version").output().is_err() {
+        note("SKIP: head is missing");
+        return;
+    }
+    for i in 0..600 {
+        fs::write(p.join(format!("file{i:04}")), b"before").unwrap();
+    }
+    assert_success(&script(&s, &p, "rm file*"));
+    assert_success(&script(&s, &p, ": > created"));
+    let show = run(s.saqta(&["show", "2"]));
+    assert_success(&show);
+    let text = String::from_utf8(show.stdout).unwrap();
+    assert!(text.lines().next().unwrap().contains("1 effects, 0 kept"));
+    let row: Vec<_> = text.lines().last().unwrap().split_whitespace().collect();
+    assert_eq!(&row[3..5], &["-", "-"]);
+    let home = PathBuf::from(&s.env[OsStr::new("SAQTA_HOME")]);
+    let folder = home.join("cmd/2");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(folder.join("meta")).unwrap()).unwrap();
+    // Empty, legacy-format records make log exceed pipe capacity without
+    // spawning hundreds of supervisors or duplicating the large effect log.
+    for id in 3..1000 {
+        let dest = home.join("cmd").join(id.to_string());
+        fs::create_dir(&dest).unwrap();
+        let mut meta = meta.clone();
+        meta["id"] = id.into();
+        fs::write(dest.join("meta"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        fs::copy(folder.join("end"), dest.join("end")).unwrap();
+    }
+    for text in [
+        "saqta log -n 1000 | head -1",
+        "saqta show 1 | head -1",
+        "saqta show 1 | head -20",
+    ] {
+        let mut command = s.command("sh");
+        let result = run({
+            command.args(["-c", text]);
+            command
+        });
+        assert_success(&result);
+        assert!(!result.stdout.is_empty());
+        assert!(
+            result.stderr.is_empty(),
+            "{text}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[test]
 fn undo_survives_closed_stdout() {
     for verbose in [false, true] {
         let (s, p) = capture_fixture("undo_closed_stdout");
@@ -514,6 +566,69 @@ fn undo_reports_every_unprotected_item_in_summary() {
     }
 }
 
+#[test]
+fn log_shows_local_time_and_json_keeps_nanoseconds() {
+    let (s, p) = capture_fixture("local_time");
+    let long_command = format!("true # {}\n# second line", "x".repeat(200));
+    assert_success(&script(&s, &p, &long_command));
+    let home = PathBuf::from(&s.env[OsStr::new("SAQTA_HOME")]);
+    let meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("cmd/1/meta")).unwrap()).unwrap();
+    let end: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("cmd/1/end")).unwrap()).unwrap();
+    // A fixed legacy timestamp exercises local conversion and subsecond
+    // precision deterministically, independent of the machine's timezone.
+    let start_ns = 1_700_000_000_123_456_789u64;
+    let mut legacy_meta = meta;
+    legacy_meta["start_ns"] = start_ns.into();
+    let mut legacy_end = end;
+    legacy_end["end_ns"] = (start_ns + 800_000_000).into();
+    fs::write(
+        home.join("cmd/1/meta"),
+        serde_json::to_vec(&legacy_meta).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        home.join("cmd/1/end"),
+        serde_json::to_vec(&legacy_end).unwrap(),
+    )
+    .unwrap();
+    let mut command = s.saqta(&["log"]);
+    let result = run({
+        command.env("TZ", "UTC-5").env("COLUMNS", "120");
+        command
+    });
+    assert_success(&result);
+    let text = String::from_utf8(result.stdout).unwrap();
+    assert!(text.contains("2023-11-15 03:13:20"), "{text}");
+    assert!(text.contains("0.8 s"));
+    assert_eq!(text.lines().count(), 2);
+    assert!(
+        text.lines().all(|line| line.chars().count() <= 120),
+        "{text}"
+    );
+    assert!(text.trim_end().ends_with("..."));
+    assert_eq!(
+        text.lines().next().unwrap().find("STARTED"),
+        text.lines().nth(1).unwrap().find("2023-11-15")
+    );
+    let mut command = s.saqta(&["log"]);
+    command.env("TZ", "UTC-5").env("COLUMNS", "80");
+    let narrow = run(command);
+    assert_success(&narrow);
+    assert!(
+        String::from_utf8_lossy(&narrow.stdout)
+            .lines()
+            .all(|line| line.chars().count() <= 80)
+    );
+    let result = run(s.saqta(&["log", "--json"]));
+    assert_success(&result);
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(json[0]["start_ns"], start_ns);
+    assert_eq!(json[0]["end_ns"], start_ns + 800_000_000);
+    assert_eq!(json[0]["duration_ns"], 800_000_000);
+    assert_eq!(json[0]["command"], legacy_meta["command"]);
+}
 #[test]
 fn sed_rename_over_fifty_files() {
     let (s, p) = capture_fixture("sed_fifty");

@@ -20,6 +20,8 @@ fn main() {
     let undo = std::env::args_os().nth(1).is_some_and(|s| s == "undo");
     if undo {
         sys::ignore_sigpipe();
+    } else if std::env::args_os().nth(1).is_none_or(|s| s != "exec") {
+        sys::default_sigpipe();
     }
     let cli = clap::Command::new("saqta")
         .about("Run coding agent commands under a seccomp supervisor")

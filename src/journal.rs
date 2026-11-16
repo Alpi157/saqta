@@ -386,6 +386,7 @@ pub struct Record {
     pub meta: Meta,
     pub status: String,
     pub exit_status: Option<i32>,
+    pub end_ns: Option<u64>,
     pub undone: bool,
     pub effects: Vec<Effect>,
     pub warning: Option<String>,
@@ -459,6 +460,7 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
     Ok(Record {
         meta,
         status,
+        end_ns: end.as_ref().map(|e| e.end_ns),
         exit_status: end.map(|e| {
             if libc::WIFEXITED(e.status) {
                 libc::WEXITSTATUS(e.status)
@@ -595,30 +597,89 @@ pub fn log(n: usize, json: bool) -> Result<i32> {
     let records = import(&home)?;
     let values: Vec<_> = records.iter().take(n).map(|r| {
         let count = |op: &str| r.effects.iter().filter(|e| e.op == op).count();
-        serde_json::json!({"id":r.meta.id,"start_ns":r.meta.start_ns,"exit_status":r.exit_status,"status":r.status,"undone":r.undone,"cwd":r.meta.cwd,"command":r.meta.command,"counts":{"deleted":count("delete")+count("rmdir"),"modified":count("modify")+count("size")+count("rename")+count("exchange"),"created":count("create"),"blocked":count("blocked"),"not_protected":count("not protected")+usize::from(r.warning.is_some())}})
+        serde_json::json!({"id":r.meta.id,"start_ns":r.meta.start_ns,"end_ns":r.end_ns,"duration_ns":r.end_ns.map(|end| end.saturating_sub(r.meta.start_ns)),"exit_status":r.exit_status,"status":r.status,"undone":r.undone,"cwd":r.meta.cwd,"command":r.meta.command,"counts":{"deleted":count("delete")+count("rmdir"),"modified":count("modify")+count("size")+count("rename")+count("exchange"),"created":count("create"),"blocked":count("blocked"),"not_protected":count("not protected")+usize::from(r.warning.is_some())}})
     }).collect();
     if json {
         println!("{}", serde_json::to_string_pretty(&values)?);
     } else {
+        let columns = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(sys::terminal_columns)
+            .unwrap_or(120)
+            .clamp(40, 240);
+        let header = if columns >= 110 {
+            format!(
+                "{:>6}  {:19}  {:>8}  {:>4}  {:10}  {:>5} {:>5} {:>5} {:>5} {:>5}  COMMAND",
+                "ID", "STARTED", "DURATION", "EXIT", "STATUS", "DEL", "MOD", "NEW", "BLOCK", "GAPS"
+            )
+        } else if columns >= 70 {
+            format!(
+                "{:>6}  {:19}  {:>8}  {:>4}  {:10}  COMMAND",
+                "ID", "STARTED", "DURATION", "EXIT", "STATUS"
+            )
+        } else {
+            format!("{:>6}  {:19}  {:>8}  COMMAND", "ID", "STARTED", "DURATION")
+        };
+        println!("{}", one_line(&header, columns));
         for v in values {
+            let start = sys::local_time(v["start_ns"].as_u64().unwrap_or(0))?;
+            let duration = v["duration_ns"]
+                .as_u64()
+                .map(|ns| format!("{:.1} s", ns as f64 / 1e9))
+                .unwrap_or_else(|| "-".into());
+            let status = if v["undone"] == true {
+                "undone"
+            } else {
+                v["status"].as_str().unwrap_or("")
+            };
+            let exit = v["exit_status"]
+                .as_i64()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into());
+            let prefix = if columns >= 110 {
+                format!(
+                    "{:>6}  {start}  {duration:>8}  {:>4}  {status:10}  {:>5} {:>5} {:>5} {:>5} {:>5}  ",
+                    v["id"].to_string(),
+                    exit,
+                    v["counts"]["deleted"].to_string(),
+                    v["counts"]["modified"].to_string(),
+                    v["counts"]["created"].to_string(),
+                    v["counts"]["blocked"].to_string(),
+                    v["counts"]["not_protected"].to_string(),
+                )
+            } else if columns >= 70 {
+                format!(
+                    "{:>6}  {start}  {duration:>8}  {exit:>4}  {status:10}  ",
+                    v["id"].to_string()
+                )
+            } else {
+                format!("{:>6}  {start}  {duration:>8}  ", v["id"].to_string())
+            };
             println!(
-                "{} {} exit={} {} deleted={} modified={} created={} blocked={} not protected={} {} {}{}",
-                v["id"],
-                v["start_ns"],
-                v["exit_status"],
-                v["status"].as_str().unwrap_or(""),
-                v["counts"]["deleted"],
-                v["counts"]["modified"],
-                v["counts"]["created"],
-                v["counts"]["blocked"],
-                v["counts"]["not_protected"],
-                v["cwd"].as_str().unwrap_or(""),
-                v["command"].as_str().unwrap_or(""),
-                if v["undone"] == true { " (undone)" } else { "" }
+                "{prefix}{}",
+                one_line(
+                    v["command"].as_str().unwrap_or(""),
+                    columns.saturating_sub(prefix.chars().count())
+                )
             );
         }
     }
     Ok(0)
+}
+fn one_line(text: &str, width: usize) -> String {
+    let mut chars = text.chars().map(|c| if c.is_control() { ' ' } else { c });
+    let mut value: String = chars.by_ref().take(width).collect();
+    if chars.next().is_some() && width >= 3 {
+        value.truncate(
+            value
+                .char_indices()
+                .nth(width - 3)
+                .map_or(value.len(), |(i, _)| i),
+        );
+        value.push_str("...");
+    }
+    value
 }
 pub fn show(id: u64, json: bool) -> Result<i32> {
     let home = paths::home()?;
@@ -627,24 +688,69 @@ pub fn show(id: u64, json: bool) -> Result<i32> {
     if json {
         println!("{}", serde_json::to_string_pretty(&r)?);
     } else {
-        println!("{}: {} ({})", id, r.meta.command, r.status);
+        let count = |op: &str| r.effects.iter().filter(|e| e.op == op).count();
+        println!(
+            "{id}: {} ({}) | {} effects, {} kept, {} blocked, {} not protected",
+            one_line(&r.meta.command, 60),
+            r.status,
+            r.effects.len(),
+            r.effects
+                .iter()
+                .filter(|e| !e.quarantine.is_empty())
+                .count(),
+            count("blocked"),
+            count("not protected") + usize::from(r.warning.is_some())
+        );
         if let Some(warning) = r.warning {
             println!("not protected: {warning}");
         }
+        let path_width = r
+            .effects
+            .iter()
+            .map(|e| {
+                e.path.len()
+                    + if e.path2.is_empty() {
+                        0
+                    } else {
+                        e.path2.len() + 4
+                    }
+            })
+            .max()
+            .unwrap_or(4)
+            .max(4);
+        let q_width = r
+            .effects
+            .iter()
+            .map(|e| e.quarantine.len())
+            .max()
+            .unwrap_or(7)
+            .max(7);
+        println!(
+            "{:>6}  {:13}  {:path_width$}  {:8}  {:q_width$}  NOTE",
+            "SEQ", "OPERATION", "PATH", "KEPT", "VERSION"
+        );
         for e in r.effects {
+            let path = if e.path2.is_empty() {
+                e.path
+            } else {
+                format!("{} -> {}", e.path, e.path2)
+            };
             println!(
-                "{} {} {}{} kept={} {} {}",
+                "{:>6}  {:13}  {:path_width$}  {:8}  {:q_width$}  {}",
                 e.seq,
                 e.op,
-                e.path,
-                if e.path2.is_empty() {
-                    String::new()
+                path,
+                if e.quarantine.is_empty() {
+                    "-"
                 } else {
-                    format!(" -> {}", e.path2)
+                    &e.note.kept
                 },
-                e.note.kept,
-                e.quarantine,
-                e.note.message
+                if e.quarantine.is_empty() {
+                    "-"
+                } else {
+                    &e.quarantine
+                },
+                one_line(&e.note.message, 160)
             );
         }
     }
