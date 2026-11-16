@@ -2,6 +2,7 @@ mod capture;
 mod doctor;
 mod exec;
 mod filter;
+mod hook;
 mod journal;
 mod output;
 mod paths;
@@ -16,6 +17,11 @@ fn main() {
     {
         let code = supervisor::internal(std::env::args_os().skip(2).collect()).unwrap_or(125);
         sys::exit(code);
+    }
+    if std::env::args_os().nth(1).is_some_and(|s| s == "hook") {
+        sys::ignore_sigpipe();
+        hook::run();
+        return;
     }
     let undo = std::env::args_os().nth(1).is_some_and(|s| s == "undo");
     if undo {

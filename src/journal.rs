@@ -297,6 +297,35 @@ impl Journal {
             debug_fd,
         })
     }
+    pub fn reopen(home: PathBuf, id: u64) -> io::Result<Self> {
+        let folder = home.join("cmd").join(id.to_string());
+        let meta =
+            serde_json::from_slice(&fs::read(folder.join("meta"))?).map_err(io::Error::other)?;
+        let effects = read_effects(&folder).map_err(io::Error::other)?;
+        let mut touched = BTreeSet::new();
+        for e in &effects {
+            for p in [&e.path, &e.path2] {
+                if !p.is_empty() {
+                    touched.insert(path(p)?);
+                }
+            }
+        }
+        Ok(Self {
+            quarantine: home.join("q/main").join(id.to_string()),
+            home,
+            meta,
+            effects: OpenOptions::new()
+                .append(true)
+                .open(folder.join("effects.log"))?,
+            outcomes: OpenOptions::new()
+                .append(true)
+                .open(folder.join("outcomes.log"))?,
+            seq: effects.len() as u64,
+            folder,
+            touched,
+            debug_fd: -1,
+        })
+    }
     pub fn child(&mut self, pid: i32) -> io::Result<()> {
         self.meta.child = pid;
         json_write(&self.folder.join("child"), &pid)
