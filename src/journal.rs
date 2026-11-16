@@ -389,6 +389,8 @@ pub struct Record {
     pub undone: bool,
     pub effects: Vec<Effect>,
     pub warning: Option<String>,
+    #[serde(skip)]
+    pub outcomes: BTreeMap<u64, bool>,
 }
 pub fn running(home: &Path, m: &Meta) -> bool {
     home.join("run").join(m.supervisor.to_string()).exists() && process_live(m.supervisor)
@@ -445,6 +447,15 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
     if !active {
         let _ = fs::remove_file(home.join("run").join(meta.supervisor.to_string()));
     }
+    let mut outcomes = BTreeMap::new();
+    for line in fs::read_to_string(folder.join("outcomes.log"))
+        .unwrap_or_default()
+        .lines()
+    {
+        if let Some((seq, applied)) = line.split_once('\t') {
+            outcomes.insert(seq.parse()?, applied == "1");
+        }
+    }
     Ok(Record {
         meta,
         status,
@@ -458,6 +469,7 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         undone: folder.join("undone").exists(),
         effects,
         warning: fs::read_to_string(folder.join("error")).ok(),
+        outcomes,
     })
 }
 pub fn post_states(folder: &Path) -> Result<BTreeMap<String, Option<State>>> {
@@ -474,6 +486,9 @@ pub fn post_states(folder: &Path) -> Result<BTreeMap<String, Option<State>>> {
         }
     }
     Ok(states)
+}
+pub fn mark_undone(folder: &Path) -> io::Result<()> {
+    synced_json_write(&folder.join("undone"), &now())
 }
 fn database(home: &Path) -> Result<Connection> {
     private_file(&home.join("journal.db"))?;

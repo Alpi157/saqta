@@ -4,6 +4,7 @@ mod exec;
 mod filter;
 mod journal;
 mod paths;
+mod restore;
 mod supervisor;
 mod sys;
 
@@ -91,6 +92,22 @@ fn main() {
                         .help("Print effects as JSON")
                         .action(clap::ArgAction::SetTrue),
                 ),
+        )
+        .subcommand(
+            clap::Command::new("undo")
+                .about("Restore the filesystem before a captured command")
+                .arg(
+                    clap::Arg::new("id")
+                        .help("Command id to undo")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64)),
+                )
+                .arg(
+                    clap::Arg::new("dry-run")
+                        .long("dry-run")
+                        .help("Check conflicts and print changes without restoring")
+                        .action(clap::ArgAction::SetTrue),
+                ),
         );
     let m = cli.get_matches();
     let result = match m.subcommand() {
@@ -103,6 +120,10 @@ fn main() {
         Some(("show", m)) => journal::show(
             m.get_one::<u64>("id").copied().unwrap_or(0),
             m.get_flag("json"),
+        ),
+        Some(("undo", m)) => restore::run(
+            m.get_one::<u64>("id").copied().unwrap_or(0),
+            m.get_flag("dry-run"),
         ),
         _ => Ok(125),
     };

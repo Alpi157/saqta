@@ -60,6 +60,25 @@ pub fn rename_at(from: i32, name: &CStr, to: i32, dest: &CStr, flags: u32) -> io
     })
     .map(|_| ())
 }
+pub fn unlink_at(base: i32, name: &CStr, directory: bool) -> io::Result<()> {
+    // SAFETY: name is terminated; unlinkat never follows the final symlink.
+    cv(unsafe {
+        libc::unlinkat(
+            base,
+            name.as_ptr(),
+            if directory { libc::AT_REMOVEDIR } else { 0 },
+        )
+    })
+    .map(|_| ())
+}
+pub fn mkdir_at(base: i32, name: &CStr, mode: u32) -> io::Result<()> {
+    // SAFETY: name is terminated and mode is a value.
+    cv(unsafe { libc::mkdirat(base, name.as_ptr(), mode) }).map(|_| ())
+}
+pub fn symlink_at(target: &CStr, base: i32, name: &CStr) -> io::Result<()> {
+    // SAFETY: target and name are terminated; symlinkat does not dereference target.
+    cv(unsafe { libc::symlinkat(target.as_ptr(), base, name.as_ptr()) }).map(|_| ())
+}
 pub fn metadata_fd(fd: i32, mode: u32, sec: i64, nsec: i64) -> io::Result<()> {
     let times = [
         libc::timespec {
@@ -77,6 +96,28 @@ pub fn metadata_fd(fd: i32, mode: u32, sec: i64, nsec: i64) -> io::Result<()> {
         cv(libc::futimens(fd, times.as_ptr()))?;
     }
     Ok(())
+}
+pub fn symlink_mtime(base: i32, name: &CStr, sec: i64, nsec: i64) -> io::Result<()> {
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec,
+        },
+    ];
+    // SAFETY: name is terminated and times contains two valid entries; do not follow the link.
+    cv(unsafe {
+        libc::utimensat(
+            base,
+            name.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })
+    .map(|_| ())
 }
 const FICLONE: libc::c_ulong = 0x40049409;
 const COPY_CHUNK: usize = 1024 * 1024;
@@ -142,6 +183,8 @@ struct OpenHow {
     mode: u64,
     resolve: u64,
 }
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
 const RESOLVE_IN_ROOT: u64 = 0x10;
 pub fn open_target_parent(root: i32, path: &CStr) -> io::Result<OwnedFd> {
     let how = OpenHow {
@@ -160,6 +203,25 @@ pub fn open_target_parent(root: i32, path: &CStr) -> io::Result<OwnedFd> {
         ) as i32
     })?;
     // SAFETY: a successful openat2 returns a fresh descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+pub fn open_restore_parent(root: i32, path: &CStr) -> io::Result<OwnedFd> {
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+    };
+    // SAFETY: path and how are live; how's size matches the Linux open_how ABI.
+    let fd = cv(unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root,
+            path.as_ptr(),
+            &how,
+            size_of::<OpenHow>(),
+        ) as i32
+    })?;
+    // SAFETY: the successful syscall returned a new owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 pub fn inherit(fd: i32, yes: bool) -> io::Result<()> {
