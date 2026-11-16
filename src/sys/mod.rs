@@ -1,5 +1,9 @@
 //! All unsafe operations live here. Forked paths use only stack storage and syscalls.
+mod files;
+mod memory;
+pub use files::*;
 use libc::{c_int, pid_t};
+pub use memory::*;
 use std::{
     ffi::{CStr, CString},
     io, ptr,
@@ -47,13 +51,6 @@ const fn seccomp_ioctl<T>(direction: u32, number: u8) -> libc::c_ulong {
 const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong =
     seccomp_ioctl::<Notification>(IOC_READ | IOC_WRITE, 0);
 const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = seccomp_ioctl::<Response>(IOC_READ | IOC_WRITE, 1);
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "M2 needs notification ID validation before capture"
-    )
-)]
 const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = seccomp_ioctl::<u64>(IOC_WRITE, 2);
 const SECCOMP_IOCTL_NOTIF_SET_FLAGS: libc::c_ulong = seccomp_ioctl::<u64>(IOC_WRITE, 4);
 
@@ -242,6 +239,32 @@ pub fn serve(fd: i32) {
         }
     }
 }
+pub fn receive(fd: i32) -> io::Result<Notification> {
+    let mut n = Notification::default();
+    // SAFETY: n matches the kernel ABI and is writable for the duration of ioctl.
+    cv(unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &mut n) })?;
+    Ok(n)
+}
+pub fn valid(fd: i32, id: u64) -> bool {
+    // SAFETY: id is readable and has the ioctl's required u64 layout.
+    unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == 0 }
+}
+pub fn answer(fd: i32, id: u64, deny: bool) {
+    let r = Response {
+        id,
+        error: if deny { -libc::EPERM } else { 0 },
+        flags: if deny {
+            0
+        } else {
+            SECCOMP_USER_NOTIF_FLAG_CONTINUE
+        },
+        ..Response::default()
+    };
+    // SAFETY: r is live and matches the kernel response ABI. A vanished request is harmless.
+    unsafe {
+        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &r);
+    }
+}
 pub fn pass_fd(sock: i32, fd: Option<i32>) -> i32 {
     // SAFETY: msghdr, iovec and aligned ancillary storage remain live; lengths are bounded.
     unsafe {
@@ -345,6 +368,45 @@ pub fn monotonic_ms() -> i64 {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t);
     }
     t.tv_sec * 1000 + t.tv_nsec / 1_000_000
+}
+// Stack-only timestamp logging is also safe immediately before S re-execs.
+pub fn debug_timestamp(fd: i32, phase: &[u8]) {
+    const MAX_PHASE_BYTES: usize = 64;
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    const DECIMAL_DIGITS: usize = 20;
+    if fd < 0 || phase.len() > MAX_PHASE_BYTES {
+        return;
+    }
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: t is writable; clock_gettime is async-signal-safe.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) } != 0 {
+        return;
+    }
+    let mut ns = (t.tv_sec as u64)
+        .saturating_mul(NANOS_PER_SECOND)
+        .saturating_add(t.tv_nsec as u64);
+    let mut digits = [0u8; DECIMAL_DIGITS];
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (ns % 10) as u8;
+        count += 1;
+        ns /= 10;
+        if ns == 0 {
+            break;
+        }
+    }
+    let mut line = [0u8; MAX_PHASE_BYTES + DECIMAL_DIGITS + 2];
+    line[..phase.len()].copy_from_slice(phase);
+    line[phase.len()] = b'\t';
+    for i in 0..count {
+        line[phase.len() + 1 + i] = digits[count - 1 - i];
+    }
+    let end = phase.len() + 1 + count;
+    line[end] = b'\n';
+    write(fd, &line[..end + 1]);
 }
 // Decimal formatting without allocation, also used after fork.
 fn decimal(mut n: i32, out: &mut [u8]) -> usize {

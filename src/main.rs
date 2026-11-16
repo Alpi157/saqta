@@ -1,11 +1,20 @@
+mod capture;
 mod doctor;
 mod exec;
 mod filter;
+mod journal;
 mod paths;
 mod supervisor;
 mod sys;
 
 fn main() {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|s| s == "__supervisor")
+    {
+        let code = supervisor::internal(std::env::args_os().skip(2).collect()).unwrap_or(125);
+        sys::exit(code);
+    }
     let cli = clap::Command::new("saqta")
         .about("Run coding agent commands under a seccomp supervisor")
         .version(env!("CARGO_PKG_VERSION"))
@@ -48,11 +57,53 @@ fn main() {
                         .conflicts_with("command")
                         .value_parser(clap::value_parser!(std::ffi::OsString)),
                 ),
+        )
+        .subcommand(
+            clap::Command::new("log")
+                .about("List captured commands")
+                .arg(
+                    clap::Arg::new("number")
+                        .short('n')
+                        .value_name("N")
+                        .help("Maximum number of commands to list")
+                        .default_value("20")
+                        .value_parser(clap::value_parser!(usize)),
+                )
+                .arg(
+                    clap::Arg::new("json")
+                        .long("json")
+                        .help("Print the command log as JSON")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            clap::Command::new("show")
+                .about("Show a command's effects and kept versions")
+                .arg(
+                    clap::Arg::new("id")
+                        .help("Command id to inspect")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64)),
+                )
+                .arg(
+                    clap::Arg::new("json")
+                        .long("json")
+                        .help("Print effects as JSON")
+                        .action(clap::ArgAction::SetTrue),
+                ),
         );
     let m = cli.get_matches();
     let result = match m.subcommand() {
         Some(("doctor", m)) => doctor::run(m.get_flag("json")),
         Some(("exec", m)) => exec::run(m),
+        Some(("log", m)) => journal::log(
+            m.get_one::<usize>("number").copied().unwrap_or(20),
+            m.get_flag("json"),
+        ),
+        Some(("show", m)) => journal::show(
+            m.get_one::<u64>("id").copied().unwrap_or(0),
+            m.get_flag("json"),
+        ),
         _ => Ok(125),
     };
     match result {
