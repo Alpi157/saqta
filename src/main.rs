@@ -1,6 +1,8 @@
 use serde_json as _;
 
 #[allow(dead_code)]
+mod filter;
+#[allow(dead_code)]
 mod sys;
 
 fn main() {
