@@ -1,5 +1,5 @@
-use crate::{filter, paths, supervisor, sys};
-use anyhow::{Context, Result, bail};
+use crate::{paths, sys};
+use anyhow::{Result, bail};
 use std::{
     env,
     ffi::{CString, OsString},
@@ -17,7 +17,10 @@ pub struct Prepared {
     _env: Vec<CString>,
 }
 impl Prepared {
-    fn new(args: Vec<OsString>) -> Result<Self> {
+    pub(crate) fn new(args: Vec<OsString>) -> Result<Self> {
+        Self::prepare(args, true)
+    }
+    fn prepare(args: Vec<OsString>, supervised: bool) -> Result<Self> {
         let Some(first) = args.first() else {
             bail!("exec needs a program or -c STRING");
         };
@@ -27,7 +30,7 @@ impl Prepared {
             .map(|a| CString::new(a.as_bytes()))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut vars = env::vars_os()
-            .filter(|(k, _)| k != "SAQTA_SUPERVISED")
+            .filter(|(k, _)| !supervised || k != "SAQTA_SUPERVISED")
             .map(|(k, v)| {
                 let mut b = k.as_bytes().to_vec();
                 b.push(b'=');
@@ -35,7 +38,9 @@ impl Prepared {
                 CString::new(b)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        vars.push(CString::new("SAQTA_SUPERVISED=1")?);
+        if supervised {
+            vars.push(CString::new("SAQTA_SUPERVISED=1")?);
+        }
         let mut argv: Vec<_> = strings.iter().map(|a| a.as_ptr()).collect();
         argv.push(std::ptr::null());
         let mut environ: Vec<_> = vars.iter().map(|a| a.as_ptr()).collect();
@@ -102,7 +107,7 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
             .map(|a| a.cloned().collect())
             .unwrap_or_default()
     };
-    let p = Prepared::new(args)?;
+    let p = Prepared::new(args.clone())?;
     if env::var_os("SAQTA_SUPERVISED").is_some()
         && std::fs::read_to_string("/proc/self/status")
             .unwrap_or_default()
@@ -113,21 +118,25 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
     }
     let strict = env::var_os("SAQTA_STRICT").is_some_and(|s| s == "1");
     let sync = !env::var_os("SAQTA_NO_SYNC_WAKE").is_some_and(|s| s == "1");
-    let prefix = paths::home()
-        .ok()
-        .and_then(|home| {
-            use std::os::unix::fs::DirBuilderExt;
-            let run = home.join("run");
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&run)
-                .ok()?;
-            let mut b = run.into_os_string().as_bytes().to_vec();
-            b.push(b'/');
-            Some(b)
-        })
-        .unwrap_or_default();
+    let home = match paths::home().and_then(|h| {
+        crate::journal::prepare(&h)?;
+        Ok(h)
+    }) {
+        Ok(h) => h,
+        Err(_) => {
+            if crate::sys::probe(&crate::filter::program())
+                .is_err_and(|e| e.raw_os_error() == Some(libc::EBUSY))
+            {
+                fallback(&p, strict, b"another seccomp supervisor is already active");
+            }
+            let location = env::var_os("SAQTA_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("Saqta home"));
+            let mut reason = b"can't write ".to_vec();
+            reason.extend_from_slice(location.as_os_str().as_bytes());
+            fallback(&p, strict, &reason);
+        }
+    };
     let log_fd = if env::var_os("SAQTA_DEBUG").is_some_and(|s| s == "1") {
         use std::os::fd::IntoRawFd;
         paths::home()
@@ -152,28 +161,28 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
     } else {
         -1
     };
-    let bpf = filter::program();
-    let setup = || -> std::io::Result<_> {
-        let ws = sys::pair()?;
-        let cs = match sys::pair() {
-            Ok(f) => f,
-            Err(e) => {
-                for f in ws {
-                    sys::close(f);
-                }
-                return Err(e);
-            }
-        };
-        let sf = sys::signal_fd(&[libc::SIGCHLD])?;
-        let wf = sys::signal_fd(&[libc::SIGTERM, libc::SIGHUP])?;
-        Ok((ws, cs, sf, wf))
-    };
-    let (ws, cs, sf, wf) = match setup() {
-        Ok(s) => s,
+    let ws = match sys::pair() {
+        Ok(f) => f,
         Err(_) => fallback(&p, strict, b"cannot create supervisor resources"),
     };
-    let chld = sys::action(libc::SIGCHLD, None).context("read SIGCHLD disposition")?;
-    let group = sys::group();
+    let wf = match sys::signal_fd(&[libc::SIGTERM, libc::SIGHUP]) {
+        Ok(f) => f,
+        Err(_) => fallback(&p, strict, b"cannot create supervisor resources"),
+    };
+    let mut home_warning = b"can't write ".to_vec();
+    home_warning.extend_from_slice(home.as_os_str().as_bytes());
+    let mut launch = vec![
+        std::env::current_exe()?.into_os_string(),
+        "__supervisor".into(),
+        ws[1].to_string().into(),
+        sys::group().to_string().into(),
+        i32::from(strict).to_string().into(),
+        i32::from(sync).to_string().into(),
+        log_fd.to_string().into(),
+        home.into_os_string(),
+    ];
+    launch.extend(args);
+    let supervisor = Prepared::prepare(launch, false)?;
     let s = match sys::fork() {
         Ok(s) => s,
         Err(_) => fallback(&p, strict, b"cannot fork supervisor"),
@@ -181,16 +190,16 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
     if s == 0 {
         sys::close(ws[0]);
         sys::close(wf);
-        supervisor::start(
-            ws[1], cs, sf, group, &chld, &p, &bpf, &prefix, strict, sync, log_fd,
-        );
+        if sys::inherit(ws[1], true).is_err()
+            || (log_fd >= 0 && sys::inherit(log_fd, true).is_err())
+        {
+            sys::exit(125);
+        }
+        sys::debug_timestamp(log_fd, b"reexec_begin");
+        supervisor.execute();
     }
     sys::close(log_fd);
     sys::close(ws[1]);
-    for f in cs {
-        sys::close(f);
-    }
-    sys::close(sf);
     let original_int = sys::action(libc::SIGINT, None)?;
     let original_quit = sys::action(libc::SIGQUIT, None)?;
     sys::disposition(libc::SIGINT, libc::SIG_IGN);
@@ -239,7 +248,15 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
         let _ = sys::action(libc::SIGINT, Some(&original_int));
         let _ = sys::action(libc::SIGQUIT, Some(&original_quit));
         sys::clear_mask();
-        fallback(&p, strict, b"cannot initialize supervisor");
+        fallback(
+            &p,
+            strict,
+            if st == -2 {
+                &home_warning
+            } else {
+                b"cannot initialize supervisor"
+            },
+        );
     }
     if libc::WIFEXITED(st) {
         Ok(libc::WEXITSTATUS(st))
