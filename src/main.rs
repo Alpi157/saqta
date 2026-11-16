@@ -1,7 +1,9 @@
 use serde_json as _;
 
-#[allow(dead_code)]
+mod exec;
 mod filter;
+mod paths;
+mod supervisor;
 #[allow(dead_code)]
 mod sys;
 
@@ -50,9 +52,9 @@ fn main() {
                 ),
         );
     let m = cli.get_matches();
-    let result: anyhow::Result<i32> = match m.subcommand() {
+    let result = match m.subcommand() {
         Some(("doctor", _)) => Err(anyhow::anyhow!("doctor is not implemented yet")),
-        Some(("exec", _)) => Err(anyhow::anyhow!("exec is not implemented yet")),
+        Some(("exec", m)) => exec::run(m),
         _ => Ok(125),
     };
     match result {
