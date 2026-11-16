@@ -54,7 +54,8 @@ Stopping or quitting Codex may leave the whole command tree running. Saqta canno
 fix that from inside the sandbox. It keeps the existing process behavior.
 
 Doctor tests capture in a temporary `.saqta-doctor/` folder in the current project
-and removes the fixture. Under an existing Saqta supervisor it verifies the real
+and removes the fixture. An existing Saqta supervisor triggers this check even
+when the host uses systemd as PID 1. It verifies the real
 creation and deletion effects in that supervisor's plain log. Otherwise it checks
 that the captured pre-image matches the sample bytes. It reports
 `inside Codex sandbox: capture works` or the reason capture failed.
