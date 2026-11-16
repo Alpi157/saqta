@@ -305,6 +305,7 @@ pub struct Capture {
     force_proc: bool,
     page: usize,
     copied: HashMap<(u64, u64), (String, State)>,
+    original_links: HashMap<(u64, u64), PathBuf>,
     created: HashSet<PathBuf>,
     pending: HashMap<u32, Pending>,
     linked: BTreeMap<String, State>,
@@ -335,6 +336,7 @@ impl Capture {
             force_proc: std::env::var_os("SAQTA_FORCE_PROC_MEM").is_some_and(|s| s == "1"),
             page: sys::page_size()?,
             copied: HashMap::new(),
+            original_links: HashMap::new(),
             created: HashSet::new(),
             pending: HashMap::new(),
             linked: BTreeMap::new(),
@@ -478,6 +480,12 @@ impl Capture {
     ) -> io::Result<()> {
         if p.skipped()? || p2.map(Resolved::skipped).transpose()?.unwrap_or(false) {
             return Ok(());
+        }
+        if c.kind == Kind::Link
+            && !self.created.contains(&p.path)
+            && let Some(st) = p.state()
+        {
+            self.original_links.insert((st.dev, st.ino), p.path.clone());
         }
         let mut effects = Vec::new();
         match c.kind {
@@ -698,8 +706,18 @@ impl Capture {
         }
         let key = (st.dev, st.ino);
         if self.created.contains(&p.path) {
-            e.note.kept = "created earlier".into();
-            return Ok(());
+            let original = self.original_links.get(&key).filter(|path| {
+                journal::state(path)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.same_inode(&st))
+            });
+            if let Some(original) = original {
+                e.path = journal::display(original);
+            } else {
+                e.note.kept = "created earlier".into();
+                return Ok(());
+            }
         }
         if deduplicate && let Some((q, original)) = self.copied.get(&key) {
             e.quarantine = q.clone();
@@ -767,10 +785,27 @@ impl Capture {
             }
             if matches!(p.kind, Kind::Delete | Kind::Rmdir) {
                 self.created.retain(|old| !old.starts_with(&p.path));
+                self.original_links
+                    .retain(|_, old| !old.starts_with(&p.path));
             }
             if matches!(p.kind, Kind::Rename | Kind::Exchange)
                 && let Some(dest) = &p.path2
             {
+                self.original_links.retain(|_, old| {
+                    if let Ok(tail) = old.strip_prefix(&p.path) {
+                        *old = dest.join(tail);
+                        true
+                    } else if let Ok(tail) = old.strip_prefix(dest) {
+                        if p.kind == Kind::Exchange {
+                            *old = p.path.join(tail);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                });
                 let previous = std::mem::take(&mut self.created);
                 for old in previous {
                     if let Ok(tail) = old.strip_prefix(&p.path) {

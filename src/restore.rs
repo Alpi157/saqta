@@ -183,6 +183,91 @@ impl Undo {
         // Reused pre-images must remain available for the earlier effects.
         self.copy_entry(self.q.as_raw_fd(), &name, at.fd.as_raw_fd(), &at.name, &st)
     }
+    fn restore_modified(&mut self, e: &Effect, p: &Path) -> io::Result<()> {
+        if e.quarantine.is_empty() {
+            return Ok(());
+        }
+        let at = self.parent(p)?;
+        let current = sys::stat_at(at.fd.as_raw_fd(), &at.name)?;
+        let Some(current) =
+            current.filter(|s| s.st_mode & libc::S_IFMT == libc::S_IFREG && s.st_nlink > 1)
+        else {
+            return self.restore_kept(e, p);
+        };
+        // Restore through a surviving shared inode so untouched aliases regain
+        // their bytes too. First detach an independent post-command backup.
+        self.save_current(p, &at)?;
+        let live = CString::new(self.serial.to_string()).map_err(io::Error::other)?;
+        let post = CString::new(format!("{}-post", self.serial)).map_err(io::Error::other)?;
+        self.copy_entry(
+            self.backup.as_raw_fd(),
+            &live,
+            self.backup.as_raw_fd(),
+            &post,
+            &current,
+        )?;
+        let name = CString::new(e.quarantine.as_bytes()).map_err(io::Error::other)?;
+        let src = sys::open_at(
+            self.q.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        )?;
+        let dst = sys::open_at(
+            self.backup.as_raw_fd(),
+            &live,
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        )?;
+        let actual = sys::stat_fd(dst.as_raw_fd())?;
+        if actual.st_dev != current.st_dev
+            || actual.st_ino != current.st_ino
+            || actual.st_mode & libc::S_IFMT != libc::S_IFREG
+        {
+            return Err(io::Error::other("shared inode changed during undo"));
+        }
+        let before = e
+            .note
+            .before
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing pre-image metadata"))?;
+        let mut source = File::from(src);
+        let mut destination = File::from(dst);
+        destination.set_len(0)?;
+        let copied = io::copy(&mut source, &mut destination)?;
+        if copied != before.size as u64 {
+            return Err(io::Error::other(
+                "short shared-inode restore; both versions remain in quarantine",
+            ));
+        }
+        sys::metadata_fd(
+            destination.as_raw_fd(),
+            before.mode,
+            before.mtime,
+            before.mtime_ns,
+        )?;
+        destination.sync_all()?;
+        sys::rename_at(
+            self.backup.as_raw_fd(),
+            &live,
+            at.fd.as_raw_fd(),
+            &at.name,
+            libc::RENAME_NOREPLACE,
+        )?;
+        sys::rename_at(
+            self.backup.as_raw_fd(),
+            &post,
+            self.backup.as_raw_fd(),
+            &live,
+            libc::RENAME_NOREPLACE,
+        )?;
+        let references = self
+            .copies
+            .get_mut(&e.quarantine)
+            .ok_or_else(|| io::Error::other("missing pre-image reference count"))?;
+        *references -= 1;
+        Ok(())
+    }
     fn restore_size(&mut self, e: &Effect, p: &Path) -> io::Result<()> {
         let at = self.parent(p)?;
         let before = e
@@ -194,21 +279,40 @@ impl Undo {
             .ok_or_else(|| io::Error::other("missing grown file"))?;
         self.save_current(p, &at)?;
         let live = CString::new(self.serial.to_string()).map_err(io::Error::other)?;
-        // Keep the grown version in quarantine and restore only its old prefix.
-        current.st_size = before.size;
-        self.copy_entry(
-            self.backup.as_raw_fd(),
-            &live,
-            at.fd.as_raw_fd(),
-            &at.name,
-            &current,
-        )?;
-        let destination = sys::open_at(
-            at.fd.as_raw_fd(),
-            &at.name,
-            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0,
-        )?;
+        let post = CString::new(format!("{}-post", self.serial)).map_err(io::Error::other)?;
+        let shared = current.st_nlink > 1;
+        let destination = if shared {
+            self.copy_entry(
+                self.backup.as_raw_fd(),
+                &live,
+                self.backup.as_raw_fd(),
+                &post,
+                &current,
+            )?;
+            sys::open_at(
+                self.backup.as_raw_fd(),
+                &live,
+                libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                0,
+            )?
+        } else {
+            // Preserve the full grown file in the backup, but copy only the old
+            // prefix back. A large sparse extension must not force a huge copy.
+            current.st_size = before.size;
+            self.copy_entry(
+                self.backup.as_raw_fd(),
+                &live,
+                at.fd.as_raw_fd(),
+                &at.name,
+                &current,
+            )?;
+            sys::open_at(
+                at.fd.as_raw_fd(),
+                &at.name,
+                libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                0,
+            )?
+        };
         let destination = File::from(destination);
         destination.set_len(before.size as u64)?;
         sys::metadata_fd(
@@ -218,13 +322,29 @@ impl Undo {
             before.mtime_ns,
         )?;
         destination.sync_all()?;
+        if shared {
+            sys::rename_at(
+                self.backup.as_raw_fd(),
+                &live,
+                at.fd.as_raw_fd(),
+                &at.name,
+                libc::RENAME_NOREPLACE,
+            )?;
+            sys::rename_at(
+                self.backup.as_raw_fd(),
+                &post,
+                self.backup.as_raw_fd(),
+                &live,
+                libc::RENAME_NOREPLACE,
+            )?;
+        }
         Ok(())
     }
     fn apply(&mut self, e: &Effect) -> io::Result<()> {
         let p = journal::path(&e.path)?;
         match e.op.as_str() {
             "delete" => self.restore_kept(e, &p),
-            "modify" => self.restore_kept(e, &p),
+            "modify" => self.restore_modified(e, &p),
             "create" => {
                 let at = match self.parent(&p) {
                     Ok(a) => a,
