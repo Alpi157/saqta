@@ -49,17 +49,18 @@ check fmt cargo fmt --all -- --check
 check clippy cargo clippy --all-targets --locked -- -D warnings
 check test cargo test --locked
 if cargo run -q --locked -- doctor --help >/dev/null 2>&1; then check doctor cargo run -q --locked -- doctor; fi
-if command -v cargo-deny >/dev/null 2>&1; then check deny cargo deny check; fi
+if command -v cargo-deny >/dev/null 2>&1; then check deny cargo deny --offline check; fi
 
-# Source and history
+# Source and history. Include the current working tree so uncommitted work is reviewable.
 g log --stat "$base..HEAD" > "$out/log.txt"
 g diff --stat "$base...HEAD" > "$out/diffstat.txt"
 g diff "$base...HEAD" > "$out/diff.patch"
 g diff HEAD > "$out/uncommitted.patch"
 g status --porcelain=v1 > "$out/status.txt"
-g archive --format=tar --prefix=source/ HEAD | tar -x -C "$out"
+mkdir -p "$out/source"
+g ls-files -z --cached --others --exclude-standard | tar --null --files-from=- -cf - | tar -xf - -C "$out/source"
 if [ -s "$out/uncommitted.patch" ] || grep -q '^??' "$out/status.txt"; then
-  echo "WARNING: uncommitted or untracked changes exist (see uncommitted.patch and status.txt); source/ is HEAD only." >> "$summary"
+  echo "WARNING: uncommitted or untracked changes exist (see uncommitted.patch and status.txt); source/ includes the working tree." >> "$summary"
 fi
 
 # Environment, including whether we ran inside a sandbox
@@ -77,7 +78,7 @@ cp review/REPORT.md "$out/REPORT.md"
 { echo; [ $failed -eq 0 ] && echo "ALL CHECKS PASSED" || echo "SOME CHECKS FAILED"; } >> "$summary"
 
 zip_path=$out.zip
-if command -v zip >/dev/null 2>&1; then (cd review && zip -qr "$(basename "$zip_path")" "$(basename "$out")")
+if command -v zip >/dev/null 2>&1; then (cd review && zip -qr - "$(basename "$out")") > "$zip_path"
 else python3 -m zipfile -c "$zip_path" "$out"; fi
 cat "$summary"
 rm -rf "$out"
