@@ -1,0 +1,9 @@
+## git checkout -- . && git clean -fdx (31k deletions)
+bare        575 ms (runs: 573 583 575) 
+v2-sync    1141 ms (runs: 1141 1157 1081) notifs=31129 links=30523 copies=0
+## rm -rf src (100k+ files)
+bare        528 ms (runs: 528 552 514) 
+v2-sync    3225 ms (runs: 2888 3225 4162) notifs=101313 links=100300 copies=0
+## git status -uall
+bare        187 ms (runs: 187 220 166) 
+v2-sync     146 ms (runs: 167 132 146) notifs=3 links=1 copies=0

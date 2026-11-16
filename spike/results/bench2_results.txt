@@ -1,0 +1,26 @@
+## git checkout -- . && git clean -fdx (31k deletions incl. node_modules, .env, 50 MB db)
+bare           644 ms  (runs: 701 597 644)  
+notify        1490 ms  (runs: 1490 1472 1513)  notifs=31330 links=0 copies=0 copied_bytes=0
+capture       2082 ms  (runs: 1967 2215 2082)  notifs=31330 links=30523 copies=0 copied_bytes=0
+skipregen     1867 ms  (runs: 1752 1868 1867)  notifs=31330 links=523 copies=0 copied_bytes=0
+## rm -rf src (100k+ files, home-wipe scale)
+bare           579 ms  (runs: 645 579 547)  
+notify        3583 ms  (runs: 3707 3583 3495)  notifs=101313 links=0 copies=0 copied_bytes=0
+capture       5259 ms  (runs: 5307 5213 5259)  notifs=101313 links=100300 copies=0 copied_bytes=0
+## cp -r src/pkg00 src/pkgcopy (10k new files)
+bare          1429 ms  (runs: 369 1429 3038)  
+notify        4320 ms  (runs: 4240 4320 4583)  notifs=10001 links=0 copies=0 copied_bytes=0
+capture       4690 ms  (runs: 4776 4690 4656)  notifs=10001 links=0 copies=0 copied_bytes=0
+## sed -i on 200 modified files (rename-over)
+bare            31 ms  (runs: 29 33 31)  
+notify          49 ms  (runs: 57 49 42)  notifs=401 links=0 copies=0 copied_bytes=0
+capture         57 ms  (runs: 51 57 57)  notifs=401 links=200 copies=0 copied_bytes=0
+## write 30k new files into node_modules (npm-install-like)
+bare          6600 ms  (runs: 4240 6600 9149)  
+notify       13628 ms  (runs: 14072 13628 12947)  notifs=30001 links=0 copies=0 copied_bytes=0
+capture      13465 ms  (runs: 13976 13465 13247)  notifs=30001 links=0 copies=0 copied_bytes=0
+skipregen    13485 ms  (runs: 13676 13485 13180)  notifs=30001 links=0 copies=0 copied_bytes=0
+## overwrite 200 existing files in place with > (needs content copies)
+bare            40 ms  (runs: 40 41 33)  
+notify          51 ms  (runs: 51 47 55)  notifs=201 links=0 copies=0 copied_bytes=0
+capture         71 ms  (runs: 89 63 71)  notifs=201 links=0 copies=200 copied_bytes=506117

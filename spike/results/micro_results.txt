@@ -1,0 +1,30 @@
+## delete N files (rm -rf) (N=20000, median of 5; total ms and extra µs per file vs bare)
+bare            78.6 ms     +0.0 µs/file
+v1-notify      617.4 ms    +26.9 µs/file
+v1-capture     803.4 ms    +36.2 µs/file
+v2-capture     777.8 ms    +35.0 µs/file
+v2-sync        269.1 ms     +9.5 µs/file
+## create N files with open('w') (O_TRUNC) (N=20000, median of 5; total ms and extra µs per file vs bare)
+bare           266.5 ms     +0.0 µs/file
+v1-notify      955.6 ms    +34.5 µs/file
+v1-capture    1044.5 ms    +38.9 µs/file
+v2-capture    1063.9 ms    +39.9 µs/file
+v2-sync        412.7 ms     +7.3 µs/file
+## create N files with O_EXCL (like git objects, cp to new paths) (N=20000, median of 5; total ms and extra µs per file vs bare)
+bare           143.7 ms     +0.0 µs/file
+v1-notify      744.3 ms    +30.0 µs/file
+v1-capture     767.3 ms    +31.2 µs/file
+v2-capture     134.9 ms     -0.4 µs/file
+v2-sync        148.9 ms     +0.3 µs/file
+## rename N files over existing targets (atomic-save pattern) (N=20000, median of 5; total ms and extra µs per file vs bare)
+bare            80.9 ms     +0.0 µs/file
+v1-notify      359.8 ms    +13.9 µs/file
+v1-capture     433.2 ms    +17.6 µs/file
+v2-capture     427.7 ms    +17.3 µs/file
+v2-sync        173.5 ms     +4.6 µs/file
+## stat + read N files (read-only, never intercepted) (N=20000, median of 5; total ms and extra µs per file vs bare)
+bare           256.6 ms     +0.0 µs/file
+v1-notify      256.4 ms     -0.0 µs/file
+v1-capture     254.5 ms     -0.1 µs/file
+v2-capture     251.0 ms     -0.3 µs/file
+v2-sync        267.5 ms     +0.5 µs/file
