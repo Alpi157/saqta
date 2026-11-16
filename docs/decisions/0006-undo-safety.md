@@ -1,19 +1,23 @@
 # Check every conflict before restoring
 
 ## Context
-Undo must preserve newer user work. A replaced directory or symlink must not redirect restoration elsewhere.
+Undo must preserve newer work and finish independently of its output consumer.
 
 ## Decision
-Refuse supervised undo, live command trees, repeated undo and damaged journals. Hold a command-specific nonblocking undo lock. Compare every changed path against its latest post-state before changing anything. Blocked calls changed no paths and do not participate in conflicts. Check saved pre-image metadata as well.
+Refuse supervised undo, live trees, repeated undo and damaged journals. Hold a nonblocking command lock. Check post-states and pre-image metadata before restoring. Ignore blocked calls in conflict checks.
 
-Open canonical parents from a pinned root with openat2 RESOLVE_NO_SYMLINKS and RESOLVE_BENEATH. All final-component operations use directory fds and never follow symlinks. A missing parent is acceptable during conflict checking only when the recorded path is absent. During restoration its directory must already have been recreated by an earlier reverse effect.
+Open canonical parents from a pinned root with openat2 RESOLVE_NO_SYMLINKS and RESOLVE_BENEATH. Final operations use directory fds. Accept missing parents only for absent post-states. Recreate parents before children.
 
-Reverse effects in sequence order: recreate removed directories, restore kept files, remove creations, shrink extensions, reverse renames, and swap exchanges back. Consume a quarantine name by rename on the same filesystem. Copy across filesystems or when earlier effects still need that pre-image.
+Changed `.git/index` and `.git/worktrees/*/index` never block undo. Restore the pre-command index matching the working tree. Keep the newer index and print its location, explaining that git status rewrites it. Other index paths get no exception.
 
-Before discarding a current entry, move it to a private undo quarantine. Sync its percent-encoded recovery map first. Across filesystems, copy before unlinking; refuse nonempty directory or special-file copies. Reverse renames and exchanges also get recovery instructions. An undo-in-progress marker makes partial failure require manual review. Mark undone only after the protected effects finish. Report unprotected effects explicitly.
+Other conflicts refuse before restoration, listing ten paths and the remainder. Offer --force, retaining newer entries before replacement. Dry-run explains conflicts and retention. Name exclusive undo folders from command id/start time. Force cannot bypass safety checks. M2 journals stay compatible.
+
+Reverse effects newest first. Rename pre-images back; copy when reused or across filesystems. Sync the recovery map before displacing entries. Refuse nonempty directory and special-file copies across filesystems. Retain conflicting move inputs before making working copies. Record reverse moves. Keep an in-progress marker until completion; partial failure requires manual review.
+
+Undo ignores SIGPIPE. Output errors disable further printing without stopping restoration. Future file-changing commands, including release and gc, follow this rule. Read-only commands use default SIGPIPE. Default summaries show category counts, elapsed time, ten example paths at most, every unprotected item and recovery locations. --verbose lists effects. Dry-run uses the same format.
 
 ## Alternatives considered
-Blind replacement loses newer work. Following intermediate symlinks can restore into an unrelated tree. Keep-both conflict handling belongs to a later milestone.
+Blind replacement loses work. Blocking Git refreshes prevents rescue. Output-driven termination leaves partial restores.
 
 ## Consequences
-Two hard links modified in place may return as separate files. Surviving shared inodes are repaired after retaining independent backups. Incomplete-command post-states cannot detect changes made before recovery observation. All entries displaced by undo remain available for manual recovery. Power loss during undo requires reviewing its recovery map.
+Hard links may separate. Back up shared inodes before repair. Recovery observations cannot detect earlier edits. Power loss requires reviewing the recovery map.

@@ -133,6 +133,9 @@ pub fn disposition(sig: i32, handler: usize) {
     }
     let _ = action(sig, Some(&a));
 }
+pub fn ignore_sigpipe() {
+    disposition(libc::SIGPIPE, libc::SIG_IGN);
+}
 fn mask(signals: &[i32]) -> libc::sigset_t {
     // SAFETY: the local mask is initialized before use.
     unsafe {

@@ -1,19 +1,24 @@
 //! Undo checks all conflicts first, then walks canonical parents without symlinks.
 use crate::{
     journal::{self, Effect, State},
+    output::Progress,
     paths, sys,
 };
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CString, OsStr},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
-        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, OpenOptionsExt},
+        },
     },
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 fn cstr(p: &OsStr) -> io::Result<CString> {
@@ -30,6 +35,10 @@ struct Undo {
     log: File,
     serial: u64,
     copies: HashMap<String, usize>,
+    conflicts: HashSet<String>,
+    git_indexes: HashSet<String>,
+    backup_path: PathBuf,
+    output: Progress<io::Stdout>,
 }
 impl Undo {
     fn parent(&self, p: &Path) -> io::Result<Parent> {
@@ -88,7 +97,62 @@ impl Undo {
                 )
             }
             Err(e) => Err(e),
+        }?;
+        if self.git_indexes.remove(&journal::display(p)) {
+            self.output.line(format_args!(
+                "kept the newer git index in {} (git rewrites it on commands like git status)",
+                journal::display(&self.backup_path.join(self.serial.to_string()))
+            ));
         }
+        Ok(())
+    }
+    // Reverse moves still need their source. Keep the conflicting entry first,
+    // then make an independent working copy so the retained version never moves.
+    fn keep_move_input(&mut self, p: &Path, at: &Parent) -> io::Result<()> {
+        if !self.conflicts.remove(&journal::display(p))
+            || sys::stat_at(at.fd.as_raw_fd(), &at.name)?.is_none()
+        {
+            return Ok(());
+        }
+        self.save_current(p, at)?;
+        let saved = CString::new(self.serial.to_string()).map_err(io::Error::other)?;
+        self.copy_tree(self.backup.as_raw_fd(), &saved, at.fd.as_raw_fd(), &at.name)
+    }
+    fn copy_tree(
+        &self,
+        from: i32,
+        name: &std::ffi::CStr,
+        to: i32,
+        dest: &std::ffi::CStr,
+    ) -> io::Result<()> {
+        let st = sys::stat_at(from, name)?
+            .ok_or_else(|| io::Error::other("missing displaced move input"))?;
+        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return self.copy_entry(from, name, to, dest, &st);
+        }
+        let source = sys::open_at(
+            from,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )?;
+        sys::mkdir_at(to, dest, 0o700)?;
+        let target = sys::open_at(
+            to,
+            dest,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )?;
+        for entry in fs::read_dir(format!("/proc/self/fd/{}", source.as_raw_fd()))? {
+            let child = cstr(&entry?.file_name())?;
+            self.copy_tree(source.as_raw_fd(), &child, target.as_raw_fd(), &child)?;
+        }
+        sys::metadata_fd(
+            target.as_raw_fd(),
+            st.st_mode,
+            st.st_mtime,
+            st.st_mtime_nsec,
+        )
     }
     fn copy_entry(
         &self,
@@ -355,6 +419,9 @@ impl Undo {
             }
             "rmdir" => {
                 let at = self.parent(&p)?;
+                if self.conflicts.remove(&e.path) {
+                    self.save_current(&p, &at)?;
+                }
                 if sys::stat_at(at.fd.as_raw_fd(), &at.name)?.is_none() {
                     let st = e
                         .note
@@ -384,6 +451,7 @@ impl Undo {
                 if sys::stat_at(from.fd.as_raw_fd(), &from.name)?.is_none() {
                     return Ok(());
                 }
+                self.keep_move_input(&dest, &from)?;
                 // An unacknowledged rename on a killed supervisor may never have run.
                 if sys::stat_at(to.fd.as_raw_fd(), &to.name)?
                     .as_ref()
@@ -413,6 +481,8 @@ impl Undo {
                 let dest = journal::path(&e.path2)?;
                 let a = self.parent(&p)?;
                 let b = self.parent(&dest)?;
+                self.keep_move_input(&p, &a)?;
+                self.keep_move_input(&dest, &b)?;
                 writeln!(
                     self.log,
                     "exchange\t{}\t{}",
@@ -457,7 +527,149 @@ fn current_secure(root: i32, p: &Path) -> io::Result<Option<State>> {
         .as_ref()
         .map(State::from_stat))
 }
-pub fn run(id: u64, dry_run: bool) -> Result<i32> {
+fn is_git_index(p: &Path) -> bool {
+    if p.file_name() != Some(OsStr::new("index")) {
+        return false;
+    }
+    let Some(parent) = p.parent() else {
+        return false;
+    };
+    parent.file_name() == Some(OsStr::new(".git"))
+        || parent.parent().is_some_and(|worktrees| {
+            worktrees.file_name() == Some(OsStr::new("worktrees"))
+                && worktrees.parent().and_then(Path::file_name) == Some(OsStr::new(".git"))
+        })
+}
+
+fn conflict_message(id: u64, conflicts: &[String], backup: &Path) -> String {
+    let mut message = format!(
+        "paths changed after command {id}; refusing to overwrite newer work:\n{}",
+        conflicts
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    if conflicts.len() > 10 {
+        message.push_str(&format!("\n+{} more", conflicts.len() - 10));
+    }
+    message.push_str(&format!(
+        "\nRun `saqta undo {id} --force` to restore anyway. Every newer version is moved to {} first, so nothing is lost.",
+        journal::display(backup)
+    ));
+    message
+}
+
+#[derive(Default)]
+struct Summary {
+    counts: [usize; 5],
+    examples: Vec<String>,
+}
+impl Summary {
+    fn record(&mut self, e: &Effect) {
+        let category = match e.op.as_str() {
+            "delete" => 0,
+            "modify" | "size" => 1,
+            "create" => 2,
+            "rmdir" => 3,
+            "rename" | "exchange" => 4,
+            _ => return,
+        };
+        self.counts[category] += 1;
+        for path in [&e.path, &e.path2] {
+            if !path.is_empty() && self.examples.len() < 10 && !self.examples.contains(path) {
+                self.examples.push(path.clone());
+            }
+        }
+    }
+
+    fn print(
+        &self,
+        output: &mut Progress<io::Stdout>,
+        dry_run: bool,
+        verbose: bool,
+        started: Instant,
+    ) {
+        let labels = if dry_run {
+            [
+                "would restore deleted files",
+                "would restore modified files",
+                "would remove created paths",
+                "would recreate directories",
+                "would reverse renames",
+            ]
+        } else {
+            [
+                "restored deleted files",
+                "restored modified files",
+                "removed created paths",
+                "recreated directories",
+                "reversed renames",
+            ]
+        };
+        for (label, count) in labels.iter().zip(self.counts) {
+            output.line(format_args!("{label}: {count}"));
+        }
+        output.line(format_args!(
+            "elapsed: {:.3} s",
+            started.elapsed().as_secs_f64()
+        ));
+        if !verbose {
+            for path in &self.examples {
+                output.line(format_args!("example path: {path}"));
+            }
+        }
+    }
+}
+
+fn report_unrestored(output: &mut Progress<io::Stdout>, effects: &[Effect]) {
+    // Report every unprotected item before starting, even if a later restore
+    // fails. These diagnostics are never limited by the example-path budget.
+    for e in effects {
+        match e.op.as_str() {
+            "not protected" => output.line(format_args!(
+                "could not restore {}: not protected: {}",
+                e.path, e.note.message
+            )),
+            "blocked" => output.line(format_args!("blocked {}: {}", e.path, e.note.message)),
+            _ => {}
+        }
+    }
+}
+
+fn restore_effects(
+    undo: &mut Undo,
+    record: &journal::Record,
+    verbose: bool,
+    summary: &mut Summary,
+) -> Result<()> {
+    for e in record.effects.iter().rev() {
+        if record.outcomes.get(&e.seq) == Some(&false)
+            || matches!(e.op.as_str(), "blocked" | "not protected")
+        {
+            continue;
+        }
+        undo.apply(e).with_context(|| {
+            format!(
+                "could not undo {} {}; recovery files: {}",
+                e.op,
+                e.path,
+                journal::display(&undo.backup_path)
+            )
+        })?;
+        summary.record(e);
+        if verbose {
+            undo.output
+                .line(format_args!("restored {} {}", e.op, e.path));
+        }
+    }
+    Ok(())
+}
+
+pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
+    let started = Instant::now();
+    let mut output = Progress::new(io::stdout());
     if std::env::var_os("SAQTA_SUPERVISED").is_some() {
         bail!("run undo in your own terminal");
     }
@@ -494,6 +706,7 @@ pub fn run(id: u64, dry_run: bool) -> Result<i32> {
     let root = sys::open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY, 0)?;
     let mut posts = journal::post_states(&folder)?;
     let mut conflicts = Vec::new();
+    let mut inaccessible = HashSet::new();
     for e in &r.effects {
         if e.op == "blocked" {
             continue;
@@ -516,16 +729,33 @@ pub fn run(id: u64, dry_run: bool) -> Result<i32> {
                         bail!("missing post-state for {name}; refusing undo");
                     }
                 }
-                Err(_) => conflicts.push(name.clone()),
+                Err(_) => {
+                    inaccessible.insert(name.clone());
+                    conflicts.push(name.clone());
+                }
             }
         }
     }
     conflicts.sort();
     conflicts.dedup();
-    if !conflicts.is_empty() {
+    let (git_indexes, conflicts): (Vec<_>, Vec<_>) = conflicts.into_iter().partition(|name| {
+        !inaccessible.contains(name) && journal::path(name).is_ok_and(|p| is_git_index(&p))
+    });
+    let backup_path = home
+        .join("q/main")
+        .join(format!("undo-{id}-{}", r.meta.start_ns));
+    if !conflicts.is_empty() && !force && !dry_run {
+        bail!("{}", conflict_message(id, &conflicts, &backup_path));
+    }
+    if !inaccessible.is_empty() && !dry_run {
         bail!(
-            "paths changed after command {id}:\n{}",
-            conflicts.join("\n")
+            "cannot safely open parents for changed paths; --force cannot bypass directory traversal checks; nothing restored:\n{}",
+            conflicts
+                .iter()
+                .filter(|name| inaccessible.contains(*name))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
     let qpath = home.join("q/main").join(id.to_string());
@@ -561,20 +791,57 @@ pub fn run(id: u64, dry_run: bool) -> Result<i32> {
         }
     }
     if dry_run {
+        output.line(format_args!("would undo command {id} (dry run)"));
+        if !conflicts.is_empty() {
+            output.line(format_args!(
+                "{}",
+                conflict_message(id, &conflicts, &backup_path)
+            ));
+            output.line(format_args!(
+                "with --force, would keep newer entries there before restoring"
+            ));
+        }
+        if !inaccessible.is_empty() {
+            output.line(format_args!(
+                "--force cannot bypass directory traversal checks; repair the changed parents first"
+            ));
+        }
+        for name in &git_indexes {
+            output.line(format_args!(
+                "would keep the newer git index {name} in {} before restoring",
+                journal::display(&backup_path)
+            ));
+        }
+        report_unrestored(&mut output, &r.effects);
+        let mut summary = Summary::default();
         for e in r
             .effects
             .iter()
             .rev()
             .filter(|e| r.outcomes.get(&e.seq) != Some(&false))
         {
-            println!("would undo {} {}", e.op, e.path);
+            summary.record(e);
+            if verbose && !matches!(e.op.as_str(), "blocked" | "not protected") {
+                output.line(format_args!("would undo {} {}", e.op, e.path));
+            }
         }
+        summary.print(&mut output, true, verbose, started);
+        output.line(format_args!(
+            "would keep displaced versions in {} (see recovery.log after undo)",
+            journal::display(&backup_path)
+        ));
         return Ok(0);
     }
-    let backup_path = home
-        .join("q/main")
-        .join(format!("undo-{id}-{}", journal::now()));
-    journal::private_dir(&backup_path)?;
+    output.line(format_args!("undoing command {id}"));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&backup_path)
+        .with_context(|| {
+            format!(
+                "cannot create undo folder {}; inspect it if it already exists",
+                journal::display(&backup_path)
+            )
+        })?;
     let backup = sys::open_at(
         libc::AT_FDCWD,
         &cstr(backup_path.as_os_str())?,
@@ -597,34 +864,54 @@ pub fn run(id: u64, dry_run: bool) -> Result<i32> {
         log,
         serial: 0,
         copies,
+        conflicts: conflicts
+            .into_iter()
+            .chain(git_indexes.iter().cloned())
+            .collect(),
+        git_indexes: git_indexes.into_iter().collect(),
+        backup_path: backup_path.clone(),
+        output,
     };
-    for e in r.effects.iter().rev() {
-        if r.outcomes.get(&e.seq) == Some(&false) {
-            continue;
-        }
-        if e.op == "blocked" {
-            println!("blocked {}: {}", e.path, e.note.message);
-            continue;
-        }
-        if e.op == "not protected" {
-            println!(
-                "could not restore {}: not protected: {}",
-                e.path, e.note.message
-            );
-            continue;
-        }
-        undo.apply(e).with_context(|| {
-            format!(
-                "could not undo {} {}; recovery files: {}",
-                e.op,
-                e.path,
-                backup_path.display()
-            )
-        })?;
-        println!("restored {} {}", e.op, e.path);
+    report_unrestored(&mut undo.output, &r.effects);
+    let mut summary = Summary::default();
+    let result = restore_effects(&mut undo, &r, verbose, &mut summary).and_then(|()| {
+        journal::mark_undone(&folder)?;
+        fs::remove_file(folder.join("undo-in-progress"))?;
+        journal::import(&home)?;
+        Ok(())
+    });
+    summary.print(&mut undo.output, false, verbose, started);
+    if undo.serial > 0 {
+        undo.output.line(format_args!(
+            "displaced versions kept in {} (see recovery.log)",
+            journal::display(&backup_path)
+        ));
+    } else {
+        undo.output.line(format_args!("displaced versions: none"));
     }
-    journal::mark_undone(&folder)?;
-    fs::remove_file(folder.join("undo-in-progress"))?;
-    journal::import(&home)?;
+    result?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_index_exception_has_exact_component_boundaries() {
+        for path in ["/repo/.git/index", "/repo/.git/worktrees/topic/index"] {
+            assert!(is_git_index(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/repo/index",
+            "/repo/not.git/index",
+            "/repo/.git/objects/index",
+            "/repo/.git/worktrees/index",
+            "/repo/.git/worktrees/topic/nested/index",
+            "/repo/.git/index.lock",
+            "/repo/.git/worktrees/topic/index.lock",
+        ] {
+            assert!(!is_git_index(Path::new(path)), "{path}");
+        }
+    }
 }

@@ -3,6 +3,7 @@ mod doctor;
 mod exec;
 mod filter;
 mod journal;
+mod output;
 mod paths;
 mod restore;
 mod supervisor;
@@ -15,6 +16,10 @@ fn main() {
     {
         let code = supervisor::internal(std::env::args_os().skip(2).collect()).unwrap_or(125);
         sys::exit(code);
+    }
+    let undo = std::env::args_os().nth(1).is_some_and(|s| s == "undo");
+    if undo {
+        sys::ignore_sigpipe();
     }
     let cli = clap::Command::new("saqta")
         .about("Run coding agent commands under a seccomp supervisor")
@@ -107,6 +112,18 @@ fn main() {
                         .long("dry-run")
                         .help("Check conflicts and print changes without restoring")
                         .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    clap::Arg::new("force")
+                        .long("force")
+                        .help("Restore despite newer paths, keeping displaced entries")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    clap::Arg::new("verbose")
+                        .long("verbose")
+                        .help("Print every effect as well as the summary")
+                        .action(clap::ArgAction::SetTrue),
                 ),
         );
     let m = cli.get_matches();
@@ -124,13 +141,19 @@ fn main() {
         Some(("undo", m)) => restore::run(
             m.get_one::<u64>("id").copied().unwrap_or(0),
             m.get_flag("dry-run"),
+            m.get_flag("force"),
+            m.get_flag("verbose"),
         ),
         _ => Ok(125),
     };
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("saqta: {e:#}");
+            if undo {
+                output::Progress::new(std::io::stderr()).line(format_args!("saqta: {e:#}"));
+            } else {
+                eprintln!("saqta: {e:#}");
+            }
             std::process::exit(125);
         }
     }
