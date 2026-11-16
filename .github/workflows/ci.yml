@@ -6,6 +6,7 @@ on:
 jobs:
   check:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
@@ -22,6 +23,7 @@ jobs:
         env:
           SAQTA_FORCE_PROC_MEM: '1'
       - run: cargo run --locked -- doctor
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@v2
         with:
-          command: check licenses bans advisories
+          tool: cargo-deny
+      - run: cargo deny check licenses bans advisories

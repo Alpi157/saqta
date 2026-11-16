@@ -63,7 +63,15 @@ doctor_check() {
   return "$rc"
 }
 if cargo run -q --locked -- doctor --help >/dev/null 2>&1; then check doctor doctor_check; fi
-if command -v cargo-deny >/dev/null 2>&1; then check deny cargo deny --offline check; fi
+if command -v cargo-deny >/dev/null 2>&1; then
+  advisory_dbs=("${CARGO_HOME:-$HOME/.cargo}"/advisory-dbs/*/.git)
+  if [ -d "${advisory_dbs[0]}" ]; then
+    check deny cargo deny --offline check
+  else
+    check deny cargo deny --offline check licenses bans sources
+    echo "SKIP: advisory database not fetched; run cargo deny fetch outside the sandbox" >> "$summary"
+  fi
+fi
 
 # Source and history. Include the current working tree so uncommitted work is reviewable.
 g log --stat "$base..HEAD" > "$out/log.txt"
