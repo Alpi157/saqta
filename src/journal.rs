@@ -255,6 +255,7 @@ pub struct Journal {
     pub touched: BTreeSet<PathBuf>,
     seq: u64,
     debug_fd: i32,
+    notifications: Option<File>,
 }
 impl Journal {
     pub fn start(home: PathBuf, args: &[OsString], cwd: &Path, debug_fd: i32) -> io::Result<Self> {
@@ -322,7 +323,17 @@ impl Journal {
             .create_new(true)
             .mode(0o600)
             .open(folder.join("outcomes.log"))?;
+        let notifications = (debug_fd >= 0)
+            .then(|| {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(folder.join("notifications"))
+            })
+            .and_then(Result::ok);
         Ok(Self {
+            notifications,
             home,
             folder,
             quarantine,
@@ -361,7 +372,27 @@ impl Journal {
             folder,
             touched,
             debug_fd: -1,
+            notifications: None,
         })
+    }
+    /// Debug-only observation data. Five LE u64s: received, answered, id, pid, monotonic ms.
+    /// A failed observation must never prevent answering the tracee.
+    pub fn notification_progress(&self, received: u64, answered: u64, id: u64, pid: u32) {
+        use std::os::unix::fs::FileExt;
+        if let Some(file) = &self.notifications {
+            let fields = [
+                received,
+                answered,
+                id,
+                u64::from(pid),
+                sys::monotonic_ms() as u64,
+            ];
+            let mut bytes = [0u8; 40];
+            for (slot, value) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(fields) {
+                slot.copy_from_slice(&value.to_le_bytes());
+            }
+            let _ = file.write_at(&bytes, 0);
+        }
     }
     pub fn child(&mut self, pid: i32) -> io::Result<()> {
         self.meta.child = pid;

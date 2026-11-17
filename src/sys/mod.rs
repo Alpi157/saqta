@@ -283,7 +283,7 @@ pub fn valid(fd: i32, id: u64) -> bool {
     // SAFETY: id is readable and has the ioctl's required u64 layout.
     unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == 0 }
 }
-pub fn answer(fd: i32, id: u64, deny: bool) {
+pub fn answer(fd: i32, id: u64, deny: bool) -> bool {
     let r = Response {
         id,
         error: if deny { -libc::EPERM } else { 0 },
@@ -295,9 +295,7 @@ pub fn answer(fd: i32, id: u64, deny: bool) {
         ..Response::default()
     };
     // SAFETY: r is live and matches the kernel response ABI. A vanished request is harmless.
-    unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &r);
-    }
+    unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &r) == 0 }
 }
 pub fn pass_fd(sock: i32, fd: Option<i32>) -> i32 {
     // SAFETY: msghdr, iovec and aligned ancillary storage remain live; lengths are bounded.

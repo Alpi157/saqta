@@ -165,6 +165,7 @@ fn start(
 fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut Capture) {
     let (mut done, mut status, mut sent, mut gone) = (false, 0, false, false);
     let mut deadline = None;
+    let (mut received, mut answered) = (0u64, 0u64);
     loop {
         let mut fds = [
             libc::pollfd {
@@ -229,7 +230,14 @@ fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut
             && fds[0].revents & libc::POLLIN != 0
             && let Ok(n) = sys::receive(listener)
         {
-            capture.handle(listener, &n);
+            received += 1;
+            capture
+                .journal
+                .notification_progress(received, answered, n.id, n.pid);
+            answered += u64::from(capture.handle(listener, &n));
+            capture
+                .journal
+                .notification_progress(received, answered, n.id, n.pid);
         }
         if done && !sent {
             if listener < 0 {

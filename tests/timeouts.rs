@@ -1,0 +1,135 @@
+mod common;
+use common::*;
+use std::{ffi::OsStr, fs, panic::AssertUnwindSafe, path::PathBuf, time::Duration};
+
+fn report(s: &Sandbox, running: Running, phase: &str) -> String {
+    let pid = running.pid();
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        running.output_with_timeout(Duration::from_millis(350))
+    }));
+    assert!(result.is_err(), "fault injection must hit the timeout");
+    let home = PathBuf::from(&s.env[OsStr::new("SAQTA_HOME")]);
+    let text = fs::read_to_string(home.join(format!("logs/timeout-{pid}.log"))).unwrap();
+    assert!(text.contains("elapsed="), "{text}");
+    assert!(text.contains(&format!("phase={phase}")), "{text}");
+    assert!(
+        text.contains("pid ppid state wchan cpu_ticks delta cmdline"),
+        "{text}"
+    );
+    // Killing S leaves a stale run marker. Exercise the normal dead-command
+    // recovery instead of removing it by hand in the test.
+    assert_success(&run(s.saqta(&["log", "--json"])));
+    text
+}
+fn no_live_processes(tag: &str) {
+    wait_until(Duration::from_secs(2), || {
+        find_processes(tag).into_iter().all(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .is_none_or(|stat| {
+                    stat.rsplit_once(')')
+                        .unwrap()
+                        .1
+                        .trim_start()
+                        .starts_with('Z')
+                })
+        })
+    });
+}
+fn no_sync(s: &mut Sandbox) {
+    s.env.insert("SAQTA_NO_SYNC_WAKE".into(), "1".into());
+}
+
+#[test]
+fn timeout_distinguishes_an_answering_supervisor_and_kills_the_tree() {
+    let (mut s, root) = capture_fixture("timeout-progress");
+    no_sync(&mut s);
+    let mut command = s.exec(&[
+        "--",
+        "/bin/sh",
+        "-c",
+        "while :; do printf x >> victim; sleep .01; done",
+        &s.tag,
+    ]);
+    command.current_dir(root);
+    let running = Running::spawn(command, None);
+    let text = report(&s, running, "process exit");
+    assert!(text.contains("YES, answering notifications"), "{text}");
+    assert!(text.contains("effects.log"), "{text}");
+    assert!(text.contains("outcomes.log"), "{text}");
+    no_live_processes(&s.tag);
+}
+
+#[test]
+fn timeout_identifies_a_stopped_supervisor_and_blocked_tracee() {
+    let (mut s, root) = capture_fixture("timeout-stopped");
+    no_sync(&mut s);
+    let mut command = s.exec(&[
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf ready > ready; sleep .5; printf x > victim",
+        &s.tag,
+    ]);
+    command.current_dir(&root);
+    let running = Running::spawn(command, None);
+    wait_until(Duration::from_secs(3), || root.join("ready").exists());
+    let supervisor = s.run_markers()[0];
+    signal(supervisor, libc::SIGSTOP);
+    let text = report(&s, running, "process exit");
+    assert!(text.contains("NO replies observed in sample"), "{text}");
+    assert!(text.contains(" T "), "{text}");
+    assert!(text.contains("seccomp"), "{text}");
+    no_live_processes(&s.tag);
+}
+
+#[test]
+fn timeout_finds_an_orphan_holding_stdout_after_wrapper_exit() {
+    let s = Sandbox::new("timeout-orphan");
+    let mut command = s.command("/bin/sh");
+    // Clear the environment and reparent the sleeper. Pipe ownership still
+    // connects it to the command even without SAQTA_HOME or a living parent.
+    command.args([
+        "-c",
+        "env -i /bin/sh -c 'sleep 30' & echo $! > orphan",
+        &s.tag,
+    ]);
+    let text = report(&s, Running::spawn(command, None), "stdout EOF");
+    let pid = fs::read_to_string(s.dir.join("orphan")).unwrap();
+    assert!(text.contains(&format!("{} ", pid.trim())), "{text}");
+    assert!(text.contains("sleep 30"), "{text}");
+    assert!(text.contains("wrapper exited"), "{text}");
+    wait_until(Duration::from_secs(2), || {
+        fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+            .ok()
+            .is_none_or(|s| s.rsplit_once(')').unwrap().1.trim_start().starts_with('Z'))
+    });
+}
+
+#[test]
+fn timeout_reports_the_requested_undos_recovery_state() {
+    let (mut s, root) = capture_fixture("timeout-undo");
+    no_sync(&mut s);
+    fs::write(root.join("victim"), b"original bytes").unwrap();
+    let before = tree_hash(&root);
+    assert_success(&script(&s, &root, "rm victim"));
+    let id = last_id(&s);
+    let mut abort = s.saqta(&["undo", &id.to_string()]);
+    abort.env("SAQTA_TEST_ABORT_AFTER", "1");
+    assert_eq!(run(abort).status.code(), Some(86));
+    // The requested undo is deliberately outside the latest three journals.
+    for _ in 0..3 {
+        assert_success(&s.run(&["--", "/bin/true"]));
+    }
+    let running = Running::spawn(s.saqta(&["undo", &id.to_string(), "--resume"]), None);
+    signal(running.pid(), libc::SIGSTOP);
+    let text = report(&s, running, "process exit");
+    assert!(text.contains("undo progress: before=effect=1"), "{text}");
+    assert!(text.contains("recovery.log"), "{text}");
+    assert!(
+        text.contains("command ended; no active listener expected during undo"),
+        "{text}"
+    );
+    assert_success(&run(s.saqta(&["undo", &id.to_string(), "--resume"])));
+    assert_tree(&before, &root);
+}

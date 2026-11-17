@@ -49,6 +49,19 @@ check fmt cargo fmt --all -- --check
 check clippy cargo clippy --all-targets --locked -- -D warnings
 check test cargo test --locked
 if [[ "$milestone" == m2-capture* || "$milestone" == m2b-undo* || "$milestone" == m3-codex* || "$milestone" == m4-harness* ]]; then check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture; fi
+if [[ "$milestone" == m4-harness-r1* ]]; then
+  check release cargo check --release --locked
+  if command -v taskset >/dev/null 2>&1 && taskset -c 0,1 true; then
+    check bulk-two-cpu taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test codex separate_bind_mount_five_thousand_deletes_restore -- --exact --nocapture --test-threads=1
+    check timeouts-two-cpu taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test timeouts -- --test-threads=1
+  else
+    echo "SKIP: taskset or CPUs 0,1 unavailable for constrained R1 checks" >> "$summary"
+  fi
+  if [ -d target/r1-evidence ]; then
+    mkdir -p "$out/evidence"
+    cp target/r1-evidence/*.log target/r1-evidence/*.patch "$out/evidence/"
+  fi
+fi
 doctor_check() {
   local doctor_dir
   mkdir -p target/saqta-tests
