@@ -50,43 +50,57 @@ pub fn run(json_output: bool) -> Result<i32> {
         },
         format!("{}; v0.1 requires x86_64", std::env::consts::ARCH),
     );
-    match sys::probe(&filter::program()) {
-        Ok(sync) => {
-            add(
-                "functional probe",
-                "ok",
-                "listener and CONTINUE worked".into(),
-            );
-            add(
-                "synchronous wake-up",
-                if sync { "ok" } else { "warn" },
-                if sync {
-                    "accepted"
-                } else {
-                    "interception is slower without synchronous wake-up"
-                }
-                .into(),
-            );
-        }
-        Err(e) => {
-            add(
-                "functional probe",
-                if e.raw_os_error() == Some(libc::EBUSY) {
-                    "warn"
-                } else {
-                    "fail"
-                },
-                if e.raw_os_error() == Some(libc::EBUSY) {
-                    "already running under a seccomp supervisor".into()
-                } else {
-                    format!("cannot install and service a listener: {e}")
-                },
-            );
-            add(
-                "synchronous wake-up",
-                "warn",
-                "unavailable because listener probe failed".into(),
-            );
+    let supervised = crate::exec::is_supervised();
+    if supervised {
+        add(
+            "functional probe",
+            "info",
+            "already supervised; listener probe skipped".into(),
+        );
+        add(
+            "synchronous wake-up",
+            "info",
+            "listener probe skipped while already supervised".into(),
+        );
+    } else {
+        match sys::probe(&filter::program()) {
+            Ok(sync) => {
+                add(
+                    "functional probe",
+                    "ok",
+                    "listener and CONTINUE worked".into(),
+                );
+                add(
+                    "synchronous wake-up",
+                    if sync { "ok" } else { "warn" },
+                    if sync {
+                        "accepted"
+                    } else {
+                        "interception is slower without synchronous wake-up"
+                    }
+                    .into(),
+                );
+            }
+            Err(e) => {
+                add(
+                    "functional probe",
+                    if e.raw_os_error() == Some(libc::EBUSY) {
+                        "warn"
+                    } else {
+                        "fail"
+                    },
+                    if e.raw_os_error() == Some(libc::EBUSY) {
+                        "already running under a seccomp supervisor".into()
+                    } else {
+                        format!("cannot install and service a listener: {e}")
+                    },
+                );
+                add(
+                    "synchronous wake-up",
+                    "warn",
+                    "unavailable because listener probe failed".into(),
+                );
+            }
         }
     }
     let yama =
@@ -135,18 +149,26 @@ pub fn run(json_output: bool) -> Result<i32> {
             let metadata = fs::metadata(&home)?;
             let same = metadata.dev() == fs::metadata(&cwd)?.dev();
             let shared = metadata.permissions().mode() & 0o066 != 0;
-            let writable = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(home.join(format!(".doctor-{}", std::process::id())));
-            let can_write = writable.is_ok();
-            if can_write {
+            let writable = if supervised {
+                None
+            } else {
+                Some(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(home.join(format!(".doctor-{}", std::process::id()))),
+                )
+            };
+            let can_write = supervised || writable.as_ref().is_some_and(|r| r.is_ok());
+            if can_write && !supervised {
                 drop(writable);
                 fs::remove_file(home.join(format!(".doctor-{}", std::process::id())))?;
             }
             add(
                 "SAQTA_HOME",
-                if !can_write || !same || shared {
+                if supervised {
+                    "info"
+                } else if !can_write || !same || shared {
                     "warn"
                 } else {
                     "ok"

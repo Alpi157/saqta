@@ -182,6 +182,44 @@ fn running_and_interrupted_undo_are_protected() {
     assert_eq!(fs::read(p.join("file")).unwrap(), b"original");
 }
 #[test]
+fn incremental_history_does_not_reparse_seventy_thousand_effects() {
+    let (s, p) = capture_fixture("history-speed");
+    fs::write(p.join("file"), "original").unwrap();
+    assert_success(&script(&s, &p, "rm file"));
+    let folder = home(&s).join("cmd/0");
+    fs::create_dir(&folder).unwrap();
+    let mut m: Value =
+        serde_json::from_slice(&fs::read(home(&s).join("cmd/1/meta")).unwrap()).unwrap();
+    m["id"] = json!(0);
+    fs::write(folder.join("meta"), serde_json::to_vec(&m).unwrap()).unwrap();
+    fs::write(folder.join("end"), b"{\"status\":0,\"end_ns\":1}").unwrap();
+    let mut text = String::new();
+    for i in 1..=70_000 {
+        text.push_str(&format!("{i}\t1\t0\tnot protected\t\t\t\t0\t{{\"before\":null,\"before2\":null,\"kept\":\"\",\"message\":\"fixture\"}}\n"));
+    }
+    fs::write(folder.join("effects.log"), text).unwrap();
+    let cold = Instant::now();
+    assert_success(&run(s.saqta(&["log", "--json"])));
+    note(format!(
+        "70,000 effects initial import: {:?}",
+        cold.elapsed()
+    ));
+    let db = rusqlite::Connection::open(home(&s).join("journal.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER no_reimport BEFORE DELETE ON effects BEGIN SELECT RAISE(FAIL,'unchanged effects reimported'); END;").unwrap();
+    for args in [
+        vec!["log", "--json"],
+        vec!["show", "1", "--json"],
+        vec!["undo", "1"],
+    ] {
+        let start = Instant::now();
+        assert_success(&run(s.saqta(&args)));
+        let elapsed = start.elapsed();
+        note(format!("70,000 effects history, {}: {elapsed:?}", args[0]));
+        assert!(elapsed < Duration::from_secs(2), "loose CI bound");
+    }
+    assert_eq!(fs::read(p.join("file")).unwrap(), b"original");
+}
+#[test]
 fn opportunistic_gc_runs_after_output_at_most_once_per_day() {
     let (s, p) = capture_fixture("gc-opportunistic");
     assert_success(&script(&s, &p, "true"));

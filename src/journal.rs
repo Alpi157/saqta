@@ -1,7 +1,7 @@
 //! S writes plain files. Only the CLI opens SQLite, which is a rebuildable index.
 use crate::{paths, sys};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -627,6 +627,7 @@ fn database(home: &Path) -> Result<Connection> {
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA user_version=1;
         CREATE TABLE IF NOT EXISTS commands(id INTEGER PRIMARY KEY, start_ns INTEGER NOT NULL, command BLOB NOT NULL, cwd BLOB NOT NULL, status TEXT NOT NULL, exit_status INTEGER, undone INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS effects(command_id INTEGER NOT NULL, seq INTEGER NOT NULL, time_ns INTEGER NOT NULL, pid INTEGER NOT NULL, op TEXT NOT NULL, path BLOB NOT NULL, path2 BLOB NOT NULL, quarantine TEXT NOT NULL, flags INTEGER NOT NULL, note TEXT NOT NULL, PRIMARY KEY(command_id,seq));")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS imports(id INTEGER PRIMARY KEY, stamp BLOB NOT NULL, summary BLOB NOT NULL);")?;
     Ok(db)
 }
 fn recover_posts(folder: &Path, r: &Record) -> Result<()> {
@@ -664,6 +665,33 @@ fn recover_posts(folder: &Path, r: &Record) -> Result<()> {
     synced_json_write(&folder.join("recovered-post.json"), &posts)?;
     Ok(())
 }
+fn summary(r: &Record) -> serde_json::Value {
+    let count = |op: &str| r.effects.iter().filter(|e| e.op == op).count();
+    serde_json::json!({"id":r.meta.id,"start_ns":r.meta.start_ns,"end_ns":r.end_ns,"duration_ns":r.end_ns.map(|end| end.saturating_sub(r.meta.start_ns)),"exit_status":r.exit_status,"status":r.status,"undone":r.undone,"cwd":r.meta.cwd,"command":r.meta.command,"counts":{"deleted":count("delete")+count("rmdir"),"modified":count("modify")+count("size")+count("rename")+count("exchange"),"created":count("create"),"blocked":count("blocked"),"not_protected":count("not protected")+usize::from(r.warning.is_some())}})
+}
+fn source_stamp(folder: &Path) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut stamp = Vec::new();
+    for name in [
+        "meta",
+        "child",
+        "effects.log",
+        "outcomes.log",
+        "post.log",
+        "end",
+        "undone",
+        "error",
+        "expired.json",
+        "tail-recovery.json",
+    ] {
+        match fs::symlink_metadata(folder.join(name)) {
+            Ok(m) => stamp.push(Some((m.ino(), m.len(), m.mtime(), m.mtime_nsec()))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => stamp.push(None),
+            Err(e) => return Err(e),
+        }
+    }
+    serde_json::to_vec(&stamp).map_err(io::Error::other)
+}
 pub fn refresh(home: &Path, id: u64) -> Result<Record> {
     prepare(home)?;
     let record = load(home, id)?;
@@ -673,24 +701,43 @@ pub fn refresh(home: &Path, id: u64) -> Result<Record> {
     recover_posts(&home.join("cmd").join(id.to_string()), &record)?;
     Ok(record)
 }
-pub fn import(home: &Path) -> Result<Vec<Record>> {
+pub fn import(home: &Path) -> Result<Vec<serde_json::Value>> {
     prepare(home)?;
     let mut db = database(home)?;
-    let mut records = Vec::new();
-    for e in fs::read_dir(home.join("cmd"))? {
-        let e = e?;
-        let Some(id) = e.file_name().to_str().and_then(|s| s.parse::<u64>().ok()) else {
+    let tx = db.transaction()?;
+    let mut values = Vec::new();
+    let mut ids = BTreeSet::new();
+    for entry in fs::read_dir(home.join("cmd"))? {
+        let entry = entry?;
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
             continue;
         };
-        if !e.path().join("meta").exists() {
+        let folder = entry.path();
+        if !folder.join("meta").exists() {
             continue;
         }
-        let record = refresh(home, id)?;
-        records.push(record);
-    }
-    records.sort_by_key(|r| std::cmp::Reverse(r.meta.id));
-    let tx = db.transaction()?;
-    for r in &records {
+        ids.insert(id);
+        let stamp = source_stamp(&folder)?;
+        let cached = tx
+            .query_row(
+                "SELECT stamp,summary FROM imports WHERE id=?1",
+                [i64::try_from(id)?],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        if let Some((previous, bytes)) = cached {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if stamp == previous && value["status"] != "running" {
+                values.push(value);
+                continue;
+            }
+        }
+        let r = refresh(home, id)?;
+        let value = summary(&r);
         tx.execute(
             "INSERT OR REPLACE INTO commands VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
@@ -724,17 +771,33 @@ pub fn import(home: &Path) -> Result<Vec<Record>> {
                 ],
             )?;
         }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO imports VALUES (?1,?2,?3)",
+            params![i64::try_from(id)?, stamp, serde_json::to_vec(&value)?],
+        )?;
+        values.push(value);
+    }
+    // A collected folder must never remain visible in the rebuildable index.
+    let cached_ids = tx
+        .prepare("SELECT id FROM commands")?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in cached_ids
+        .into_iter()
+        .filter(|id| !ids.contains(&(*id as u64)))
+    {
+        tx.execute("DELETE FROM effects WHERE command_id=?1", [id])?;
+        tx.execute("DELETE FROM commands WHERE id=?1", [id])?;
+        tx.execute("DELETE FROM imports WHERE id=?1", [id])?;
     }
     tx.commit()?;
-    Ok(records)
+    values.sort_by_key(|v| std::cmp::Reverse(v["id"].as_u64()));
+    Ok(values)
 }
 pub fn log(n: usize, json: bool) -> Result<i32> {
     let home = paths::home()?;
-    let records = import(&home)?;
-    let values: Vec<_> = records.iter().take(n).map(|r| {
-        let count = |op: &str| r.effects.iter().filter(|e| e.op == op).count();
-        serde_json::json!({"id":r.meta.id,"start_ns":r.meta.start_ns,"end_ns":r.end_ns,"duration_ns":r.end_ns.map(|end| end.saturating_sub(r.meta.start_ns)),"exit_status":r.exit_status,"status":r.status,"undone":r.undone,"cwd":r.meta.cwd,"command":r.meta.command,"counts":{"deleted":count("delete")+count("rmdir"),"modified":count("modify")+count("size")+count("rename")+count("exchange"),"created":count("create"),"blocked":count("blocked"),"not_protected":count("not protected")+usize::from(r.warning.is_some())}})
-    }).collect();
+    let values: Vec<_> = import(&home)?.into_iter().take(n).collect();
     if json {
         println!("{}", serde_json::to_string_pretty(&values)?);
     } else {
@@ -819,8 +882,7 @@ fn one_line(text: &str, width: usize) -> String {
 }
 pub fn show(id: u64, json: bool) -> Result<i32> {
     let home = paths::home()?;
-    import(&home)?;
-    let r = load(&home, id)?;
+    let r = refresh(&home, id)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&r)?);
     } else {
