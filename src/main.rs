@@ -3,6 +3,7 @@ mod codex;
 mod doctor;
 mod exec;
 mod filter;
+mod gc;
 mod hook;
 mod journal;
 mod output;
@@ -26,7 +27,7 @@ fn main() {
     }
     let undo = std::env::args_os()
         .nth(1)
-        .is_some_and(|s| s == "undo" || s == "init" || s == "uninstall");
+        .is_some_and(|s| s == "undo" || s == "gc" || s == "init" || s == "uninstall");
     if undo {
         sys::ignore_sigpipe();
     } else if std::env::args_os().nth(1).is_none_or(|s| s != "exec") {
@@ -143,7 +144,30 @@ fn main() {
                         .action(clap::ArgAction::SetTrue),
                 ),
         );
-    let cli = cli.subcommand(clap::Command::new("status"));
+    let cli = cli.subcommand(clap::Command::new("status")).subcommand(
+        clap::Command::new("gc")
+            .about("Collect expired retained content")
+            .arg(
+                clap::Arg::new("dry-run")
+                    .long("dry-run")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("older-than")
+                    .long("older-than")
+                    .default_value("7d"),
+            )
+            .arg(
+                clap::Arg::new("max-size")
+                    .long("max-size")
+                    .default_value("5GB"),
+            )
+            .arg(
+                clap::Arg::new("json")
+                    .long("json")
+                    .action(clap::ArgAction::SetTrue),
+            ),
+    );
     let cli = ["init", "uninstall"].into_iter().fold(cli, |cli, name| {
         cli.subcommand(
             clap::Command::new(name)
@@ -161,6 +185,14 @@ fn main() {
     let m = cli.get_matches();
     let result = match m.subcommand() {
         Some(("status", _)) => codex::status(),
+        Some(("gc", m)) => gc::run(
+            m.get_flag("dry-run"),
+            m.get_one::<String>("older-than")
+                .map_or("7d", String::as_str),
+            m.get_one::<String>("max-size")
+                .map_or("5GB", String::as_str),
+            m.get_flag("json"),
+        ),
         Some((name @ ("init" | "uninstall"), m)) => codex::configure(
             m.get_one::<std::path::PathBuf>("project"),
             name == "uninstall",
@@ -184,6 +216,17 @@ fn main() {
         ),
         _ => Ok(125),
     };
+    if result.is_ok()
+        && matches!(
+            m.subcommand_name(),
+            Some("log" | "show" | "status" | "undo")
+        )
+        && !m
+            .subcommand()
+            .is_some_and(|(_, s)| s.try_get_one::<bool>("dry-run").ok().flatten() == Some(&true))
+    {
+        gc::maybe_gc();
+    }
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
