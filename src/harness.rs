@@ -155,6 +155,20 @@ fn name_path(slot: u8) -> PathBuf {
     name(slot)
 }
 pub fn run() -> Result<()> {
+    if std::env::args_os()
+        .nth(2)
+        .is_some_and(|s| s == "--build-info")
+    {
+        // Compile-time provenance only. This mode opens no fixture or store.
+        serde_json::to_writer(
+            io::stdout().lock(),
+            &serde_json::json!({
+                "manifest_dir": env!("CARGO_MANIFEST_DIR").as_bytes(),
+                "notification_observations": 1,
+            }),
+        )?;
+        return Ok(());
+    }
     let root = std::env::args_os()
         .nth(2)
         .context("fixture root required")?;

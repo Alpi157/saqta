@@ -1,11 +1,11 @@
-# M4 harness, R1: report
+# M4 harness, R2: report
 
 ## What works now (5 lines max)
 - Three filesystem properties exercise sequential commands, concurrent subtrees and interrupted undo.
 - Undo resumes from explicit recovery actions and preserves hard-link alias lineage across commands.
 - GC applies retention in the requested order and labels collected content during undo.
 - Log, show and one-file undo avoid importing unrelated effects on repeated calls.
-- Bulk undo has fewer recovery writes; timeout reports show process and notification progress.
+- Timeout tests validate build provenance and establish fault states before the 350 ms deadline.
 
 ## How it works
 
@@ -70,6 +70,17 @@ Fixtures enable debug logging consistently for direct and supervised commands.
 Each helper command has its own process group. This prevents job-control HUP
 signals from reaching parallel tests while cleanup freezes a process tree.
 
+R2 checks the debug executable's compiled manifest path and observation protocol
+once per test binary with `verify_build`. `__harness --build-info` returns static
+metadata without opening a store. Review builds use `target/review-build`, and
+each validation snapshot must have its own Cargo target directory. Timeout
+tests use `wait_ready` before `output_after_setup`. A stdin barrier establishes
+the blocked tracee; `SAQTA_TEST_STOP_UNDO=1` stops a debug undo before mutation.
+Reports show total elapsed, setup and fault-window time, plus actual observation
+read errors. Capture behavior is unchanged. A separate saved-seed fix relocates
+directory observations through reverse moves and freezes their input map once
+per undo, so resume cannot apply an exchange twice.
+
 ## Acceptance checklist
 
 | # | Item | Result | Proven by (test name or command) |
@@ -101,6 +112,13 @@ signals from reaching parallel tests while cleanup freezes a process tree.
 | R1.4 | Investigate >25% regression and fix cheap recovery overhead | PASS, residual recorded | Checkpoint count and before/after table below; `resume_replays_deletes_with_deferred_completion_checkpoints` |
 | R1.5 | Repeat constrained checks on both CI operating systems; retain timeout artifacts | AUTHORED | `.github/workflows/ci.yml`; remote rerun awaits publication |
 | R1.6 | Full checks and revised review bundle | PASS | `scripts/review-bundle.sh m4-harness-r1`: fmt, clippy, 156 tests, proc-memory fallback, release build, constrained checks, doctor and cargo-deny |
+| R2.1 | Reproduce the user's terminal failure outside the sandbox and compare inside | PASS | `evidence/r2/r2-outside-before.log`, `r2-inside-before.log`, `stale-build.json`: the same three failures in both |
+| R2.2 | Reject stale or foreign binaries before fault injection; isolate validation builds | PASS | `foreign_build_is_rejected_before_fault_injection`; `verify_build`; review script and AGENTS.md |
+| R2.3 | Explicit readiness, including startup exceeding 350 ms; assertions retained | PASS | All four original timeout tests; stopped-supervisor setup includes a deliberate 500 ms delay |
+| R2.4 | Loaded 24-CPU and 2-CPU runs | PASS | Three runs per configuration, all five tests pass; `loaded-checks.json` and individual logs |
+| R2.5 | Whole suite inside and outside the sandbox, with approval for outside | PASS | 160 tests in each: `evidence/r2/full-inside.log` and `full-outside.log` |
+| R2.6 | Revised review bundle | PASS | `scripts/review-bundle.sh m4-harness-r2`: fmt, clippy, 160 tests, proc-memory fallback, release configuration, constrained checks, doctor and cargo-deny |
+| R2.7 | New directory-observation harness regression, exact resume and later-edit refusal | PASS | `regression_directory_observations_follow_exchanges_of_ancestors`, `resumed_directory_observations_are_not_exchanged_twice`, `restored_directory_observations_reject_later_user_edits`; saved seed |
 
 ### Bugs found and fixed
 
@@ -128,6 +146,7 @@ sequences share one underlying bug; all remain as separate regressions.
 | Equal-length truncate after an earlier copy omitted an alias and its changed mtime | Record a modify effect using the existing full pre-image | `regression_rename_over_alias_then_equal_length_truncate` |
 | Undoing a newer command detached an alias needed by the older command | Retain validated lineage and inode handles across undo folders | `regression_alias_lineage_survives_undo_of_a_newer_command` |
 | GC could remove the last good copy when a later command changed an older retained hard link | Refuse collection before mutation when retained pre-images changed; preserve all recovery copies and report why | `tests/retention.rs`: `gc_keeps_a_newer_copy_when_an_older_retained_hard_link_was_changed` |
+| R2 recheck: nested directory exchanges left undo observations at old paths and blocked an older undo | Relocate observations and record final names; freeze the input map for idempotent publication | `regression_directory_observations_follow_exchanges_of_ancestors`, `resumed_directory_observations_are_not_exchanged_twice`, `restored_directory_observations_reject_later_user_edits` |
 
 The forced memory-fallback check also found a supervisor killed during a log
 write. Only a dead incomplete exec may recover its complete prefix. The raw
@@ -153,6 +172,8 @@ restricted to the current command's recovery locations.
 
 - [0012: unacknowledged tail](../docs/decisions/0012-unacknowledged-tail.md): preserve a killed writer's raw log and qualify prefix recovery.
 - [0013: bulk undo checkpoints and diagnostics](../docs/decisions/0013-bulk-undo-checkpoints-and-diagnostics.md): combine redundant checkpoints, retain short ordinary deadlines and measure actual replies on timeout.
+- [0014: artifact provenance and fault readiness](../docs/decisions/0014-artifact-provenance-and-fault-readiness.md): isolate builds, verify the executable, and synchronize each injected fault.
+- [0015: directory observation relocation](../docs/decisions/0015-relocate-directory-observations.md): follow reverse moves and reuse a frozen input map on resume.
 
 ## Measurements
 
@@ -260,6 +281,107 @@ two-CPU bulk and diagnostic checks, formatting, clippy, release configuration,
 doctor and offline cargo-deny all passed. The first bundle's only check failure
 was the advisory-cache lock on a read-only path; the outside-sandbox repeat passed.
 
+### R2: missing observations in the normal terminal
+
+The unmodified tests reproduced the same three failures both outside and inside
+the sandbox: one passed, three failed, in 1.50 s and 1.47 s respectively. The
+user's original `target/timeouts-local.log` is preserved in the bundle. The
+earlier sandbox and CI passes used a fresh executable.
+
+The failing executable was from the standalone R1 commit-validation snapshot.
+That validation used `--manifest-path target/r1-commit-check-bj57wulg/Cargo.toml
+--target-dir target`, which overwrote the branch's executable and build cache.
+This was an agent validation mistake. Cargo reported a fresh test build in
+0.02 s and kept running the older executable. Its SHA-256 was
+`c32b1f413130a29d20c781a7be72b1ade50b90e555ea97cf9dc62157c2de28ec`.
+The binary contained the snapshot's manifest path and lacked
+`notification_progress`. There was no observation file in any failing command,
+although effects, debug logs, process samples and undo checkpoints were present.
+The helper was reading the correct journal path from the wrong executable.
+
+`cargo clean -p saqta` removed the contaminated crate artifacts. Rebuilding the
+branch restored observations. This did not require any change to capture or to
+the observation writer. The permanent guard now rejects an older or foreign
+executable before starting workloads and gives the clean/rebuild command.
+`foreign_build_is_rejected_before_fault_injection` runs the real provenance
+endpoint against an expected foreign checkout and verifies rejection. New
+review builds and future snapshot checks use separate target directories.
+
+The environment comparison below comes from the recorded executions. Fixture
+variables have the same controlled values. Namespace differences are real but
+did not account for the failure: both environments failed with the stale binary
+and passed after rebuilding it.
+
+| Detail | Sandboxed | Approved outside-sandbox run |
+| --- | --- | --- |
+| Test process PID in the context sample | 250 | 1752426 |
+| PID namespace | `4026532473` | `4026532215` |
+| Mount namespace | `4026532471` | `4026532216` |
+| User namespace | `4026532533` | `4026531837` |
+| NoNewPrivs / Seccomp / filter count | 1 / 2 / 1 | 0 / 0 / 0 |
+| CPU affinity | 0-23 | 0-23 |
+| Fixture SAQTA_DEBUG / SAQTA_NO_SYNC_WAKE | 1 / 1 for supervised cases | 1 / 1 for supervised cases |
+| HOME, XDG and SAQTA_HOME | Unique fixture folders under `target/saqta-tests` | Same layout, distinct fixture ids |
+| `/proc` state, wchan, cmdline and journal reads | Readable, PIDs match the supervisor | Readable, PIDs match the supervisor |
+| Observation file before rebuilding | Absent | Absent |
+| Observation file after rebuilding | Present, forty bytes, replies advance | Present, forty bytes, replies advance |
+
+Readiness no longer depends on completing setup in 350 ms. Each readiness
+condition has the ordinary ten-second bound and diagnoses failure before
+cleanup. The actual injected timeout remains 350 ms. The answering supervisor
+must first publish two successful replies. The stopped supervisor is confirmed
+in state T before stdin releases its tracee, which must then reach seccomp wait.
+The undo stops itself before changing data; the orphan case waits for wrapper
+exit. Reports separate setup from the fault window while retaining total elapsed.
+All original reply, process-state, recovery-map, cleanup and exact-restore
+assertions remain. No missing-record condition counts as success.
+
+Loaded checks used three independent runs per configuration with the default
+parallel test runner. CPU workers were Python processes doing an infinite busy
+loop, pinned to the same CPUs as Cargo and the tests, then terminated and reaped.
+The bundle includes `evidence/r2/timeout-load.py`; run it from the repository root
+to repeat the load check. The stopped-supervisor setup deliberately includes a
+500 ms startup delay, followed by explicit handshakes. Recorded setup reached
+520.6 to 534.3 ms under load, beyond the old spawn-relative deadline.
+
+| R2 check | Runs / tests per run | Results | Wall time per Cargo invocation |
+| --- | --- | --- | --- |
+| CPUs 0-23 with 24 CPU workers | 3 / 5 | All pass | 2.933, 2.174, 2.172 s |
+| CPUs 0-1 with 4 CPU workers | 3 / 5 | All pass | 3.673, 3.573, 3.623 s |
+| Whole suite, sandboxed | 1 / 160 | All pass | 32.10 s across test binaries |
+| Whole suite, approved outside run | 1 / 160 | All pass | 32.21 s across test binaries |
+
+Both full runs used `cargo test --locked`. The sandbox explicitly skipped the
+Unix socket fixture and bare i386 comparison; those checks ran outside. Both
+runs explicitly skipped the privileged tmpfs mount. Source, release configuration,
+forced proc-memory fallback, constrained tests and audit are also checked by the
+R2 review bundle. No notification-writer or data-loss bug was found. The final
+recheck did find and fix the independent product refusal below.
+
+### R2: additional saved-seed regression found during final verification
+
+The final bundle rerun found seed
+`26546bdf3fd3d1ff372af8e24943c20281dcfb1ffc02479370ed72ed4abab538`.
+The retained seed has twelve operations; the named regression reduces it to four:
+exchange `d1` with `d0/f0`, exchange `d4` with `d0`, exchange `d5` with `d4/f0`,
+then unlink `d5/f0`. Splitting these across three commands and undoing newest
+first restored each newer tree but falsely refused the oldest undo.
+
+Directory mtime changes caused by restoring the deleted child were recorded at
+an intermediate path. Moving its ancestor left that observation behind.
+`reverse_names` now supplies the same path mapping for directory observations
+and inode origins. Unchanged observation values move with their names. Newly
+restored directories are observed at their final names. Conflict comparisons
+remain strict; a regression creates later user work and proves refusal preserves
+it byte for byte.
+
+Undo saves the original observation map once in its private folder. Replaying
+finalization derives from that frozen map, including after publishing the home
+map. `resumed_directory_observations_are_not_exchanged_twice` aborts at exactly
+that boundary using a debug hook, resumes, then successfully undoes the older
+command. Both the two-command and three-command exact-tree cases remain as a
+named regression. The initial failing log is in `evidence/r2/`.
+
 ## Known gaps and risks
 
 - These finite properties are evidence within the generated model, not a mathematical proof over every syscall and filesystem race. Metadata-only operations, shared-subtree races between processes, skipped filesystems and failed captures remain outside that model.
@@ -272,26 +394,24 @@ was the advisory-cache lock on a read-only path; the outside-sandbox repeat pass
 - GC refuses when an older retained hard link has changed. This preserves a good copy held by another command. Undo newer commands first or inspect the recovery copies. Background refusals appear in status.
 - Ordinary retention tests run inside physical `target/` fixtures. The mixed source/cache test temporarily gives only its stored effect paths a synthetic prefix to test classification, then restores the real paths before undo. No syscall executes against that prefix.
 - Sandboxed runs skipped Unix sockets, tmpfs mounting and the bare i386 comparison with explicit SKIP messages. The green bundle outside the sandbox ran the socket and i386 checks. Tmpfs mounting still requires privileges and was skipped. See the bundle for exact skips.
-- The original five M4 commits are already in PR #5. R1 leaves them untouched. R1 changes and CI additions are uncommitted and have not run remotely.
+- The original five M4 commits and both R1 commits remain unchanged. R2 changes are uncommitted and have not run remotely.
 - Bulk undo still exceeds M3 by more than 25% under the constrained setup. The remaining per-effect recovery cost is recorded above for the performance milestone.
 
 ## Questions for review
 
-Review the deferred completion checkpoint, timeout process ownership and reply
-observations. Check that the constrained measurements and remaining performance
-work justify the bulk test's explicit deadline. The existing recovery and
-retention review remains relevant.
+Review the executable provenance check, readiness handshakes and separate build
+directories. The 350 ms fault deadline and every original assertion remain.
+The existing recovery, retention and bulk-performance review remains relevant.
 
-### Follow-up commit plan after R1 review passes
+### Follow-up commit plan after R2 review passes
 
-Keep the five existing commits unchanged. Add:
+Keep the five M4 commits and both R1 commits unchanged. Add one commit:
 
-1. `undo: combine completion checkpoints with the next recovery plan`
-2. `test: diagnose timeouts and constrain bulk restore checks`
+1. `test: fix timeout provenance and directory observation regressions`
 
 The first bundle caught the partial-log recovery bug above. Its audit also hit
 a sandbox read-only advisory-cache lock. `cargo deny --offline check` passed
 outside the sandbox. The final bundle is rerun with that cache lock available.
 
-Include decision 0013 and the measurement report with the follow-up changes.
-Commit only after the user says R1 review passed. Do not push.
+Include decisions 0014 and 0015 and the updated report. Commit only after the user says R2
+review passed. Do not push.

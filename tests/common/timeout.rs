@@ -5,7 +5,7 @@ use std::{
     ffi::OsStr,
     fmt::Write as _,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
     process::Command,
@@ -146,10 +146,15 @@ impl Watch {
             .map(|id| home.join("cmd").join(id.to_string()))
             .collect()
     }
-    pub fn diagnose(&self, elapsed: Duration, limit: Duration, phase: &str) {
+    pub fn diagnose(&self, elapsed: Duration, setup: Duration, limit: Duration, phase: &str) {
         let mut report = format!(
             "TEST COMMAND TIMEOUT: elapsed={elapsed:.3?}, limit={limit:?}, phase={phase}, pid={}\ncommand: {}\n",
             self.root, self.command
+        );
+        let _ = writeln!(
+            report,
+            "setup={setup:.3?}, timeout window={:.3?}",
+            elapsed.saturating_sub(setup)
         );
         let folders = self.commands();
         let first_tree = self.tree();
@@ -204,8 +209,8 @@ impl Watch {
         for (folder, before) in folders.iter().zip(first) {
             let after = progress(folder);
             let _ = writeln!(report, "Journal {}:", folder.display());
-            match (before.notifications, after.notifications) {
-                (Some(a), Some(b)) => {
+            match (&before.notifications, &after.notifications) {
+                (Ok(a), Ok(b)) => {
                     let _ = writeln!(
                         report,
                         "notifications: received={} (+{}), answered={} (+{} successful ioctl replies), last_id={}, tracee_pid={}, monotonic_ms={}",
@@ -229,7 +234,10 @@ impl Watch {
                 _ => {
                     let _ = writeln!(
                         report,
-                        "notifications unavailable (supervisor not started or debug observation disabled)"
+                        "notifications unavailable at {}: before={:?}, after={:?}",
+                        folder.join("notifications").display(),
+                        before.notifications.as_ref().err(),
+                        after.notifications.as_ref().err()
                     );
                 }
             }
@@ -300,19 +308,11 @@ fn signal_same(p: &Process, signal: i32) {
     }
 }
 struct Progress {
-    notifications: Option<[u64; 5]>,
+    notifications: io::Result<[u64; 5]>,
     undo: String,
 }
 fn progress(folder: &Path) -> Progress {
-    let notifications = File::open(folder.join("notifications"))
-        .ok()
-        .and_then(|mut file| {
-            let mut bytes = [0u8; 40];
-            file.read_exact(&mut bytes).ok()?;
-            Some(std::array::from_fn(|i| {
-                u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
-            }))
-        });
+    let notifications = notification_counts(folder);
     let undo = undo_folder(folder)
         .and_then(|p| fs::read(p.join("state.json")).ok())
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -327,6 +327,13 @@ fn progress(folder: &Path) -> Progress {
         notifications,
         undo,
     }
+}
+pub fn notification_counts(folder: &Path) -> io::Result<[u64; 5]> {
+    let mut bytes = [0u8; 40];
+    File::open(folder.join("notifications"))?.read_exact(&mut bytes)?;
+    Ok(std::array::from_fn(|i| {
+        u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
+    }))
 }
 fn undo_folder(folder: &Path) -> Option<PathBuf> {
     let meta: serde_json::Value =
