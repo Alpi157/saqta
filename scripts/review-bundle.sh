@@ -13,6 +13,9 @@ case $milestone in *[!A-Za-z0-9._-]*) echo "milestone name: letters, digits, . _
 root=$(git --no-optional-locks rev-parse --show-toplevel) || exit 2
 cd "$root" || exit 2
 g() { git --no-optional-locks "$@"; }
+# Keep review builds separate from ad hoc snapshots and normal terminal builds.
+# This path belongs to this checkout, including when root is a git worktree.
+export CARGO_TARGET_DIR="$root/target/review-build"
 
 base=${2:-}
 if [ -z "$base" ]; then
@@ -49,18 +52,22 @@ check fmt cargo fmt --all -- --check
 check clippy cargo clippy --all-targets --locked -- -D warnings
 check test cargo test --locked
 if [[ "$milestone" == m2-capture* || "$milestone" == m2b-undo* || "$milestone" == m3-codex* || "$milestone" == m4-harness* ]]; then check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture; fi
-if [[ "$milestone" == m4-harness-r1* ]]; then
+if [[ "$milestone" == m4-harness-r1* || "$milestone" == m4-harness-r2* ]]; then
   check release cargo check --release --locked
   if command -v taskset >/dev/null 2>&1 && taskset -c 0,1 true; then
     check bulk-two-cpu taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test codex separate_bind_mount_five_thousand_deletes_restore -- --exact --nocapture --test-threads=1
     check timeouts-two-cpu taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test timeouts -- --test-threads=1
   else
-    echo "SKIP: taskset or CPUs 0,1 unavailable for constrained R1 checks" >> "$summary"
+    echo "SKIP: taskset or CPUs 0,1 unavailable for constrained checks" >> "$summary"
   fi
   if [ -d target/r1-evidence ]; then
     mkdir -p "$out/evidence"
     cp target/r1-evidence/*.log target/r1-evidence/*.patch "$out/evidence/"
   fi
+fi
+if [[ "$milestone" == m4-harness-r2* && -d target/r2-evidence ]]; then
+  mkdir -p "$out/evidence/r2"
+  cp target/r2-evidence/*.log target/r2-evidence/*.json target/r2-evidence/*.py "$out/evidence/r2/"
 fi
 doctor_check() {
   local doctor_dir

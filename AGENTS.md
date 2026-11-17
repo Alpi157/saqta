@@ -50,6 +50,7 @@ If a new dependency needs downloading and the network is blocked, stop and ask t
 ## Safety rules for tests and for you
 - Destructive commands run only inside a temp directory the test just created. Never `rm -rf` a path built from a variable that could be empty. Never touch the real home directory, `~/.codex`, `~/.claude` or any agent settings on this machine.
 - Tests create temp dirs under `target/saqta-tests/` (same filesystem as the repo). Not `/tmp`: it can be tmpfs, and Saqta skips tmpfs on purpose.
+- Give each validation snapshot or worktree its own Cargo target directory. Never build a snapshot with `--target-dir` pointing at another checkout's `target/`: same-named executables can overwrite each other while Cargo still reports a fresh build.
 - Every test that runs `saqta` sets `HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `SAQTA_HOME` to folders inside its temp dir.
 - A test that needs something the machine lacks (a terminal, `python3`, a 32-bit compiler, a second filesystem, root) prints `SKIP: <reason>` and returns. It never fails or passes silently.
 - Timing assertions are generous (CI machines are slow). Print measured numbers; assert only sanity bounds.

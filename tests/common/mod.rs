@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
+        OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
@@ -22,6 +23,9 @@ use std::{
 };
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_saqta");
+pub fn notification_counts(folder: &Path) -> std::io::Result<[u64; 5]> {
+    timeout::notification_counts(folder)
+}
 const TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -53,6 +57,9 @@ impl Sandbox {
             "SAQTA_STRICT",
             "SAQTA_NO_SYNC_WAKE",
             "SAQTA_DEBUG",
+            "SAQTA_TEST_ABORT_AFTER",
+            "SAQTA_TEST_STOP_UNDO",
+            "SAQTA_TEST_ABORT_UNDO_FINALIZE",
         ] {
             env.remove(OsStr::new(key));
         }
@@ -76,7 +83,19 @@ impl Sandbox {
                 .unwrap_or(&OsString::from("/bin:/usr/bin")),
         ));
         env.insert("PATH".into(), std::env::join_paths(search).unwrap());
-        Self { dir, env, tag }
+        let sandbox = Self { dir, env, tag };
+        #[cfg(debug_assertions)]
+        {
+            static BUILD: OnceLock<Result<(), String>> = OnceLock::new();
+            let verified = BUILD.get_or_init(|| {
+                verify_build(
+                    &run(sandbox.saqta(&["__harness", "--build-info"])),
+                    Path::new(env!("CARGO_MANIFEST_DIR")),
+                )
+            });
+            assert!(verified.is_ok(), "{}", verified.as_ref().unwrap_err());
+        }
+        sandbox
     }
     pub fn command(&self, program: impl AsRef<OsStr>) -> Command {
         let mut command = Command::new(program);
@@ -123,6 +142,31 @@ impl Sandbox {
             self.dir.join(file).metadata().is_ok_and(|m| m.len() > 0)
         });
     }
+}
+
+// Reject a foreign checkout's cached executable before any fault injection.
+pub fn verify_build(output: &Output, expected: &Path) -> Result<(), String> {
+    let repair = "use a separate Cargo target directory for each checkout; run `cargo clean -p saqta` here and rebuild";
+    if !output.status.success() {
+        return Err(format!(
+            "Saqta test executable {BIN} cannot report its build provenance: {}; {repair}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+        format!("Saqta test executable {BIN} returned invalid build provenance: {e}; {repair}")
+    })?;
+    let manifest: Vec<u8> = serde_json::from_value(info["manifest_dir"].clone())
+        .map_err(|e| format!("missing manifest path from {BIN}: {e}; {repair}"))?;
+    if manifest != expected.as_os_str().as_bytes() || info["notification_observations"] != 1 {
+        return Err(format!(
+            "wrong Saqta test executable {BIN}: built in {:?}, expected {:?}, notification_observations={}; {repair}",
+            OsStr::from_bytes(&manifest),
+            expected,
+            info["notification_observations"]
+        ));
+    }
+    Ok(())
 }
 impl Drop for Sandbox {
     fn drop(&mut self) {
@@ -188,19 +232,36 @@ pub struct Running {
     stdout: Receiver<Vec<u8>>,
     stderr: Receiver<Vec<u8>>,
     started: Instant,
+    timeout_started: Instant,
     watch: timeout::Watch,
 }
 impl Running {
     pub fn pid(&self) -> i32 {
         self.child.id() as i32
     }
-    pub fn spawn(mut command: Command, input: Option<&[u8]>) -> Self {
+    pub fn spawn(command: Command, input: Option<&[u8]>) -> Self {
+        let mut running = Self::launch(command, input.is_some());
+        if let Some(input) = input {
+            running
+                .child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input)
+                .unwrap();
+        }
+        running
+    }
+    pub fn spawn_with_stdin(command: Command) -> Self {
+        Self::launch(command, true)
+    }
+    fn launch(mut command: Command, piped_stdin: bool) -> Self {
         let started = Instant::now();
         // Freezing/killing a timeout's tree can orphan a stopped process group.
         // Keep any resulting job-control SIGHUP away from the test runner and
         // other tests. Saqta still shares its wrapper's group as in real use.
         command.process_group(0);
-        command.stdin(if input.is_some() {
+        command.stdin(if piped_stdin {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -217,22 +278,35 @@ impl Running {
         let watch = timeout::Watch::new(&command, child.id() as i32, pipes);
         let stdout = reader(child.stdout.take().unwrap());
         let stderr = reader(child.stderr.take().unwrap());
-        if let Some(input) = input {
-            child.stdin.take().unwrap().write_all(input).unwrap();
-        }
         Self {
             child,
             stdout,
             stderr,
             started,
+            timeout_started: started,
             watch,
         }
     }
     pub fn output(self) -> Output {
         self.output_with_timeout(TIMEOUT)
     }
+    pub fn wait_ready(&mut self, condition: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !ready() {
+            if Instant::now() >= deadline {
+                self.timed_out(TIMEOUT, &format!("setup: {condition}"));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    // Fault injection measures its short deadline after an explicit handshake.
+    // Keep the actual start time too, so diagnostics still report total elapsed.
+    pub fn output_after_setup(mut self, timeout: Duration) -> Output {
+        self.timeout_started = Instant::now();
+        self.output_with_timeout(timeout)
+    }
     pub fn output_with_timeout(mut self, timeout: Duration) -> Output {
-        let deadline = self.started + timeout;
+        let deadline = self.timeout_started + timeout;
         let status = loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
@@ -258,7 +332,12 @@ impl Running {
     }
     fn timed_out(&mut self, limit: Duration, phase: &str) -> ! {
         let elapsed = self.started.elapsed();
-        self.watch.diagnose(elapsed, limit, phase);
+        self.watch.diagnose(
+            elapsed,
+            self.timeout_started.duration_since(self.started),
+            limit,
+            phase,
+        );
         self.watch.kill_tree();
         self.reap_bounded();
         panic!(

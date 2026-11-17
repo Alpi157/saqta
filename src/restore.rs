@@ -465,15 +465,31 @@ impl Undo {
         &self,
         home: &Path,
         r: &journal::Record,
+        restored: &BTreeMap<String, State>,
         observations: BTreeMap<String, Option<State>>,
     ) -> io::Result<()> {
-        let mut observations = observations;
+        let mut observations: BTreeMap<PathBuf, Option<State>> = observations
+            .into_iter()
+            .map(|(name, state)| Ok((journal::path(&name)?, state)))
+            .collect::<io::Result<_>>()?;
+        for e in applied_effects(r).rev() {
+            reverse_names(&mut observations, e)?;
+        }
+        let mut observations: BTreeMap<String, Option<State>> = observations
+            .into_iter()
+            .map(|(name, state)| (journal::display(&name), state))
+            .collect();
         let mut parents = std::collections::BTreeSet::new();
         for e in &r.effects {
             for name in [&e.path, &e.path2].into_iter().filter(|s| !s.is_empty()) {
                 let p = journal::path(name)?;
                 parents.extend(p.ancestors().map(Path::to_owned));
             }
+        }
+        // Reverse exchanges can move a changed directory below an ancestor
+        // whose name also moved. Observe its final name, not just effect paths.
+        for name in restored.keys() {
+            parents.extend(journal::path(name)?.ancestors().map(Path::to_owned));
         }
         for p in parents {
             if let Ok(st) = self.state(&p)
@@ -488,10 +504,10 @@ impl Undo {
     fn save_alias_observations(
         &self,
         home: &Path,
-        r: &journal::Record,
+        restored: BTreeMap<String, State>,
         mut alias_posts: BTreeMap<String, (State, State)>,
     ) -> io::Result<()> {
-        for (name, origin) in restored_origins(r)? {
+        for (name, origin) in restored {
             if origin.mode & libc::S_IFMT == libc::S_IFREG
                 && let Some(actual) = self.state(&journal::path(&name)?)?
             {
@@ -564,42 +580,12 @@ fn same_post(a: Option<&State>, b: Option<&State>) -> bool {
 }
 fn restored_origins(record: &journal::Record) -> io::Result<BTreeMap<String, State>> {
     let mut origins: BTreeMap<PathBuf, State> = BTreeMap::new();
-    for e in record.effects.iter().rev().filter(|e| {
-        record.outcomes.get(&e.seq) != Some(&false)
-            && !matches!(e.op.as_str(), "blocked" | "not protected" | "expired")
-    }) {
+    for e in applied_effects(record).rev() {
         let p = journal::path(&e.path)?;
-        if matches!(e.op.as_str(), "rename" | "exchange") {
-            let dest = journal::path(&e.path2)?;
-            let old = std::mem::take(&mut origins);
-            for (name, state) in old {
-                let relocated = if let Ok(tail) = name.strip_prefix(&dest) {
-                    Some(if tail.as_os_str().is_empty() {
-                        p.clone()
-                    } else {
-                        p.join(tail)
-                    })
-                } else if let Ok(tail) = name.strip_prefix(&p) {
-                    if e.op == "exchange" {
-                        Some(if tail.as_os_str().is_empty() {
-                            dest.clone()
-                        } else {
-                            dest.join(tail)
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(name)
-                };
-                if let Some(name) = relocated {
-                    origins.insert(name, state);
-                }
-            }
-        }
-        if e.op == "create" {
-            origins.retain(|name, _| !name.starts_with(&p));
-        } else if let Some(before) = &e.note.before {
+        reverse_names(&mut origins, e)?;
+        if e.op != "create"
+            && let Some(before) = &e.note.before
+        {
             origins.insert(p, before.clone());
         }
         if e.op == "exchange"
@@ -612,6 +598,43 @@ fn restored_origins(record: &journal::Record) -> io::Result<BTreeMap<String, Sta
         .into_iter()
         .map(|(p, s)| (journal::display(&p), s))
         .collect())
+}
+fn applied_effects(record: &journal::Record) -> impl DoubleEndedIterator<Item = &Effect> {
+    record.effects.iter().filter(|e| {
+        record.outcomes.get(&e.seq) != Some(&false)
+            && !matches!(e.op.as_str(), "blocked" | "not protected" | "expired")
+    })
+}
+fn reverse_names<T>(names: &mut BTreeMap<PathBuf, T>, e: &Effect) -> io::Result<()> {
+    let source = journal::path(&e.path)?;
+    if e.op == "create" {
+        names.retain(|name, _| !name.starts_with(&source));
+    } else if matches!(e.op.as_str(), "rename" | "exchange") {
+        let dest = journal::path(&e.path2)?;
+        for (name, value) in std::mem::take(names) {
+            let relocated = if let Ok(tail) = name.strip_prefix(&dest) {
+                Some(if tail.as_os_str().is_empty() {
+                    source.clone()
+                } else {
+                    source.join(tail)
+                })
+            } else if let Ok(tail) = name.strip_prefix(&source) {
+                (e.op == "exchange").then(|| {
+                    if tail.as_os_str().is_empty() {
+                        dest.clone()
+                    } else {
+                        dest.join(tail)
+                    }
+                })
+            } else {
+                Some(name)
+            };
+            if let Some(name) = relocated {
+                names.insert(name, value);
+            }
+        }
+    }
+    Ok(())
 }
 fn is_git_index(p: &Path) -> bool {
     if p.file_name() != Some(OsStr::new("index")) {
@@ -784,6 +807,12 @@ fn restore_effects(
 }
 
 pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> Result<i32> {
+    // Fault-injection handshake: stop before undo can change anything. A parent
+    // can observe T in /proc without racing a fast one-file resume.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SAQTA_TEST_STOP_UNDO").is_some_and(|s| s == "1") {
+        sys::kill(sys::pid(), libc::SIGSTOP);
+    }
     let started = Instant::now();
     let mut output = Progress::new(io::stdout());
     if std::env::var_os("SAQTA_SUPERVISED").is_some() {
@@ -1044,6 +1073,15 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
             &journal::display(&backup_path),
         )?;
     }
+    // Reuse the same input map after interruption, even if publishing the final
+    // home observations succeeded before undo was marked complete.
+    let observed_before = backup_path.join("directory-observations.json");
+    let observations = if observed_before.exists() {
+        serde_json::from_slice(&fs::read(&observed_before)?)?
+    } else {
+        journal::synced_json_write(&observed_before, &observations)?;
+        observations
+    };
     if let Some(note) = &r.recovery_note {
         undo.output.line(format_args!("{note}"));
     }
@@ -1051,8 +1089,13 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
     report_unrestored(&mut undo.output, &r.effects);
     let mut summary = Summary::default();
     let result = restore_effects(&mut undo, &r, verbose, &mut summary).and_then(|()| {
-        undo.save_directory_observations(&home, &r, observations)?;
-        undo.save_alias_observations(&home, &r, alias_posts)?;
+        let restored = restored_origins(&r)?;
+        undo.save_directory_observations(&home, &r, &restored, observations)?;
+        undo.save_alias_observations(&home, restored, alias_posts)?;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SAQTA_TEST_ABORT_UNDO_FINALIZE").is_some_and(|s| s == "1") {
+            sys::exit(86);
+        }
         journal::mark_undone(&folder)?;
         fs::remove_file(folder.join("undo-in-progress"))?;
         Ok(())

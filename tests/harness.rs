@@ -311,6 +311,66 @@ fn resume_replays_deletes_with_deferred_completion_checkpoints() {
     }
 }
 #[test]
+fn regression_directory_observations_follow_exchanges_of_ancestors() {
+    let (s, root) = capture_fixture("directory-observation-lineage");
+    seed(&root);
+    let before = tree_hash(&root);
+    let older = execute(&s, &root, vec![vec![op(8, 1, 6)]]);
+    let middle = tree_hash(&root);
+    let newer = execute(
+        &s,
+        &root,
+        vec![vec![op(8, 4, 0), op(8, 5, 14), op(9, 16, 0)]],
+    );
+    assert_success(&undo(&s, newer));
+    assert_tree(&middle, &root);
+    assert_success(&undo(&s, older));
+    assert_tree(&before, &root);
+    check_sequence(
+        vec![op(8, 1, 6), op(8, 4, 0), op(8, 5, 14), op(9, 16, 0)],
+        3,
+    );
+}
+#[test]
+fn resumed_directory_observations_are_not_exchanged_twice() {
+    let (s, root) = capture_fixture("directory-observation-resume");
+    seed(&root);
+    let before = tree_hash(&root);
+    let older = execute(&s, &root, vec![vec![op(8, 1, 6)]]);
+    let middle = execute(&s, &root, vec![vec![op(8, 4, 0)]]);
+    let newer = execute(&s, &root, vec![vec![op(8, 5, 14), op(9, 16, 0)]]);
+    assert_success(&undo(&s, newer));
+    let mut command = s.saqta(&["undo", &middle.to_string()]);
+    command.env("SAQTA_TEST_ABORT_UNDO_FINALIZE", "1");
+    assert_eq!(run(command).status.code(), Some(86));
+    assert_success(&run(s.saqta(&["undo", &middle.to_string(), "--resume"])));
+    assert_success(&undo(&s, older));
+    assert_tree(&before, &root);
+}
+#[test]
+fn restored_directory_observations_reject_later_user_edits() {
+    let (s, root) = capture_fixture("directory-observation-user-edit");
+    seed(&root);
+    let older = execute(&s, &root, vec![vec![op(8, 1, 6)]]);
+    let newer = execute(
+        &s,
+        &root,
+        vec![vec![op(8, 4, 0), op(8, 5, 14), op(9, 16, 0)]],
+    );
+    assert_success(&undo(&s, newer));
+    let dir = root.join("d0/f0");
+    fs::write(dir.join("user-work"), b"new user data").unwrap();
+    fs::File::open(&dir)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+    let before_refusal = tree_hash(&root);
+    let output = undo(&s, older);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("paths changed"));
+    assert_tree(&before_refusal, &root);
+}
+#[test]
 fn syscall_helper_exercises_creation_and_write_through_symlink() {
     let (s, root) = capture_fixture("harness-driver");
     seed(&root);
