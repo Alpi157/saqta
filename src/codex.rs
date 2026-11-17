@@ -350,6 +350,7 @@ pub fn status() -> Result<i32> {
             if writable { "set" } else { "missing" }
         );
     }
+    crate::gc::status(&home)?;
     journal::log(5, false)
 }
 

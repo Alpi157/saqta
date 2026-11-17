@@ -76,8 +76,12 @@ pub fn private_file(p: &Path) -> io::Result<File> {
         .open(p)
 }
 pub fn prepare(home: &Path) -> io::Result<()> {
+    let fresh = !home.join("cmd").exists();
     for name in ["cmd", "q/main", "run", "logs"] {
         private_dir(&home.join(name))?;
+    }
+    if fresh {
+        json_write(&home.join("gc-attempt"), &now())?;
     }
     private_file(&home.join("next-id"))?;
     Ok(())
@@ -533,7 +537,7 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let effects = match read_effects(&folder) {
+    let mut effects = match read_effects(&folder) {
         Ok(effects) => effects,
         Err(_)
             if !folder.join("end").exists()
@@ -546,6 +550,13 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         }
         Err(e) => return Err(e),
     };
+    let expired = crate::gc::expired(&folder)?;
+    for e in &mut effects {
+        if expired.contains(&e.quarantine) {
+            e.op = "expired".into();
+            e.note.message = "expired (collected by gc)".into();
+        }
+    }
     let end = match fs::read(folder.join("end")) {
         Ok(b) => Some(serde_json::from_slice::<End>(&b)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
