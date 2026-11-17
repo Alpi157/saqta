@@ -150,3 +150,30 @@ fn cli_help_describes_commands_and_arguments() {
     assert_success(&o);
     assert_eq!(o.stdout, b"saqta 0.1.0\n");
 }
+
+#[test]
+fn supervised_doctor_reports_info_without_store_write_attempts() {
+    let (s, p) = capture_fixture("doctor-supervised");
+    let mut c = s.exec(&["--", BIN, "doctor", "--json"]);
+    c.current_dir(&p);
+    let o = run(c);
+    assert_success(&o);
+    let value: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let checks = value["checks"].as_array().unwrap();
+    assert!(checks.iter().any(|c| c["name"] == "functional probe"
+        && c["status"] == "info"
+        && c["advice"].as_str().unwrap().contains("already supervised")));
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "SAQTA_HOME" && c["status"] == "info")
+    );
+    let r = shown(&s, last_id(&s));
+    assert!(
+        !r["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["op"] == "blocked")
+    );
+}

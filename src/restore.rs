@@ -664,8 +664,11 @@ impl Summary {
         };
         self.counts[category] += 1;
         for path in [&e.path, &e.path2] {
-            if !path.is_empty() && self.examples.len() < 10 && !self.examples.contains(path) {
+            if !path.is_empty() && !self.examples.contains(path) {
                 self.examples.push(path.clone());
+                self.examples
+                    .sort_by_key(|s| journal::path(s).is_ok_and(|p| crate::gc::regenerable(&p)));
+                self.examples.truncate(10);
             }
         }
     }
@@ -1066,6 +1069,30 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn summary_examples_prefer_source_paths() {
+        let mut summary = Summary::default();
+        let mut effect = Effect {
+            seq: 0,
+            time_ns: 0,
+            pid: 0,
+            op: "delete".into(),
+            path: String::new(),
+            path2: String::new(),
+            quarantine: String::new(),
+            flags: 0,
+            note: crate::journal::Detail::default(),
+        };
+        for i in 0..12 {
+            effect.path = format!("/repo/node_modules/{i}");
+            summary.record(&effect);
+        }
+        effect.path = "/repo/src/keep.rs".into();
+        summary.record(&effect);
+        assert_eq!(summary.examples.len(), 10);
+        assert_eq!(summary.examples[0], "/repo/src/keep.rs");
+        assert_eq!(summary.counts, [13, 0, 0, 0, 0]);
+    }
     #[test]
     fn git_index_exception_has_exact_component_boundaries() {
         for path in ["/repo/.git/index", "/repo/.git/worktrees/topic/index"] {
