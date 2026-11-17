@@ -50,7 +50,7 @@ pub fn program() -> Vec<sock_filter> {
     for (nr, arg) in [(libc::SYS_open, 1), (libc::SYS_openat, 2)] {
         p.extend([
             // Other syscalls skip this entire flags block.
-            ins(JUMP_EQUAL, 0, 6, nr as u32),
+            ins(JUMP_EQUAL, 0, 5, nr as u32),
             // Load the low word of this syscall's flags argument.
             ins(
                 LOAD_WORD,
@@ -59,14 +59,12 @@ pub fn program() -> Vec<sock_filter> {
                 (offset_of!(SeccompData, args) + arg * size_of::<u64>()) as u32,
             ),
             // Creation and truncation notify even with O_APPEND.
-            ins(JUMP_BITS_SET, 2, 0, (libc::O_CREAT | libc::O_TRUNC) as u32),
-            // Pure appends bypass capture.
-            ins(JUMP_BITS_SET, 2, 0, libc::O_APPEND as u32),
+            ins(JUMP_BITS_SET, 1, 0, (libc::O_CREAT | libc::O_TRUNC) as u32),
             // Write access notifies; read-only opens skip to allow.
             ins(JUMP_BITS_SET, 0, 1, (libc::O_WRONLY | libc::O_RDWR) as u32),
             // Suspend the write-capable open.
             ins(RETURN_CONSTANT, 0, 0, SECCOMP_RET_USER_NOTIF),
-            // Allow the read or append open.
+            // Allow the read-only open.
             ins(RETURN_CONSTANT, 0, 0, SECCOMP_RET_ALLOW),
         ]);
     }
@@ -164,14 +162,12 @@ mod tests {
                 .fold(libc::O_CLOEXEC, |f, (_, bit)| f | bit);
             let modifying =
                 flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
-            let append =
-                flags & libc::O_APPEND != 0 && flags & (libc::O_CREAT | libc::O_TRUNC) == 0;
             for (nr, arg) in [(libc::SYS_open, 1), (libc::SYS_openat, 2)] {
                 let mut args = [u64::MAX; 6];
                 args[arg] = flags as u64;
                 assert_eq!(
                     interpret(nr as u32, AUDIT_ARCH_X86_64, args),
-                    if modifying && !append {
+                    if modifying {
                         SECCOMP_RET_USER_NOTIF
                     } else {
                         SECCOMP_RET_ALLOW

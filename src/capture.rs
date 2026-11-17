@@ -46,6 +46,13 @@ const SKIPPED_FILESYSTEMS: &[i64] = &[
 fn cstr(p: &OsStr) -> io::Result<CString> {
     CString::new(p.as_bytes()).map_err(io::Error::other)
 }
+fn relocated(base: &Path, tail: &Path) -> PathBuf {
+    if tail.as_os_str().is_empty() {
+        base.to_owned()
+    } else {
+        base.join(tail)
+    }
+}
 pub struct Resolved {
     pub parent: OwnedFd,
     pub name: CString,
@@ -591,6 +598,22 @@ impl Capture {
                     );
                     if c.size < st.st_size as u64 {
                         self.keep_copy(p, &mut e, true)?;
+                    } else {
+                        self.freeze_links(p)?;
+                        let key = (st.st_dev, st.st_ino);
+                        if self.created.contains(&p.path)
+                            && let Some(original) = self.original_links.get(&key)
+                        {
+                            e.path = journal::display(original);
+                        }
+                        if self.copied.contains_key(&key) {
+                            e.op = "modify".into();
+                            self.keep_copy(p, &mut e, true)?;
+                        } else if self.created.contains(&p.path)
+                            && !self.original_links.contains_key(&key)
+                        {
+                            return Ok(());
+                        }
                     }
                     effects.push(e);
                 }
@@ -754,10 +777,10 @@ impl Capture {
         )?;
         sys::copy_regular(File::from(src), File::from(dst), st)
     }
-    fn keep_copy(&mut self, p: &Resolved, e: &mut Effect, deduplicate: bool) -> io::Result<()> {
+    fn freeze_links(&mut self, p: &Resolved) -> io::Result<()> {
         let st = p
             .state()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+            .ok_or_else(|| io::Error::other("missing freeze source"))?;
         // A delete's hard link still shares the live inode. Freeze those links before a write.
         let links: Vec<_> = self
             .linked
@@ -777,6 +800,13 @@ impl Capture {
             )?;
             self.linked.remove(&q);
         }
+        Ok(())
+    }
+    fn keep_copy(&mut self, p: &Resolved, e: &mut Effect, deduplicate: bool) -> io::Result<()> {
+        let st = p
+            .state()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        self.freeze_links(p)?;
         let key = (st.dev, st.ino);
         if self.created.contains(&p.path) {
             let original = self.original_links.get(&key).filter(|path| {
@@ -866,11 +896,11 @@ impl Capture {
             {
                 self.original_links.retain(|_, old| {
                     if let Ok(tail) = old.strip_prefix(&p.path) {
-                        *old = dest.join(tail);
+                        *old = relocated(dest, tail);
                         true
                     } else if let Ok(tail) = old.strip_prefix(dest) {
                         if p.kind == Kind::Exchange {
-                            *old = p.path.join(tail);
+                            *old = relocated(&p.path, tail);
                             true
                         } else {
                             false
@@ -882,10 +912,10 @@ impl Capture {
                 let previous = std::mem::take(&mut self.created);
                 for old in previous {
                     if let Ok(tail) = old.strip_prefix(&p.path) {
-                        self.created.insert(dest.join(tail));
+                        self.created.insert(relocated(dest, tail));
                     } else if let Ok(tail) = old.strip_prefix(dest) {
                         if p.kind == Kind::Exchange {
-                            self.created.insert(p.path.join(tail));
+                            self.created.insert(relocated(&p.path, tail));
                         }
                     } else {
                         self.created.insert(old);
