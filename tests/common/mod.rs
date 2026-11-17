@@ -28,9 +28,13 @@ pub struct Sandbox {
 impl Sandbox {
     pub fn new(name: &str) -> Self {
         let tag = format!(
-            "saqta-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            "s-{:010x}",
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+                ^ NEXT_ID.fetch_add(1, Ordering::Relaxed) as u64)
+                & 0xffffffffff
         );
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target/saqta-tests")

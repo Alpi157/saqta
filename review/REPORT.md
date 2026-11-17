@@ -1,209 +1,185 @@
-# M3 Codex R1: report
+# M4 harness: report
 
 ## What works now (5 lines max)
-Project-local Codex hooks wrap Bash and capture apply_patch pre-images.
-Init, uninstall and status manage project settings and installation ownership.
-PID 1 writes complete journals before returning foreground or detached status.
-Separate bind mounts use bounded copies; doctor exercises real capture.
-The original five commits remain intact. R1 fixes are uncommitted on m3-codex.
+- Three filesystem properties exercise sequential commands, concurrent subtrees and interrupted undo.
+- Undo resumes from explicit recovery actions and preserves hard-link alias lineage across commands.
+- GC applies retention in the requested order and labels collected content during undo.
+- Log, show and one-file undo avoid importing unrelated effects on repeated calls.
+- Supervised doctor uses informational listener checks and keeps its actual capture probe.
 
 ## How it works
-`src/hook.rs` reads one JSON event. Bash commands become one shell argument to
-an absolute Saqta executable. `quote` escapes single quotes without interpreting
-the command. The login shell comes from `sys::login_shell` and getpwuid_r.
-Errors go to hook.log. The hook returns zero and leaves the original call alone.
 
-The patch hook parses the four pathname headers, resolves relative names from
-payload cwd, and calls `Capture::patch_path` in `src/capture.rs`. It uses M2's
-bounded copy and effect writer, without a supervisor or SQLite in the hook.
-Updates use modify effects; removals and overwritten destinations use delete
-effects; absent paths use create effects. A hook-reference sidecar holds session
-and tool-use IDs. PostToolUse finds that sidecar, reopens the journal with
-`Journal::reopen`, and writes post-state and end. Missing posts stay incomplete.
-Deny-floor paths get a not-protected effect and a hook log reason.
+`tests/harness.rs` generates 1 to 40 direct operations over six directories and
+twelve file names. The fixture starts with ordinary files, empty names, an empty
+directory and a pre-existing hard-link pair. The debug-only `__harness` driver in
+`src/harness.rs` reads JSON, pins parents without following symlinks, checks final
+symlink targets stay inside the fixture, and calls thin syscall wrappers. Its
+concurrent workers each own a subtree. Syscall failures are allowed inputs and
+are printed with the process, fixture, operation and errno.
 
-`src/supervisor.rs` detects W as namespace PID 1 through S's parent PID. It calls
-`Capture::finish` before sending even detached status. The existing
-`sys::reraise` fallback handles PID 1 ignoring a default-action signal. A real
-namespace test checks TERM becomes exit 143. `keep_link` labels EXDEV copy
-fallbacks explicitly and uses the existing copy-size limit.
+The sequential property uses one to three exact consecutive commands. It checks
+every intermediate snapshot while undoing newest first. The hash covers type,
+mode, file size, bytes, symlink target and file mtime. Directory allocation size
+and directory mtime are excluded. The interruption property first obtains an
+uninterrupted result, repeats the operations, then aborts after a mutation and
+before its completion checkpoint. It checks pre-command and post-command byte
+versions in that command's tree, quarantine and undo folder only. Earlier undo
+folders cannot mask a missing version. Resume must match the uninterrupted tree.
 
-`src/codex.rs` manages project hooks, writable roots, excludes and the project
-list. toml_edit is the only new runtime dependency, explicitly approved in the
-milestone. proptest is a permitted test dependency, with only its std feature.
-No deny.toml exception was needed. Installation receipts store original and
-installed bytes. A flock serializes installations. Registry writes use atomic
-rename. Uninstall validates every proposed change before applying any, restores
-original bytes for unchanged files, and removes proved owned spans or hook
-entries from subsequently edited files. It refuses ambiguous changes.
+`src/restore.rs` plans reverse effects and handles conflicts, original prefixes
+and alias lineage. `src/restore/steps.rs` executes moves, staged copies, inode
+repairs, directory recreation and exchanges. Plans and checkpoints use atomic
+replacement. Move and exchange identities distinguish a completed step from one
+that still needs execution. The recovery map remains synced before displacement. Numeric snapshots are
+independent copies when an entry shares an inode. Separate mutable inode handles
+allow older aliases to be repaired without changing those snapshots.
+Original data and independent post versions remain available before inode repair.
+Plain alias observations connect identities across consecutive undos. The
+`SAQTA_TEST_ABORT_AFTER` hook exists only in debug builds.
 
-Doctor creates and deletes a small sample in `.saqta-doctor/`. It checks the
-pre-image bytes when it launches a new supervisor. When already supervised, the
-sample is new to that command, so it checks the actual creation and deletion
-capture records instead. It reads plain journals without modifying the store.
+`src/gc.rs` validates retained pre-images before collection. It takes a global
+collector lock and the same per-command locks as undo. It first collects
+regenerable content after one day, then commands past the age limit, then oldest
+commands until under the size limit. The newest three ids, live commands and incomplete journals are protected. Any
+interrupted undo defers collection, including collection of borrowed inode handles
+in older undo folders. Every reference to a
+shared pre-image must be regenerable. CACHEDIR.TAG signatures are recognized in
+current directories and retained deleted tags. Expiry records precede unlink;
+whole-command metadata is removed last. Undo reports expired paths and restores
+other effects. Dry-run writes no locks, markers or content.
 
-## CI failure analysis and reproductions
-Evidence comes from `target/ci-m3-failed.log`, supplied from PR #4.
-The log has no runner kernel or util-linux version dump. Do not infer a specific
-kernel release from the Ubuntu job label.
+Interactive commands reserve one GC attempt per 24 hours under a lock and launch
+the collector after printing with closed standard streams. New stores begin the
+first interval at creation. Status reports retained size, last successful GC and
+any prior collection refusal.
 
-### 1. Doctor on both Ubuntu jobs: product detection bug
-At log lines 139-141 (22.04) and 302-304 (24.04), the failing assertion is the
-predicate requiring a check named `inside Codex sandbox` with advice
-`capture works`. Actual predicate: false. Expected: true. This is an `assert!`,
-so the log prints no numeric left/right pair or full JSON. The preceding
-successful-exit assertion passed. Capture failure would instead set a nonzero
-exit code, so this points to an omitted check, not failed capture.
-
-`inside_sandbox` only considered the SAQTA_HOME mount and `/proc/1/comm`.
-On hosted VMs, PID 1 is systemd and the test does not separately mount the store.
-The existing supervisor was ignored. The local PID 1 is named `codex`, hiding
-that bug. Doctor now also recognizes the same marker-plus-active-filter
-condition used by nested exec, through `exec::is_supervised`.
-
-Reproduction: run the original product under a private namespace whose PID 1
-is named systemd. `doctor_inside_systemd_named_namespace_checks_actual_capture`
-failed before the fix with exit 101 from the test harness, while doctor itself
-returned zero and its JSON omitted the capture check. It passes after the fix.
-`supervised_doctor_probes_on_a_systemd_host` exercises the detection with init,
-systemd and unreadable PID-1 metadata on every machine, without namespaces.
-The original wrapped-doctor assertion remains and now includes JSON on failure.
-
-### 2. PID 1 on Ubuntu 22.04: inherited signals in the test launcher
-At lines 146-149 the status assertion has **left `Some(0)`**, **right
-`Some(143)`**. It reached the third case, the shell's `kill -TERM $$`, after
-namespace setup and the first two cases succeeded. It failed on exit status,
-before the journal assertion. The log alone does not identify a kernel race.
-
-The older util-linux launcher sets SIGINT and SIGTERM to SIG_IGN before fork
-and leaves them ignored in its execed child. See [util-linux v2.37.2
-unshare.c, lines 532-546](https://github.com/util-linux/util-linux/blob/v2.37.2/sys-utils/unshare.c#L532-L546).
-The newer launcher blocks signals across fork and restores the old mask in
-the child instead. See [v2.39.3, lines 896-922](https://github.com/util-linux/util-linux/blob/v2.39.3/sys-utils/unshare.c#L896-L922).
-An ignored disposition survives exec. Saqta preserved it, so Bash ignored its
-self-directed TERM and exited zero. Changing Saqta to reset TERM would change
-commands that intentionally inherit an ignored signal.
-
-Local reproduction on the same 6.18 kernel: put SIG_IGN for INT and TERM in a
-Python launcher before modern unshare. The original failing command returned
-**0** and its raw journal end status was **0**, with both
-SAQTA_NO_SYNC_WAKE=0 and SAQTA_NO_SYNC_WAKE=1. Thus the observed mismatch can be
-reproduced without changing kernel, POLLHUP timing or finish ordering. No
-supervisor or wrapper status fix is justified by this failure.
-
-The test now uses a small Python launcher inside the namespace to establish
-SIG_DFL for INT and TERM, then execs W, which remains PID 1. The expected exit
-143 is unchanged. It checks foreground, background and TERM cases with ordinary
-and simulated older unshare signal inheritance, with synchronous wake-up both
-enabled and explicitly disabled in the child's environment. All 12 runs
-reported the expected status and a finished journal. Assertions also check each
-journal exit status. `inherited_ignored_term_is_preserved_without_namespaces`
-checks both intentional ignore and explicit restoration on every machine,
-including machines that cannot create namespaces.
-
-### 3. Read-only home on Ubuntu 24.04: capability detection bug in the test
-At lines 309-312, the status assertion has **left `Some(1)`**, **right
-`Some(7)`**. Neighbouring namespace probes at lines 283 and 291 print
-`unshare: write failed /proc/self/uid_map: Operation not permitted` and SKIP.
-The read-only test only recognized stderr containing `unshare failed`, or a
-mount command's reserved exit 77. UID-map denial occurs earlier and matches
-neither condition. Saqta and its exit-7 command were never reached. The log
-omits this test's own stderr, so that diagnosis also uses the neighbouring
-capability evidence and the supplied AppArmor runner configuration.
-
-The test now runs a separate `unshare --user --map-root-user --mount /bin/true`
-probe first. Probe failure prints its status and exact reason as SKIP; once
-setup succeeds, command failures remain failures. The exact read-only warning
-and exit-7 assertions are unchanged. All namespace fixtures share that explicit
-probe, including missing-unshare handling. The existing mount-77 handling still
-only covers mount setup, before Saqta runs.
-
-`namespace_probe_reports_uid_map_denial` simulates the runner's exact UID-map
-stderr and exit 1 on every machine. It proves that the setup failure is reported
-without relying on that particular wording. The real read-only bind test ran
-successfully locally. AppArmor itself was not reconfigured or disabled.
+`journal::import` fingerprints each command and caches summaries in SQLite. It
+reimports only changed journals. `journal::refresh` lets show and undo load only
+the requested command. First import and explicit database rebuild still read the
+source effects. No dependencies were added.
 
 ## Acceptance checklist
+
 | # | Item | Result | Proven by (test name or command) |
-|---|---|---|---|
-| 1 | Bash rewrite, exact output envelope, fail-open, off switch, repeated wrapping | PASS | hook_rewrite_and_fail_open; raw_garbage_hook_is_silent_and_successful |
-| 2 | Patch add, update, delete, move, session matching and undo | PASS | patch_add_update_delete_move_and_undo |
-| 3 | Patch deny floor and missing post become incomplete | PASS | patch_deny_floor_and_missing_post |
-| 4 | PID 1 foreground, background and signal journals complete | PASS, real namespaces available | pid_one_namespace_finishes_journal |
-| 5 | Cross-mount copies and 5,000-file byte-for-byte restore | PASS, real bind mount available | separate_bind_mount_five_thousand_deletes_restore |
-| 6 | EROFS fails open with the specified single line | PASS | readonly_home_has_one_line_and_runs_command |
-| 7 | Init merges hooks and commented config, backups, idempotence, exact uninstall | PASS | init_uninstall_exact_roundtrip_and_idempotence |
-| 8 | Default git root, tracked warnings, excludes, broken output | PASS | default_project_tracked_settings_and_closed_output |
-| 9 | Refuse outside git and in Saqta itself | PASS | init_refuses_non_repo_and_saqta |
-| 10 | Preserve later settings and hooks at uninstall | PASS for proved ownership; ambiguous edits refuse | uninstall_preserves_later_comments; uninstall_keeps_new_foreign_hook_bytes |
-| 11 | Status checks current hooks, writable root and recent commands | PASS | init_uninstall_exact_roundtrip_and_idempotence |
-| 12 | Doctor checks actual capture when already supervised | PASS | doctor_inside_wrapped_command_checks_actual_capture; existing doctor tests |
-| 13 | Quoting with arbitrary NUL-free bytes, Unicode, heredocs and shell syntax | PASS, 128 generated cases | hook::tests::quoting_matches_bash; real_hook_shell_cases |
-| 14 | All existing tests and forced proc-memory fallback | PASS | cargo test --locked; SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture |
-| 15 | Formatting, clippy, dependency policy, docs and R1 bundle | See bundle checks | scripts/review-bundle.sh m3-codex-r1 |
-| R1.1 | Wrapped doctor probes on systemd hosts | PASS | supervised_doctor_probes_on_a_systemd_host; doctor_inside_systemd_named_namespace_checks_actual_capture |
-| R1.2 | Ignored and restored TERM semantics without namespaces | PASS | inherited_ignored_term_is_preserved_without_namespaces |
-| R1.3 | UID-map denial is a setup capability result | PASS | namespace_probe_reports_uid_map_denial |
-| R1.4 | PID 1 with wake-up disabled and older launcher semantics | PASS, 12 namespace runs | pid_one_namespace_finishes_journal |
+| 1 | All requested operation kinds, colliding namespace, direct debug helper | PASS | `consecutive_commands_restore_every_snapshot`, `syscall_helper_exercises_creation_and_write_through_symlink` |
+| 2 | One to three commands; newest-only and complete undo match snapshots | PASS | `consecutive_commands_restore_every_snapshot` |
+| 3 | Two to four concurrent processes on separate subtrees | PASS | `concurrent_subtrees_restore_exactly` |
+| 4 | Interrupted undo retains both boundary versions and resumes exactly | PASS | `interrupted_undo_preserves_versions_and_resumes` |
+| 5 | Every action boundary for shared inode repair and exchange | PASS | `resume_replays_every_step_of_shared_inode_repair_and_exchange` |
+| 6 | 64 cases by default; override; saved seeds; failing fixtures | PASS | `config` in `tests/harness.rs`; regression file; fixture preservation |
+| 7 | Nightly and manual 5,000-case Ubuntu 24.04 workflow; failure artifacts | AUTHORED | `.github/workflows/harness.yml`; not run on GitHub during this session |
+| 8 | Minimized product failures become named regressions | PASS | Bug table below |
+| 9 | Age and size limits; regenerable content first; newest three protected | PASS | `age_size_dry_run_and_newest_three` |
+| 10 | Shared pre-images and tagged caches | PASS | `cachedir_tag_and_shared_preimages_keep_nonregenerable_references` |
+| 11 | Running commands and interrupted undos protected | PASS | `running_and_interrupted_undo_are_protected` |
+| 12 | Expired paths reported; remaining content restored | PASS | `regenerable_content_expires_first_and_undo_restores_other_content` |
+| 13 | Dry-run changes nothing | PASS | Full store hash in `age_size_dry_run_and_newest_three` |
+| 14 | Opportunistic GC at most once daily; status size and timestamp | PASS | `opportunistic_gc_runs_after_output_at_most_once_per_day` |
+| 15 | Incremental import with 70,000-effect history; loose timing bound | PASS | `incremental_history_does_not_reparse_seventy_thousand_effects`; SQLite trigger rejects reimport |
+| 16 | Non-zero undo categories and preferred source examples | PASS | `undo_and_dry_run_print_only_nonzero_categories`, `summary_examples_prefer_source_paths` |
+| 17 | Supervised doctor gives info, no blocked store writes, real capture probe | PASS | `supervised_doctor_reports_info_without_store_write_attempts`; existing two Codex doctor tests |
+| 18 | GC preserves recovery copies when an older hard link changed | PASS | `gc_keeps_a_newer_copy_when_an_older_retained_hard_link_was_changed` |
+| 19 | A dead incomplete exec recovers a partial trailing intent; raw log retained | PASS | `killed_command_recovers_only_complete_intents_and_keeps_the_raw_tail` |
+| 20 | A retained post version stays immutable after later alias writes | PASS | `preserved_created_hard_link_is_immutable_after_later_write` |
+| 21 | Formatting, clippy, full suite, forced proc-memory fallback, release configuration | PASS | `scripts/review-bundle.sh m4-harness`; `cargo check --release --locked` |
+
+### Bugs found and fixed
+
+Persisted failure seeds remain in `tests/harness.proptest-regressions`. Names
+below are in `tests/harness.rs` unless another file is named. Several minimized
+sequences share one underlying bug; all remain as separate regressions.
+
+| Failure | Fix | Named regression |
+| --- | --- | --- |
+| A pure append survived undo | Notify on append-capable write opens | `regression_pure_append_is_undone` |
+| A failed directory rename caused a conflict after undoing a later child write | Ignore failed intents; compare restored file metadata and recorded directory observations | `regression_failed_directory_rename_then_child_write` |
+| Exchange could not reverse after a created input was removed | Move the surviving input back when the other side is absent | `regression_exchange_then_remove_a_created_input` |
+| Growth between repeated writes restored an impossible intermediate size | Use the existing full pre-image once one exists | `regression_write_then_grow_then_write_does_not_restore_an_intermediate_size` |
+| Original bytes existed only as a prefix during interrupted growth undo | Materialize complete original prefix files before mutation | `regression_grown_prefix_survives_interrupted_undo` |
+| A grown file disappeared from its recorded pathname after a directory exchange | Follow later successful moves to find its prefix | `regression_grown_file_moves_with_exchanged_directory` |
+| Undo of a newer command changed an inode and blocked an older growth undo | Use restored metadata and alias observations | `regression_growth_then_a_later_command_replaces_the_inode` |
+| Snapshot followed a removed directory replaced by a symlink | Snapshot without traversing symlink parents | `regression_removed_directory_replaced_by_a_symlink` |
+| A moved parent replaced by a symlink loop damaged post-state recording | Record inaccessible children as absent and verify the recorded ancestor before accepting that absence | `regression_moved_parent_replaced_by_a_symlink_loop` |
+| Exchanging a symlink over a touched parent made safe undo look inaccessible | Apply the same recorded-ancestor check | `regression_exchange_a_symlink_over_a_touched_parent` |
+| An exchanged hard-link source acquired a trailing slash, so capture treated an original alias as created | Preserve the exact basename when a moved suffix is empty | `regression_write_new_hard_link_after_original_name_is_exchanged` |
+| Growth through a new alias restored the wrong name after the original name was replaced | Record growth against its surviving original name | `regression_growth_through_new_hard_link_then_replace_original_name` |
+| Growth, deletion and a write through a pre-existing alias left the other name wrong | Preserve inode identity and repair recorded aliases | `regression_grow_delete_and_write_a_preexisting_alias` |
+| Repeated writes around an alias deletion left a frozen restored alias at an intermediate version | Track original and actual identities during recovery | `regression_repeated_write_after_alias_deletion_repairs_both_names` |
+| The same frozen-alias failure occurred after a rename | Relocate recovery lineage with names | `regression_repair_alias_after_rename_and_later_write` |
+| Equal-length truncate after an earlier copy omitted an alias and its changed mtime | Record a modify effect using the existing full pre-image | `regression_rename_over_alias_then_equal_length_truncate` |
+| Undoing a newer command detached an alias needed by the older command | Retain validated lineage and inode handles across undo folders | `regression_alias_lineage_survives_undo_of_a_newer_command` |
+| GC could remove the last good copy when a later command changed an older retained hard link | Refuse collection before mutation when retained pre-images changed; preserve all recovery copies and report why | `tests/retention.rs`: `gc_keeps_a_newer_copy_when_an_older_retained_hard_link_was_changed` |
+
+The forced memory-fallback check also found a supervisor killed during a log
+write. Only a dead incomplete exec may recover its complete prefix. The raw
+log stays byte for byte. Completed or live journals still refuse that damage.
+`tests/capture.rs`: `killed_command_recovers_only_complete_intents_and_keeps_the_raw_tail`
+is the named regression. A related retained-version check now separates immutable
+numeric snapshots from mutable inode handles, proved by
+`preserved_created_hard_link_is_immutable_after_later_write`.
+
+The harness itself also needed corrections. openat2 is intentionally blocked in
+the filtered command, so the driver now walks pinned parents with openat and
+O_NOFOLLOW. Truncate uses a checked fixture pathname instead of a proc magic
+link. A smoke test proves actual creation and symlink writes occur. Fixture ids
+include a short timestamp because sandbox PID namespaces can reuse process ids;
+the short form also fits Unix socket path limits. The interruption oracle was
+restricted to the current command's recovery locations.
 
 ## Decisions
-[0008 Codex integration](../docs/decisions/0008-codex-integration.md): local hooks,
-namespace finish ordering and settings ownership. Prior decisions remain in place.
+
+- [0009: resumable undo](../docs/decisions/0009-resumable-undo.md): replayable actions, alias lineage and process-crash guarantees.
+- [0010: retention](../docs/decisions/0010-retention.md): collection order, protection, expiry and daily scheduling.
+- [0011: incremental index](../docs/decisions/0011-incremental-index.md): changed-journal imports and append interception.
+
+- [0012: unacknowledged tail](../docs/decisions/0012-unacknowledged-tail.md): preserve a killed writer's raw log and qualify prefix recovery.
 
 ## Measurements
-WSL2 x86_64, kernel 6.18.58.1-microsoft-standard-WSL2, Rust and Cargo 1.100.0.
-Bash hook wall time: 1.76 to 3.70 ms across local test runs.
-5,000 cross-mount deletes plus undo: 1.60 to 2.27 seconds across local runs.
-Existing 200-sample exec check: direct median 3.40 ms, p95 3.85 ms;
-Saqta median 6.67 ms, p95 8.79 ms. These are development-build measurements.
-R1: `cargo test --locked` passed 117 tests (10 unit, 107 integration).
-`SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture` passed all 56 tests.
-R1's 5,000-file bind delete and restore took 2.26 seconds. The existing exec
-measurement was direct median 3.36 ms, p95 3.79 ms; Saqta median 6.66 ms,
-p95 6.85 ms. Namespace cases also ran with synchronous wake-up disabled.
-Final check logs and their measurements are in the R1 review bundle.
+
+Machine: AMD Ryzen 9 9900X, 24 logical CPUs, ext4 on WSL2.
+Kernel: `6.18.58.1-microsoft-standard-WSL2`, x86_64.
+Toolchain: rustc 1.100.0 and cargo 1.100.0. Measurements use debug builds.
+
+- Recorded green full-suite run: 151 tests, 27.76 seconds across test binaries. The final bundle repeats the final source checks.
+- Default harness with pre-existing hard links and immutable post snapshots: 24 tests, 15.96 seconds in that green run.
+- Extended run with pre-existing hard links: 128 cases per property, all 22 tests passed in 27.52 seconds.
+- Earlier extended run: 256 cases per property passed before the pre-existing alias fixture was added.
+- 70,000-effect first import: 695 ms. Cached log: 4.55 ms; show: 2.42 ms; one-file undo: 8.69 ms. The test asserts only a generous two-second sanity bound and separately rejects any unchanged-effect reimport with a SQLite trigger.
+- Scheduling background GC from log: 42.4 ms including normal log work.
+- Existing 5,000-file cross-mount deletion and undo: 3.56 seconds.
+- Existing 500-file undo after stdout closes: 359 ms normally and 317 ms with verbose output.
 
 ## Known gaps and risks
-- Real Codex trust-screen interaction was not automated. The integration uses
-  the payload and trust behavior measured by the user.
-- An ambiguous later settings edit can require manual review before uninstall.
-  Saqta leaves the settings and installation receipt intact in this case.
-- JSON hook formatting can change at init. Unchanged settings round-trip exactly.
-  Symlinked project Codex settings are refused to avoid changing another location.
-- Patch capture only records named entries. It does not remove unnamed parent
-  directories made by a patch applier. Nonregular files that cannot be copied
-  and files above SAQTA_MAX_COPY are logged as not protected.
-- M2's races with unrelated writers and lack of power-loss durability remain.
-- Codex stopping or quitting can leave commands alive. Inside PID namespaces,
-  background jobs die with the namespace. The hooks cannot change either fact.
-- Existing environment skips remain explicit: Unix socket creation in this
-  sandbox, the old direct tmpfs mount fixture, and bare i386 execution. The new
-  user-namespace PID and bind-mount tests ran successfully rather than skipping.
+
+- These finite properties are evidence within the generated model, not a mathematical proof over every syscall and filesystem race. Metadata-only operations, shared-subtree races between processes, skipped filesystems and failed captures remain outside that model.
+- First index import or rebuilding journal.db still scales with effects. The steady-state target is met; a cold 70,000-effect import takes about 0.7 seconds here.
+- Recovery checkpoints guarantee process-crash replay. They do not add power-loss durability. The existing synced displacement map remains. Older partial undos without an M4 plan require manual recovery.
+- Hard links may return as separate files. Recorded lineage restores bytes across tested command boundaries. External edits during recovery can require manual inspection rather than automatic completion.
+- Cross-filesystem moves of nonempty directories can refuse. Entries and recovery copies remain available.
+- Retention size counts logical bytes in `cmd/` and `q/`, once per inode. It excludes the rebuildable index and diagnostic logs. Protected commands, incomplete journals and orphaned recovery content may keep retained size over the limit.
+- Any in-progress undo defers GC to protect shared inode handles in older undo folders.
+- GC refuses when an older retained hard link has changed. This preserves a good copy held by another command. Undo newer commands first or inspect the recovery copies. Background refusals appear in status.
+- Ordinary retention tests run inside physical `target/` fixtures. The mixed source/cache test temporarily gives only its stored effect paths a synthetic prefix to test classification, then restores the real paths before undo. No syscall executes against that prefix.
+- Sandboxed runs skipped Unix sockets, tmpfs mounting and the bare i386 comparison with explicit SKIP messages. The green bundle outside the sandbox ran the socket and i386 checks. Tmpfs mounting still requires privileges and was skipped. See the bundle for exact skips.
+- The GitHub workflow is authored but has not executed remotely. No files were committed or published.
 
 ## Questions for review
-Review hook payload compatibility against the measured Codex 0.169 behavior.
-Review the installation ownership receipt and conservative refusal behavior.
-Hosted Ubuntu CI has not been rerun from these uncommitted changes. Review the
-local reproductions and the runner's next CI result. No R1 commits will be made
-until the user says this review passed.
 
-## Commit plan
-Original approved plan:
-1. `exec: finish journals before PID 1 returns and label cross-mount copies`
-2. `codex: capture Bash and patch hooks with M2 journals`
-3. `codex: manage project hooks, settings and protection status`
-4. `doctor: verify real capture inside the Codex sandbox`
-5. `codex: add integration tests, documentation and review checks`
-The five reviewed commits above already exist as b5cfa32, caff1f6, 0523f24,
-875f156 and 3bda5d9. They will not be rewritten.
+Review the replay identities, growth-prefix handling, alias lineage, expiry-before-unlink order and conservative GC refusal. Check that the documented process-crash and retention-size boundaries match the intended contract.
 
-New commits proposed on top, after R1 review:
-6. `doctor: check actual capture when supervised on systemd hosts`
-   Share supervised detection, add the host-context unit regression and the
-   systemd-named namespace reproduction.
-7. `tests: probe namespace setup before running capture fixtures`
-   Centralize capability probes and cover the UID-map failure independently.
-8. `tests: establish PID 1 signal semantics across unshare versions`
-   Restore fixture signal dispositions, cover ignored signals without namespaces,
-   exercise both wake-up modes, and include this report.
-Each new commit will build and pass its relevant tests. None is committed yet.
+### Commit plan after review passes
+
+1. `capture: protect appends and preserve moved hard-link origins`
+2. `undo: resume reverse actions and retain alias lineage`
+3. `gc: collect expired versions under command locks`
+4. `journal: import changed commands and polish CLI output`
+5. `test: add model harness, regressions and nightly artifacts`
+
+The first bundle caught the partial-log recovery bug above. Its audit also hit
+a sandbox read-only advisory-cache lock. `cargo deny --offline check` passed
+outside the sandbox. The final bundle is rerun with that cache lock available.
+
+Stage related CLI and journal hunks with each change so every commit builds and
+passes its checks. Include each decision with its implementation. Commit only
+after the user says review passed, and request the required permission before
+each commit.

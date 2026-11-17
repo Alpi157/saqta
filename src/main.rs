@@ -4,6 +4,8 @@ mod doctor;
 mod exec;
 mod filter;
 mod gc;
+#[cfg(debug_assertions)]
+mod harness;
 mod hook;
 mod journal;
 mod output;
@@ -13,6 +15,14 @@ mod supervisor;
 mod sys;
 
 fn main() {
+    #[cfg(debug_assertions)]
+    if std::env::args_os().nth(1).is_some_and(|s| s == "__harness") {
+        let result = harness::run();
+        if let Err(e) = &result {
+            eprintln!("harness: {e:#}");
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 125 });
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|s| s == "__supervisor")

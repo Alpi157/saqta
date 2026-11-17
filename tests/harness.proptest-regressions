@@ -1,0 +1,22 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 76d2e5c968d225b857ef3d6605305e7ef36f766764db1eedecc045d0ae01d6b8 # shrinks to ops = [Op { kind: 3, a: 6, b: 0, n: 0, data: [0] }], splits = 1
+cc b34b9d8e51d430fe5001d719152e1ecbcb81638759766a959017080e7478b778 # shrinks to ops = [Op { kind: 3, a: 6, b: 0, n: 0, data: [0] }], splits = 1
+cc 1daa07b7cb16539b3f6f2b56b93f092a09f5b448eaf740e8c345f9a51937488e # shrinks to ops = [Op { kind: 4, a: 6, b: 0, n: 0, data: [] }], stop = 1
+cc de160f2a881ee1dd2483fcad755e0d6530122d9dbba358a1a3200edb2a6c5b8f # shrinks to ops = [Op { kind: 9, a: 13, b: 0, n: 0, data: [] }, Op { kind: 0, a: 13, b: 0, n: 0, data: [] }, Op { kind: 8, a: 13, b: 5, n: 0, data: [] }, Op { kind: 9, a: 5, b: 0, n: 0, data: [] }], splits = 1
+cc d6832f47004189b444eff8e4f717b5e84278db2175ecb615bb5a49dc745fdc52 # shrinks to processes = [[Op { kind: 0, a: 0, b: 0, n: 0, data: [] }], [Op { kind: 1, a: 6, b: 0, n: 0, data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, Op { kind: 5, a: 6, b: 0, n: 0, data: [] }, Op { kind: 1, a: 6, b: 0, n: 0, data: [] }]]
+cc 938f0f6293808244a0cd237c6275ff628d670cbe56dc2794b3778b3de2136c54 # shrinks to ops = [Op { kind: 5, a: 6, b: 0, n: 0, data: [] }, Op { kind: 1, a: 6, b: 0, n: 0, data: [] }, Op { kind: 14, a: 6, b: 0, n: 0, data: [] }, Op { kind: 1, a: 6, b: 0, n: 0, data: [] }, Op { kind: 1, a: 6, b: 0, n: 0, data: [] }, Op { kind: 1, a: 6, b: 0, n: 0, data: [] }, Op { kind: 1, a: 6, b: 0, n: 0, data: [] }, Op { kind: 1, a: 6, b: 0, n: 0, data: [] }], stop = 1
+cc 7de8af3b9d47ce89ab0c72cdffd53068b7f1b896249e02f1084da79c12c44b7f # shrinks to processes = [[Op { kind: 9, a: 14, b: 0, n: 0, data: [] }, Op { kind: 10, a: 4, b: 0, n: 0, data: [] }, Op { kind: 13, a: 4, b: 0, n: 0, data: [] }], [Op { kind: 0, a: 0, b: 0, n: 0, data: [] }]]
+cc 51c079ca4fa40e8433bde65d701ec3be8c536b0429438736496af5bb1fe1a081 # shrinks to ops = [Op { kind: 7, a: 7, b: 6, n: 0, data: [] }, Op { kind: 7, a: 0, b: 15, n: 0, data: [] }, Op { kind: 13, a: 0, b: 0, n: 0, data: [] }], splits = 1
+cc 2e9a4f6ba4fc0dbfe515b722d9a669ef302ae272139bd3c1581d9e6dd3d2c33f # shrinks to ops = [Op { kind: 13, a: 15, b: 0, n: 0, data: [] }, Op { kind: 7, a: 15, b: 6, n: 0, data: [] }, Op { kind: 8, a: 6, b: 4, n: 0, data: [] }], stop = 1
+cc c74cd3cfce5d0bb9f9aae4037d306857c5b1a27ce003bec6eda93451eee2f343 # shrinks to processes = [[Op { kind: 0, a: 0, b: 0, n: 0, data: [] }], [Op { kind: 12, a: 11, b: 17, n: 0, data: [] }, Op { kind: 8, a: 11, b: 0, n: 0, data: [] }, Op { kind: 1, a: 17, b: 0, n: 0, data: [] }]]
+cc a0585d562f9374339c696662926b693a3972135ce95f7234c929865a99db30fa # shrinks to processes = [[Op { kind: 12, a: 7, b: 16, n: 0, data: [] }, Op { kind: 5, a: 16, b: 0, n: 0, data: [] }, Op { kind: 7, a: 8, b: 7, n: 0, data: [] }, Op { kind: 14, a: 16, b: 0, n: 0, data: [] }], [Op { kind: 0, a: 0, b: 0, n: 0, data: [] }]]
+cc efd0f189bfe3d8618f23a54b62fa1888a488fc76fb1a4301090b56ccd75a0e3e # shrinks to ops = [Op { kind: 1, a: 8, b: 0, n: 0, data: [] }, Op { kind: 9, a: 11, b: 0, n: 0, data: [] }, Op { kind: 1, a: 8, b: 0, n: 0, data: [] }], splits = 1
+cc 77d87a429144c6f05300eacb8b0630fea3fca5cf6c2d577ac73454028251d773 # shrinks to ops = [Op { kind: 1, a: 11, b: 0, n: 0, data: [] }, Op { kind: 9, a: 8, b: 0, n: 0, data: [] }, Op { kind: 14, a: 11, b: 0, n: 0, data: [] }], stop = 1
+cc f9993ee79c1415d8865f83d24a4fe1d374a410072d9a8472fa10c00c260bedb2 # shrinks to processes = [[Op { kind: 1, a: 11, b: 0, n: 0, data: [] }, Op { kind: 7, a: 11, b: 17, n: 0, data: [] }, Op { kind: 9, a: 8, b: 0, n: 0, data: [] }, Op { kind: 1, a: 17, b: 0, n: 0, data: [] }], [Op { kind: 0, a: 0, b: 0, n: 0, data: [] }]]
+cc a3ad92e0f4ca0eb9f313664c4c7e7a8ce7921dfe160e7052902e8674f36f3bb0 # shrinks to ops = [Op { kind: 1, a: 8, b: 0, n: 0, data: [] }, Op { kind: 7, a: 6, b: 8, n: 0, data: [] }, Op { kind: 4, a: 11, b: 0, n: 0, data: [] }], stop = 1
+cc 9587f1fe1a5cf558a3acb32f3c7f06f018b25f5ac41db64a1c8d0575ea00d88d # shrinks to processes = [[Op { kind: 1, a: 8, b: 0, n: 0, data: [] }, Op { kind: 7, a: 6, b: 8, n: 0, data: [] }, Op { kind: 4, a: 11, b: 0, n: 0, data: [] }], [Op { kind: 0, a: 0, b: 0, n: 0, data: [] }]]
