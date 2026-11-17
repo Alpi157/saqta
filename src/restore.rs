@@ -1,12 +1,14 @@
-//! Undo checks all conflicts first, then walks canonical parents without symlinks.
+//! Undo checks conflicts, plans reverse effects and keeps alias lineage.
+mod steps;
 use crate::{
     journal::{self, Effect, State},
     output::Progress,
     paths, sys,
 };
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::{CString, OsStr},
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -28,16 +30,54 @@ struct Parent {
     fd: OwnedFd,
     name: CString,
 }
-struct Undo {
-    root: OwnedFd,
-    q: OwnedFd,
-    backup: OwnedFd,
-    log: File,
+#[derive(Clone, Serialize, Deserialize)]
+enum Action {
+    Move {
+        from: String,
+        to: String,
+    },
+    Copy {
+        from: String,
+        to: String,
+    },
+    Write {
+        from: String,
+        to: String,
+        before: State,
+    },
+    Directory {
+        path: String,
+        before: State,
+    },
+    Exchange {
+        a: String,
+        b: String,
+        first: State,
+        second: State,
+    },
+}
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Recovery {
+    completed_through: Option<u64>,
+    origins: BTreeMap<String, (State, State)>,
     serial: u64,
-    copies: HashMap<String, usize>,
     conflicts: HashSet<String>,
     git_indexes: HashSet<String>,
+    pending: Vec<Action>,
+    effect: u64,
+    cursor: usize,
+    before: Option<State>,
+    steps: u64,
+}
+struct Undo {
+    root: OwnedFd,
+    log: File,
+    recovery: Recovery,
     backup_path: PathBuf,
+    qpath: PathBuf,
+    aliases: Vec<String>,
+    alias_keys: BTreeSet<(u64, u64)>,
     output: Progress<io::Stdout>,
 }
 impl Undo {
@@ -51,457 +91,443 @@ impl Undo {
         } else {
             parent
         };
-        let name = p
-            .file_name()
-            .ok_or_else(|| io::Error::other("cannot restore root"))?;
         Ok(Parent {
             fd: sys::open_restore_parent(self.root.as_raw_fd(), &cstr(parent.as_os_str())?)?,
-            name: cstr(name)?,
+            name: cstr(
+                p.file_name()
+                    .ok_or_else(|| io::Error::other("cannot restore root"))?,
+            )?,
         })
     }
-    fn save_current(&mut self, p: &Path, at: &Parent) -> io::Result<()> {
-        let Some(st) = sys::stat_at(at.fd.as_raw_fd(), &at.name)? else {
-            return Ok(());
+    fn state(&self, p: &Path) -> io::Result<Option<State>> {
+        current_secure(self.root.as_raw_fd(), p)
+    }
+    fn save_state(&self) -> io::Result<()> {
+        journal::json_write(&self.backup_path.join("state.json"), &self.recovery)
+    }
+    fn push_move(&mut self, from: &Path, to: &Path) {
+        self.recovery.pending.push(Action::Move {
+            from: journal::display(from),
+            to: journal::display(to),
+        });
+    }
+    fn push_copy(&mut self, from: &Path, to: &Path) {
+        self.recovery.pending.push(Action::Copy {
+            from: journal::display(from),
+            to: journal::display(to),
+        });
+    }
+    fn save_current(&mut self, p: &Path) -> io::Result<Option<(PathBuf, State)>> {
+        let at = match self.parent(p) {
+            Ok(at) => at,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
         };
-        self.serial += 1;
-        let q = CString::new(self.serial.to_string()).map_err(io::Error::other)?;
-        // The recovery map is durable before the name can move.
+        let Some(raw) = sys::stat_at(at.fd.as_raw_fd(), &at.name)? else {
+            return Ok(None);
+        };
+        let shared = raw.st_nlink > 1;
+        let st = State::from_stat(&raw);
+        self.recovery.serial += 1;
+        let saved = self.backup_path.join(self.recovery.serial.to_string());
         writeln!(
             self.log,
             "{}\t{}\t{}",
-            self.serial,
+            self.recovery.serial,
             journal::display(p),
-            serde_json::to_string(&State::from_stat(&st)).map_err(io::Error::other)?
+            serde_json::to_string(&st).map_err(io::Error::other)?
         )?;
         self.log.sync_data()?;
-        match sys::rename_at(
-            at.fd.as_raw_fd(),
-            &at.name,
-            self.backup.as_raw_fd(),
-            &q,
-            libc::RENAME_NOREPLACE,
-        ) {
-            Ok(()) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                self.copy_entry(
-                    at.fd.as_raw_fd(),
-                    &at.name,
-                    self.backup.as_raw_fd(),
-                    &q,
-                    &st,
-                )?;
-                sys::unlink_at(
-                    at.fd.as_raw_fd(),
-                    &at.name,
-                    st.st_mode & libc::S_IFMT == libc::S_IFDIR,
-                )
-            }
-            Err(e) => Err(e),
-        }?;
-        if self.git_indexes.remove(&journal::display(p)) {
+        self.push_move(p, &saved);
+        let retained = if st.directory() || (st.mode & libc::S_IFMT == libc::S_IFREG && shared) {
+            // Keep an inode handle for older alias repairs, and an independent
+            // numeric snapshot for the user. Later writes cannot change that snapshot.
+            let held = self
+                .backup_path
+                .join(format!("inode-{}", self.recovery.serial));
+            self.push_move(&saved, &held);
+            self.push_copy(&held, &saved);
+            held
+        } else {
+            saved.clone()
+        };
+        if self.recovery.git_indexes.remove(&journal::display(p)) {
             self.output.line(format_args!(
                 "kept the newer git index in {} (git rewrites it on commands like git status)",
-                journal::display(&self.backup_path.join(self.serial.to_string()))
+                journal::display(&saved)
             ));
         }
-        Ok(())
+        Ok(Some((retained, st)))
     }
-    // Reverse moves still need their source. Keep the conflicting entry first,
-    // then make an independent working copy so the retained version never moves.
-    fn keep_move_input(&mut self, p: &Path, at: &Parent) -> io::Result<()> {
-        if !self.conflicts.remove(&journal::display(p))
-            || sys::stat_at(at.fd.as_raw_fd(), &at.name)?.is_none()
+    fn keep_move_input(&mut self, p: &Path) -> io::Result<()> {
+        if self.recovery.conflicts.remove(&journal::display(p))
+            && let Some((saved, _)) = self.save_current(p)?
         {
-            return Ok(());
+            self.push_copy(&saved, p);
         }
-        self.save_current(p, at)?;
-        let saved = CString::new(self.serial.to_string()).map_err(io::Error::other)?;
-        self.copy_tree(self.backup.as_raw_fd(), &saved, at.fd.as_raw_fd(), &at.name)
+        Ok(())
     }
-    fn copy_tree(
-        &self,
-        from: i32,
-        name: &std::ffi::CStr,
-        to: i32,
-        dest: &std::ffi::CStr,
-    ) -> io::Result<()> {
-        let st = sys::stat_at(from, name)?
-            .ok_or_else(|| io::Error::other("missing displaced move input"))?;
-        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return self.copy_entry(from, name, to, dest, &st);
-        }
-        let source = sys::open_at(
-            from,
-            name,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-            0,
-        )?;
-        sys::mkdir_at(to, dest, 0o700)?;
-        let target = sys::open_at(
-            to,
-            dest,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-            0,
-        )?;
-        for entry in fs::read_dir(format!("/proc/self/fd/{}", source.as_raw_fd()))? {
-            let child = cstr(&entry?.file_name())?;
-            self.copy_tree(source.as_raw_fd(), &child, target.as_raw_fd(), &child)?;
-        }
-        sys::metadata_fd(
-            target.as_raw_fd(),
-            st.st_mode,
-            st.st_mtime,
-            st.st_mtime_nsec,
-        )
-    }
-    fn copy_entry(
-        &self,
-        from: i32,
-        name: &std::ffi::CStr,
-        to: i32,
-        dest: &std::ffi::CStr,
-        st: &libc::stat,
-    ) -> io::Result<()> {
-        match st.st_mode & libc::S_IFMT {
-            libc::S_IFREG => {
-                let src = sys::open_at(
-                    from,
-                    name,
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                    0,
-                )?;
-                let dst = sys::open_at(
-                    to,
-                    dest,
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-                    0o600,
-                )?;
-                sys::copy_regular(File::from(src), File::from(dst), st)
-            }
-            libc::S_IFLNK => {
-                let target = fs::read_link(
-                    PathBuf::from(format!("/proc/self/fd/{from}"))
-                        .join(OsStr::from_bytes(name.to_bytes())),
-                )?;
-                sys::symlink_at(&cstr(target.as_os_str())?, to, dest)?;
-                sys::symlink_mtime(to, dest, st.st_mtime, st.st_mtime_nsec)
-            }
-            libc::S_IFDIR => {
-                // Cross-filesystem directory backups are safe only when empty.
-                let source = sys::open_at(
-                    from,
-                    name,
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                    0,
-                )?;
-                if fs::read_dir(format!("/proc/self/fd/{}", source.as_raw_fd()))?
-                    .next()
-                    .is_some()
-                {
-                    return Err(io::Error::other(
-                        "cannot move a nonempty directory across filesystems; kept it in place",
-                    ));
-                }
-                sys::mkdir_at(to, dest, st.st_mode & 0o7777)?;
-                let fd = sys::open_at(
-                    to,
-                    dest,
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                    0,
-                )?;
-                sys::metadata_fd(fd.as_raw_fd(), st.st_mode, st.st_mtime, st.st_mtime_nsec)
-            }
-            _ => Err(io::Error::other(
-                "cannot copy a special file across filesystems; kept it in place",
-            )),
-        }
-    }
-    fn restore_kept(&mut self, e: &Effect, p: &Path) -> io::Result<()> {
-        if e.quarantine.is_empty() {
-            return Ok(());
-        }
-        let name = CString::new(e.quarantine.as_bytes()).map_err(io::Error::other)?;
-        let st = sys::stat_at(self.q.as_raw_fd(), &name)?
-            .ok_or_else(|| io::Error::other("missing quarantine pre-image"))?;
-        let at = self.parent(p)?;
-        self.save_current(p, &at)?;
-        let remaining = self
-            .copies
-            .get_mut(&e.quarantine)
-            .ok_or_else(|| io::Error::other("missing quarantine reference count"))?;
-        *remaining -= 1;
-        let last = *remaining == 0;
-        if last {
-            match sys::rename_at(
-                self.q.as_raw_fd(),
-                &name,
-                at.fd.as_raw_fd(),
-                &at.name,
-                libc::RENAME_NOREPLACE,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        // Reused pre-images must remain available for the earlier effects.
-        self.copy_entry(self.q.as_raw_fd(), &name, at.fd.as_raw_fd(), &at.name, &st)
-    }
-    fn restore_modified(&mut self, e: &Effect, p: &Path) -> io::Result<()> {
-        if e.quarantine.is_empty() {
-            return Ok(());
-        }
-        let at = self.parent(p)?;
-        let current = sys::stat_at(at.fd.as_raw_fd(), &at.name)?;
-        let Some(current) =
-            current.filter(|s| s.st_mode & libc::S_IFMT == libc::S_IFREG && s.st_nlink > 1)
-        else {
-            return self.restore_kept(e, p);
-        };
-        // Restore through a surviving shared inode so untouched aliases regain
-        // their bytes too. First detach an independent post-command backup.
-        self.save_current(p, &at)?;
-        let live = CString::new(self.serial.to_string()).map_err(io::Error::other)?;
-        let post = CString::new(format!("{}-post", self.serial)).map_err(io::Error::other)?;
-        self.copy_entry(
-            self.backup.as_raw_fd(),
-            &live,
-            self.backup.as_raw_fd(),
-            &post,
-            &current,
-        )?;
-        let name = CString::new(e.quarantine.as_bytes()).map_err(io::Error::other)?;
-        let src = sys::open_at(
-            self.q.as_raw_fd(),
-            &name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0,
-        )?;
-        let dst = sys::open_at(
-            self.backup.as_raw_fd(),
-            &live,
-            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0,
-        )?;
-        let actual = sys::stat_fd(dst.as_raw_fd())?;
-        if actual.st_dev != current.st_dev
-            || actual.st_ino != current.st_ino
-            || actual.st_mode & libc::S_IFMT != libc::S_IFREG
+    fn prepare_sizes(&self, record: &journal::Record) -> io::Result<()> {
+        for e in record
+            .effects
+            .iter()
+            .filter(|e| e.op == "size" && record.outcomes.get(&e.seq) != Some(&false))
         {
-            return Err(io::Error::other("shared inode changed during undo"));
-        }
-        let before = e
-            .note
-            .before
-            .as_ref()
-            .ok_or_else(|| io::Error::other("missing pre-image metadata"))?;
-        let mut source = File::from(src);
-        let mut destination = File::from(dst);
-        destination.set_len(0)?;
-        let copied = io::copy(&mut source, &mut destination)?;
-        if copied != before.size as u64 {
-            return Err(io::Error::other(
-                "short shared-inode restore; both versions remain in quarantine",
-            ));
-        }
-        sys::metadata_fd(
-            destination.as_raw_fd(),
-            before.mode,
-            before.mtime,
-            before.mtime_ns,
-        )?;
-        destination.sync_all()?;
-        sys::rename_at(
-            self.backup.as_raw_fd(),
-            &live,
-            at.fd.as_raw_fd(),
-            &at.name,
-            libc::RENAME_NOREPLACE,
-        )?;
-        sys::rename_at(
-            self.backup.as_raw_fd(),
-            &post,
-            self.backup.as_raw_fd(),
-            &live,
-            libc::RENAME_NOREPLACE,
-        )?;
-        let references = self
-            .copies
-            .get_mut(&e.quarantine)
-            .ok_or_else(|| io::Error::other("missing pre-image reference count"))?;
-        *references -= 1;
-        Ok(())
-    }
-    fn restore_size(&mut self, e: &Effect, p: &Path) -> io::Result<()> {
-        let at = self.parent(p)?;
-        let before = e
-            .note
-            .before
-            .as_ref()
-            .ok_or_else(|| io::Error::other("missing original size"))?;
-        let mut current = sys::stat_at(at.fd.as_raw_fd(), &at.name)?
-            .ok_or_else(|| io::Error::other("missing grown file"))?;
-        self.save_current(p, &at)?;
-        let live = CString::new(self.serial.to_string()).map_err(io::Error::other)?;
-        let post = CString::new(format!("{}-post", self.serial)).map_err(io::Error::other)?;
-        let shared = current.st_nlink > 1;
-        let destination = if shared {
-            self.copy_entry(
-                self.backup.as_raw_fd(),
-                &live,
-                self.backup.as_raw_fd(),
-                &post,
-                &current,
-            )?;
-            sys::open_at(
-                self.backup.as_raw_fd(),
-                &live,
-                libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                0,
-            )?
-        } else {
-            // Preserve the full grown file in the backup, but copy only the old
-            // prefix back. A large sparse extension must not force a huge copy.
-            current.st_size = before.size;
-            self.copy_entry(
-                self.backup.as_raw_fd(),
-                &live,
-                at.fd.as_raw_fd(),
-                &at.name,
-                &current,
-            )?;
-            sys::open_at(
-                at.fd.as_raw_fd(),
-                &at.name,
-                libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                0,
-            )?
-        };
-        let destination = File::from(destination);
-        destination.set_len(before.size as u64)?;
-        sys::metadata_fd(
-            destination.as_raw_fd(),
-            before.mode,
-            before.mtime,
-            before.mtime_ns,
-        )?;
-        destination.sync_all()?;
-        if shared {
-            sys::rename_at(
-                self.backup.as_raw_fd(),
-                &live,
-                at.fd.as_raw_fd(),
-                &at.name,
-                libc::RENAME_NOREPLACE,
-            )?;
-            sys::rename_at(
-                self.backup.as_raw_fd(),
-                &post,
-                self.backup.as_raw_fd(),
-                &live,
-                libc::RENAME_NOREPLACE,
-            )?;
-        }
-        Ok(())
-    }
-    fn apply(&mut self, e: &Effect) -> io::Result<()> {
-        let p = journal::path(&e.path)?;
-        match e.op.as_str() {
-            "delete" => self.restore_kept(e, &p),
-            "modify" => self.restore_modified(e, &p),
-            "create" => {
-                let at = match self.parent(&p) {
-                    Ok(a) => a,
-                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
-                    Err(e) => return Err(e),
-                };
-                self.save_current(&p, &at)
+            let target = self.backup_path.join(format!("size-{}", e.seq));
+            if target.exists() {
+                continue;
             }
-            "rmdir" => {
-                let at = self.parent(&p)?;
-                if self.conflicts.remove(&e.path) {
-                    self.save_current(&p, &at)?;
-                }
-                if sys::stat_at(at.fd.as_raw_fd(), &at.name)?.is_none() {
-                    let st = e
+            let before = e
+                .note
+                .before
+                .as_ref()
+                .ok_or_else(|| io::Error::other("missing size metadata"))?;
+            let source = record
+                .effects
+                .iter()
+                .filter(|other| other.seq >= e.seq && !other.quarantine.is_empty())
+                .find(|other| {
+                    other
                         .note
                         .before
                         .as_ref()
-                        .ok_or_else(|| io::Error::other("missing directory metadata"))?;
-                    sys::mkdir_at(at.fd.as_raw_fd(), &at.name, st.mode & 0o7777)?;
-                    let fd = sys::open_at(
-                        at.fd.as_raw_fd(),
-                        &at.name,
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                        0,
-                    )?;
-                    sys::metadata_fd(fd.as_raw_fd(), st.mode, st.mtime, st.mtime_ns)?;
-                }
-                Ok(())
+                        .is_some_and(|s| s.same_inode(before))
+                })
+                .map(|other| self.qpath.join(&other.quarantine))
+                .or_else(|| {
+                    let mut p = journal::path(&e.path).ok()?;
+                    for later in record
+                        .effects
+                        .iter()
+                        .filter(|v| v.seq > e.seq && record.outcomes.get(&v.seq) != Some(&false))
+                    {
+                        if matches!(later.op.as_str(), "rename" | "exchange") {
+                            let a = journal::path(&later.path).ok()?;
+                            let b = journal::path(&later.path2).ok()?;
+                            if let Ok(tail) = p.strip_prefix(&a) {
+                                p = b.join(tail);
+                            } else if later.op == "exchange"
+                                && let Ok(tail) = p.strip_prefix(&b)
+                            {
+                                p = a.join(tail);
+                            }
+                        }
+                    }
+                    self.state(&p)
+                        .ok()
+                        .flatten()
+                        .filter(|s| s.mode & libc::S_IFMT == libc::S_IFREG && s.size >= before.size)
+                        .map(|_| p)
+                });
+            let source =
+                source.ok_or_else(|| io::Error::other("missing original prefix for grown file"))?;
+            let at = self.parent(&source)?;
+            let mut source = File::from(sys::open_at(
+                at.fd.as_raw_fd(),
+                &at.name,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                0,
+            )?);
+            let staging = self.backup_path.join(format!("size-{}-staging", e.seq));
+            if staging.exists() {
+                self.rename(
+                    &staging,
+                    &self
+                        .backup_path
+                        .join(format!("size-{}-partial-{}", e.seq, journal::now())),
+                )?;
             }
-            "size" => self.restore_size(e, &p),
+            let at = self.parent(&staging)?;
+            let mut dst = File::from(sys::open_at(
+                at.fd.as_raw_fd(),
+                &at.name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )?);
+            use std::io::Read;
+            if io::copy(&mut (&mut source).take(before.size as u64), &mut dst)?
+                != before.size as u64
+            {
+                return Err(io::Error::other("short original prefix; originals kept"));
+            }
+            sys::metadata_fd(dst.as_raw_fd(), before.mode, before.mtime, before.mtime_ns)?;
+            dst.sync_all()?;
+            self.rename(&staging, &target)?;
+        }
+        Ok(())
+    }
+    fn alias_paths(&self, p: &Path, before: &State) -> io::Result<BTreeSet<PathBuf>> {
+        let mut aliases = BTreeSet::from([p.to_owned()]);
+        let mut live_original = false;
+        for name in self.aliases.iter().chain(self.recovery.origins.keys()) {
+            let candidate = journal::path(name)?;
+            if let Ok(Some(current)) = self.state(&candidate) {
+                let restored = self
+                    .recovery
+                    .origins
+                    .get(name)
+                    .is_some_and(|(origin, actual)| {
+                        origin.same_inode(before) && current.same_inode(actual)
+                    });
+                live_original |= current.same_inode(before);
+                if current.same_inode(before) || restored {
+                    aliases.insert(candidate);
+                }
+            }
+        }
+        if !live_original {
+            let mut dirs = vec![self.backup_path.clone()];
+            while let Some(dir) = dirs.pop() {
+                for entry in fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let st = fs::symlink_metadata(entry.path())?;
+                    if st.is_dir() {
+                        dirs.push(entry.path());
+                    } else if st.is_file()
+                        && self
+                            .state(&entry.path())?
+                            .is_some_and(|s| s.same_inode(before))
+                    {
+                        aliases.insert(entry.path());
+                    }
+                }
+            }
+        }
+        Ok(aliases)
+    }
+    fn remember_origins(&mut self, e: &Effect) -> io::Result<()> {
+        if matches!(e.op.as_str(), "rename" | "exchange") {
+            let a = journal::path(&e.path)?;
+            let b = journal::path(&e.path2)?;
+            let old = std::mem::take(&mut self.recovery.origins);
+            for (name, value) in old {
+                let p = journal::path(&name)?;
+                let p = if let Ok(tail) = p.strip_prefix(&b) {
+                    a.join(tail)
+                } else if e.op == "exchange"
+                    && let Ok(tail) = p.strip_prefix(&a)
+                {
+                    b.join(tail)
+                } else {
+                    p
+                };
+                self.recovery.origins.insert(journal::display(&p), value);
+            }
+        }
+        for (name, before) in [
+            (&e.path, e.note.before.as_ref()),
+            (
+                &e.path2,
+                if e.op == "exchange" {
+                    e.note.before2.as_ref()
+                } else {
+                    None
+                },
+            ),
+        ] {
+            if let Some(before) = before
+                && self.alias_keys.contains(&(before.dev, before.ino))
+            {
+                let p = journal::path(name)?;
+                if let Some(actual) = self.state(&p)? {
+                    self.recovery
+                        .origins
+                        .insert(name.clone(), (before.clone(), actual));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn plan_repair(&mut self, e: &Effect, p: &Path, source: &Path) -> io::Result<()> {
+        if let Some((live, st)) = self.save_current(p)?
+            && st.mode & libc::S_IFMT == libc::S_IFREG
+        {
+            // Keep the inode even when its other alias is temporarily absent. Older
+            // effects still identify it when reversing a later deletion or growth.
+            let post = self
+                .backup_path
+                .join(format!("{}-post", self.recovery.serial));
+            self.push_copy(&live, &post);
+            self.recovery.pending.push(Action::Write {
+                from: journal::display(source),
+                to: journal::display(&live),
+                before: e
+                    .note
+                    .before
+                    .clone()
+                    .ok_or_else(|| io::Error::other("missing pre-image metadata"))?,
+            });
+            self.push_move(&live, p);
+            self.push_move(&post, &live);
+        } else {
+            self.push_copy(source, p);
+        }
+        Ok(())
+    }
+    fn plan(&mut self, e: &Effect) -> io::Result<()> {
+        let p = journal::path(&e.path)?;
+        match e.op.as_str() {
+            "modify" if !e.quarantine.is_empty() => {
+                let source = self.qpath.join(&e.quarantine);
+                let before = e
+                    .note
+                    .before
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("missing pre-image metadata"))?;
+                for p in self.alias_paths(&p, before)? {
+                    self.plan_repair(e, &p, &source)?;
+                }
+            }
+            "delete" if !e.quarantine.is_empty() => {
+                self.save_current(&p)?;
+                let source = self.qpath.join(&e.quarantine);
+                self.push_move(&source, &p);
+            }
+            "create" => {
+                self.save_current(&p)?;
+            }
+            "rmdir" => {
+                if self.recovery.conflicts.remove(&e.path) {
+                    self.save_current(&p)?;
+                }
+                if self.state(&p)?.is_none() || !self.recovery.pending.is_empty() {
+                    self.recovery.pending.push(Action::Directory {
+                        path: e.path.clone(),
+                        before: e
+                            .note
+                            .before
+                            .clone()
+                            .ok_or_else(|| io::Error::other("missing directory metadata"))?,
+                    });
+                }
+            }
+            "size" => {
+                let before = e
+                    .note
+                    .before
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("missing size metadata"))?;
+                let aliases = self.alias_paths(&p, before)?;
+                let source = self.backup_path.join(format!("size-{}", e.seq));
+                for p in aliases {
+                    self.plan_repair(e, &p, &source)?;
+                }
+            }
             "rename" => {
                 let dest = journal::path(&e.path2)?;
-                let to = self.parent(&p)?;
-                let from = match self.parent(&dest) {
-                    Ok(a) => a,
-                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
-                    Err(e) => return Err(e),
-                };
-                if sys::stat_at(from.fd.as_raw_fd(), &from.name)?.is_none() {
+                if self.state(&dest)?.is_none() {
                     return Ok(());
                 }
-                self.keep_move_input(&dest, &from)?;
-                // An unacknowledged rename on a killed supervisor may never have run.
-                if sys::stat_at(to.fd.as_raw_fd(), &to.name)?
-                    .as_ref()
-                    .map(State::from_stat)
+                if self
+                    .state(&p)?
                     .zip(e.note.before.as_ref())
                     .is_some_and(|(a, b)| a.same_inode(b))
                 {
                     return Ok(());
                 }
-                self.save_current(&p, &to)?;
-                writeln!(
-                    self.log,
-                    "rename\t{}\t{}",
-                    journal::display(&dest),
-                    journal::display(&p)
-                )?;
-                self.log.sync_data()?;
-                sys::rename_at(
-                    from.fd.as_raw_fd(),
-                    &from.name,
-                    to.fd.as_raw_fd(),
-                    &to.name,
-                    libc::RENAME_NOREPLACE,
-                )
+                self.keep_move_input(&dest)?;
+                self.save_current(&p)?;
+                self.push_move(&dest, &p);
             }
             "exchange" => {
                 let dest = journal::path(&e.path2)?;
-                let a = self.parent(&p)?;
-                let b = self.parent(&dest)?;
-                self.keep_move_input(&p, &a)?;
-                self.keep_move_input(&dest, &b)?;
-                writeln!(
-                    self.log,
-                    "exchange\t{}\t{}",
-                    journal::display(&p),
-                    journal::display(&dest)
-                )?;
-                self.log.sync_data()?;
-                sys::rename_at(
-                    a.fd.as_raw_fd(),
-                    &a.name,
-                    b.fd.as_raw_fd(),
-                    &b.name,
-                    libc::RENAME_EXCHANGE,
-                )
+                let first = self.state(&p)?;
+                let second = self.state(&dest)?;
+                let (first, second) = match (first, second) {
+                    (Some(a), Some(b)) => (a, b),
+                    (None, Some(_)) => {
+                        self.push_move(&dest, &p);
+                        return Ok(());
+                    }
+                    (Some(_), None) => {
+                        self.push_move(&p, &dest);
+                        return Ok(());
+                    }
+                    (None, None) => return Ok(()),
+                };
+                self.keep_move_input(&p)?;
+                self.keep_move_input(&dest)?;
+                // Input copies receive fresh identities. The executor records those just before exchanging.
+                self.recovery.pending.push(Action::Exchange {
+                    a: e.path.clone(),
+                    b: e.path2.clone(),
+                    first,
+                    second,
+                });
             }
-            _ => Ok(()),
+            _ => {}
         }
+        Ok(())
+    }
+    fn save_directory_observations(
+        &self,
+        home: &Path,
+        r: &journal::Record,
+        observations: BTreeMap<String, Option<State>>,
+    ) -> io::Result<()> {
+        let mut observations = observations;
+        let mut parents = std::collections::BTreeSet::new();
+        for e in &r.effects {
+            for name in [&e.path, &e.path2].into_iter().filter(|s| !s.is_empty()) {
+                let p = journal::path(name)?;
+                parents.extend(p.ancestors().map(Path::to_owned));
+            }
+        }
+        for p in parents {
+            if let Ok(st) = self.state(&p)
+                && st.as_ref().is_some_and(State::directory)
+            {
+                observations.insert(journal::display(&p), st);
+            }
+        }
+        journal::synced_json_write(&home.join("undo-posts.json"), &observations)?;
+        Ok(())
+    }
+    fn save_alias_observations(
+        &self,
+        home: &Path,
+        r: &journal::Record,
+        mut alias_posts: BTreeMap<String, (State, State)>,
+    ) -> io::Result<()> {
+        for (name, origin) in restored_origins(r)? {
+            if origin.mode & libc::S_IFMT == libc::S_IFREG
+                && let Some(actual) = self.state(&journal::path(&name)?)?
+            {
+                alias_posts.insert(name, (origin, actual));
+            }
+        }
+        let mut dirs = vec![self.backup_path.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let st = fs::symlink_metadata(entry.path())?;
+                if st.is_dir() {
+                    dirs.push(entry.path());
+                } else if st.is_file()
+                    && let Some(actual) = self.state(&entry.path())?
+                {
+                    alias_posts.insert(journal::display(&entry.path()), (actual.clone(), actual));
+                }
+            }
+        }
+        journal::synced_json_write(&home.join("undo-aliases.json"), &alias_posts)?;
+        Ok(())
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let a = self.parent(from)?;
+        let b = self.parent(to)?;
+        sys::rename_at(
+            a.fd.as_raw_fd(),
+            &a.name,
+            b.fd.as_raw_fd(),
+            &b.name,
+            libc::RENAME_NOREPLACE,
+        )
     }
 }
+
 fn current_secure(root: i32, p: &Path) -> io::Result<Option<State>> {
     let parent = p
         .parent()
@@ -526,6 +552,66 @@ fn current_secure(root: i32, p: &Path) -> io::Result<Option<State>> {
     Ok(sys::stat_at(fd.as_raw_fd(), &cstr(name)?)?
         .as_ref()
         .map(State::from_stat))
+}
+fn same_post(a: Option<&State>, b: Option<&State>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.mode == b.mode && a.size == b.size && a.mtime == b.mtime && a.mtime_ns == b.mtime_ns
+        }
+        _ => false,
+    }
+}
+fn restored_origins(record: &journal::Record) -> io::Result<BTreeMap<String, State>> {
+    let mut origins: BTreeMap<PathBuf, State> = BTreeMap::new();
+    for e in record.effects.iter().rev().filter(|e| {
+        record.outcomes.get(&e.seq) != Some(&false)
+            && !matches!(e.op.as_str(), "blocked" | "not protected" | "expired")
+    }) {
+        let p = journal::path(&e.path)?;
+        if matches!(e.op.as_str(), "rename" | "exchange") {
+            let dest = journal::path(&e.path2)?;
+            let old = std::mem::take(&mut origins);
+            for (name, state) in old {
+                let relocated = if let Ok(tail) = name.strip_prefix(&dest) {
+                    Some(if tail.as_os_str().is_empty() {
+                        p.clone()
+                    } else {
+                        p.join(tail)
+                    })
+                } else if let Ok(tail) = name.strip_prefix(&p) {
+                    if e.op == "exchange" {
+                        Some(if tail.as_os_str().is_empty() {
+                            dest.clone()
+                        } else {
+                            dest.join(tail)
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(name)
+                };
+                if let Some(name) = relocated {
+                    origins.insert(name, state);
+                }
+            }
+        }
+        if e.op == "create" {
+            origins.retain(|name, _| !name.starts_with(&p));
+        } else if let Some(before) = &e.note.before {
+            origins.insert(p, before.clone());
+        }
+        if e.op == "exchange"
+            && let Some(before) = &e.note.before2
+        {
+            origins.insert(journal::path(&e.path2)?, before.clone());
+        }
+    }
+    Ok(origins
+        .into_iter()
+        .map(|(p, s)| (journal::display(&p), s))
+        .collect())
 }
 fn is_git_index(p: &Path) -> bool {
     if p.file_name() != Some(OsStr::new("index")) {
@@ -609,7 +695,9 @@ impl Summary {
             ]
         };
         for (label, count) in labels.iter().zip(self.counts) {
-            output.line(format_args!("{label}: {count}"));
+            if count > 0 {
+                output.line(format_args!("{label}: {count}"));
+            }
         }
         output.line(format_args!(
             "elapsed: {:.3} s",
@@ -632,6 +720,7 @@ fn report_unrestored(output: &mut Progress<io::Stdout>, effects: &[Effect]) {
                 "could not restore {}: not protected: {}",
                 e.path, e.note.message
             )),
+            "expired" => output.line(format_args!("{}: expired (collected by gc)", e.path)),
             "blocked" => output.line(format_args!("blocked {}: {}", e.path, e.note.message)),
             _ => {}
         }
@@ -646,11 +735,29 @@ fn restore_effects(
 ) -> Result<()> {
     for e in record.effects.iter().rev() {
         if record.outcomes.get(&e.seq) == Some(&false)
-            || matches!(e.op.as_str(), "blocked" | "not protected")
+            || matches!(e.op.as_str(), "blocked" | "not protected" | "expired")
         {
             continue;
         }
-        undo.apply(e).with_context(|| {
+        if undo
+            .recovery
+            .completed_through
+            .is_some_and(|seq| e.seq >= seq)
+        {
+            continue;
+        }
+        if undo.recovery.effect != e.seq {
+            undo.recovery.pending.clear();
+            undo.recovery.cursor = 0;
+            undo.recovery.before = None;
+            undo.recovery.effect = e.seq;
+            undo.plan(e)?;
+            if let Some(Action::Move { from, .. }) = undo.recovery.pending.first() {
+                undo.recovery.before = undo.state(&journal::path(from)?)?;
+            }
+            undo.save_state()?;
+        }
+        undo.execute().with_context(|| {
             format!(
                 "could not undo {} {}; recovery files: {}",
                 e.op,
@@ -658,6 +765,9 @@ fn restore_effects(
                 journal::display(&undo.backup_path)
             )
         })?;
+        undo.remember_origins(e)?;
+        undo.recovery.completed_through = Some(e.seq);
+        undo.save_state()?;
         summary.record(e);
         if verbose {
             undo.output
@@ -667,15 +777,14 @@ fn restore_effects(
     Ok(())
 }
 
-pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
+pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> Result<i32> {
     let started = Instant::now();
     let mut output = Progress::new(io::stdout());
     if std::env::var_os("SAQTA_SUPERVISED").is_some() {
         bail!("run undo in your own terminal");
     }
     let home = paths::home()?;
-    journal::import(&home)?;
-    let r = journal::load(&home, id)?;
+    let r = journal::refresh(&home, id)?;
     if journal::running(&home, &r.meta)
         || (r.status == "incomplete"
             && (journal::process_live(r.meta.child)
@@ -685,30 +794,47 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
     {
         bail!("command {id}'s tree is still running");
     }
-    if r.undone {
+    if r.undone && !resume {
         bail!("command {id} already undone");
     }
     let folder = home.join("cmd").join(id.to_string());
     let lock = journal::private_file(&folder.join("undo.lock"))?;
     sys::flock_exclusive(lock.as_raw_fd(), true).context("another undo is in progress")?;
     if folder.join("undone").exists() {
+        if resume && folder.join("undo-in-progress").exists() {
+            fs::remove_file(folder.join("undo-in-progress"))?;
+            output.line(format_args!("finished undoing command {id}"));
+            return Ok(0);
+        }
         bail!("command {id} already undone");
     }
     if let Some(warning) = r.warning {
         bail!("journal writes failed: {warning}; inspect quarantine before restoring by hand");
     }
-    if folder.join("undo-in-progress").exists() {
+    let backup_path = home
+        .join("q/main")
+        .join(format!("undo-{id}-{}", r.meta.start_ns));
+    let resuming = folder.join("undo-in-progress").exists()
+        || (resume && backup_path.join("state.json").exists());
+    if resuming && !resume {
         bail!(
-            "a previous undo stopped partway; inspect {} and its recovery map",
+            "a previous undo stopped partway; run `saqta undo {id} --resume`; recovery files: {}",
             folder.display()
         );
     }
     let root = sys::open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY, 0)?;
     let mut posts = journal::post_states(&folder)?;
+    let observations: std::collections::BTreeMap<String, Option<State>> =
+        fs::read(home.join("undo-posts.json"))
+            .ok()
+            .map(|b| serde_json::from_slice(&b))
+            .transpose()?
+            .unwrap_or_default();
     let mut conflicts = Vec::new();
     let mut inaccessible = HashSet::new();
-    for e in &r.effects {
-        if e.op == "blocked" {
+    for e in r.effects.iter().filter(|_| !resuming) {
+        if matches!(e.op.as_str(), "blocked" | "expired") || r.outcomes.get(&e.seq) == Some(&false)
+        {
             continue;
         }
         for name in [&e.path, &e.path2] {
@@ -720,7 +846,10 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
             match current {
                 Ok(current) => {
                     if let Some(expected) = posts.get(name) {
-                        if expected != &current {
+                        if !same_post(expected.as_ref(), current.as_ref())
+                            && !(expected.as_ref().is_some_and(State::directory)
+                                && observations.get(name) == Some(&current))
+                        {
                             conflicts.push(name.clone());
                         }
                     } else if r.status == "incomplete" {
@@ -729,6 +858,20 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
                         bail!("missing post-state for {name}; refusing undo");
                     }
                 }
+                Err(_)
+                    if posts.get(name) == Some(&None)
+                        && p.ancestors().skip(1).any(|parent| {
+                            posts
+                                .get(&journal::display(parent))
+                                .is_some_and(|expected| {
+                                    expected.is_some()
+                                        && current_secure(root.as_raw_fd(), parent).is_ok_and(
+                                            |current| {
+                                                same_post(expected.as_ref(), current.as_ref())
+                                            },
+                                        )
+                                })
+                        }) => {}
                 Err(_) => {
                     inaccessible.insert(name.clone());
                     conflicts.push(name.clone());
@@ -765,12 +908,11 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
         libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
         0,
     )?;
-    let mut copies = HashMap::new();
-    for e in &r.effects {
+    for e in r.effects.iter().filter(|_| !resuming) {
         if r.outcomes.get(&e.seq) == Some(&false) {
             continue;
         }
-        if !e.quarantine.is_empty() {
+        if !e.quarantine.is_empty() && e.op != "expired" {
             let name = CString::new(e.quarantine.as_bytes())?;
             let saved = sys::stat_at(q.as_raw_fd(), &name)?.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -787,7 +929,6 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
             {
                 bail!("pre-image changed for {}; nothing restored", e.path);
             }
-            *copies.entry(e.quarantine.clone()).or_insert(0) += 1;
         }
     }
     if dry_run {
@@ -821,7 +962,7 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
             .filter(|e| r.outcomes.get(&e.seq) != Some(&false))
         {
             summary.record(e);
-            if verbose && !matches!(e.op.as_str(), "blocked" | "not protected") {
+            if verbose && !matches!(e.op.as_str(), "blocked" | "not protected" | "expired") {
                 output.line(format_args!("would undo {} {}", e.op, e.path));
             }
         }
@@ -833,61 +974,89 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool) -> Result<i32> {
         return Ok(0);
     }
     output.line(format_args!("undoing command {id}"));
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&backup_path)
-        .with_context(|| {
-            format!(
-                "cannot create undo folder {}; inspect it if it already exists",
-                journal::display(&backup_path)
-            )
-        })?;
-    let backup = sys::open_at(
-        libc::AT_FDCWD,
-        &cstr(backup_path.as_os_str())?,
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        0,
-    )?;
+    let alias_keys: BTreeSet<_> = r
+        .effects
+        .iter()
+        .filter(|e| matches!(e.op.as_str(), "modify" | "size"))
+        .filter_map(|e| e.note.before.as_ref().map(|s| (s.dev, s.ino)))
+        .collect();
+    let alias_posts: BTreeMap<String, (State, State)> = fs::read(home.join("undo-aliases.json"))
+        .ok()
+        .map(|b| serde_json::from_slice(&b))
+        .transpose()?
+        .unwrap_or_default();
+    let recovery = if resuming {
+        serde_json::from_slice(&fs::read(backup_path.join("state.json"))?)?
+    } else {
+        fs::DirBuilder::new().mode(0o700).create(&backup_path)?;
+        let mut origins = BTreeMap::new();
+        for (name, (origin, actual)) in &alias_posts {
+            if alias_keys.contains(&(origin.dev, origin.ino))
+                && current_secure(root.as_raw_fd(), &journal::path(name)?)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    == Some(actual)
+            {
+                origins.insert(name.clone(), (origin.clone(), actual.clone()));
+            }
+        }
+        Recovery {
+            origins,
+            conflicts: conflicts
+                .into_iter()
+                .chain(git_indexes.iter().cloned())
+                .collect(),
+            git_indexes: git_indexes.into_iter().collect(),
+            ..Recovery::default()
+        }
+    };
     let log = OpenOptions::new()
         .append(true)
-        .create_new(true)
+        .create(true)
         .mode(0o600)
         .open(backup_path.join("recovery.log"))?;
-    fs::write(
-        folder.join("undo-in-progress"),
-        journal::display(&backup_path),
-    )?;
     let mut undo = Undo {
         root,
-        q,
-        backup,
         log,
-        serial: 0,
-        copies,
-        conflicts: conflicts
-            .into_iter()
-            .chain(git_indexes.iter().cloned())
-            .collect(),
-        git_indexes: git_indexes.into_iter().collect(),
+        recovery,
         backup_path: backup_path.clone(),
+        qpath,
+        alias_keys,
+        aliases: r
+            .effects
+            .iter()
+            .flat_map(|e| [e.path.clone(), e.path2.clone()])
+            .filter(|s| !s.is_empty())
+            .collect(),
         output,
     };
+    if !resuming {
+        undo.save_state()?;
+        journal::synced_json_write(
+            &folder.join("undo-in-progress"),
+            &journal::display(&backup_path),
+        )?;
+    }
+    if let Some(note) = &r.recovery_note {
+        undo.output.line(format_args!("{note}"));
+    }
+    undo.prepare_sizes(&r)?;
     report_unrestored(&mut undo.output, &r.effects);
     let mut summary = Summary::default();
     let result = restore_effects(&mut undo, &r, verbose, &mut summary).and_then(|()| {
+        undo.save_directory_observations(&home, &r, observations)?;
+        undo.save_alias_observations(&home, &r, alias_posts)?;
         journal::mark_undone(&folder)?;
         fs::remove_file(folder.join("undo-in-progress"))?;
-        journal::import(&home)?;
         Ok(())
     });
     summary.print(&mut undo.output, false, verbose, started);
-    if undo.serial > 0 {
+    if undo.recovery.serial > 0 {
         undo.output.line(format_args!(
             "displaced versions kept in {} (see recovery.log)",
             journal::display(&backup_path)
         ));
-    } else {
-        undo.output.line(format_args!("displaced versions: none"));
     }
     result?;
     Ok(0)

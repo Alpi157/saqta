@@ -111,6 +111,12 @@ fn main() {
         )
         .subcommand(
             clap::Command::new("undo")
+                .arg(
+                    clap::Arg::new("resume")
+                        .long("resume")
+                        .help("Finish an interrupted undo from its recovery log")
+                        .action(clap::ArgAction::SetTrue),
+                )
                 .about("Restore the filesystem before a captured command")
                 .arg(
                     clap::Arg::new("id")
@@ -174,6 +180,7 @@ fn main() {
             m.get_flag("dry-run"),
             m.get_flag("force"),
             m.get_flag("verbose"),
+            m.get_flag("resume"),
         ),
         _ => Ok(125),
     };
