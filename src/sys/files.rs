@@ -231,3 +231,9 @@ pub fn alive(pid: i32) -> bool {
         libc::kill(pid, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 }
+
+#[cfg(debug_assertions)]
+pub fn truncate_path(path: &CStr, length: u64) -> io::Result<()> {
+    // SAFETY: path is terminated and length is a bounded test value.
+    cv(unsafe { libc::truncate(path.as_ptr(), length as libc::off_t) }).map(|_| ())
+}

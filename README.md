@@ -1,6 +1,6 @@
 # Saqta
 
-Saqta is an undo layer for AI coding agents on Linux and WSL2. M2 preserves files before deletion, replacement and in-place writes, records creations, and restores a command's effects in reverse order.
+Saqta is an undo layer for AI coding agents on Linux and WSL2. M4 preserves files before deletion, replacement and in-place writes, records creations, and restores a command's effects in reverse order.
 
 ```sh
 cargo build --release --locked
@@ -16,10 +16,38 @@ Undo runs in your own terminal. It refuses while a command's background tree is 
 
 Undo prints category counts, elapsed time, up to ten example paths, every unprotected item and the location of displaced versions. `--verbose` lists every effect, including with `--dry-run`. Closing stdout, for example with `saqta undo 1 | head -1`, silences further output and lets the full restore finish.
 
-The default store is `$XDG_DATA_HOME/saqta` or `$HOME/.local/share/saqta`. `SAQTA_HOME` overrides it. `SAQTA_MAX_COPY` limits individual copies in bytes, defaulting to 256 MiB. Hard-linked captures have no size limit. Failed captures are reported in the journal as not protected. Kernel and volatile filesystems are skipped. Pure append opens without creation or truncation bypass capture.
+An interrupted M4 undo finishes with `saqta undo 1 --resume`. Its recovery plan
+makes each move, exchange and copy safe to replay. The recovery folder retains
+both pre-command and displaced versions. A partial undo from an older release
+still needs manual inspection of its recovery map.
+
+`saqta gc --dry-run` previews retention. `saqta gc --older-than 7d --max-size 5GB`
+collects regenerable content after one day, then old commands, then oldest
+commands until under the size limit. It protects the newest three commands,
+running or incomplete commands, and interrupted undos. `--json` gives the plan
+and byte totals. Durations accept s, m, h, d and w; sizes accept decimal KB, MB
+and GB or binary KiB, MiB and GiB. Store size counts logical bytes in retained
+commands and versions, once per inode. Protected entries can exceed the limit.
+Undo labels collected paths as `expired (collected by gc)` and restores the rest.
+Log, show, status and undo can schedule GC after output, at most once per day.
+`saqta status` shows retained size and the last successful GC.
+
+The default store is `$XDG_DATA_HOME/saqta` or `$HOME/.local/share/saqta`. `SAQTA_HOME` overrides it. `SAQTA_MAX_COPY` limits individual copies in bytes, defaulting to 256 MiB. Hard-linked captures have no size limit. Failed captures are reported in the journal as not protected. Kernel and volatile filesystems are skipped. Append opens are captured too.
 
 Two hard links modified in place may return as separate files. Capture does not promise power-loss durability or protect against hostile filesystem races. Status: pre-alpha. Don't rely on it yet.
 
 Run `cargo test --locked` and `SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture` for the normal and forced memory fallback suites. `scripts/overhead.sh` measures a release build on fresh disposable fixtures. Its defaults are 20,000 operations and three repetitions; `N` and `REPS` override them. It is not run in CI.
 
 The design is described in [capture](docs/decisions/0004-capture.md), [journaling](docs/decisions/0005-journal.md), and [undo safety](docs/decisions/0006-undo-safety.md).
+
+The model harness runs 64 cases per property in `cargo test --locked`.
+`SAQTA_HARNESS_CASES=5000 cargo test --locked --test harness` runs the nightly
+workload. Saved seeds in `tests/harness.proptest-regressions` replay automatically.
+Failures keep fixtures, JSON operations, syscall results and journals under
+`target/saqta-tests/harness-*`. The nightly and manual GitHub workflow uploads them
+on failure. The fixed-namespace syscall helper and `SAQTA_TEST_ABORT_AFTER` undo
+hook exist only in debug builds. Metadata-only changes are outside the model.
+
+M4 decisions cover [resuming undo](docs/decisions/0009-resumable-undo.md),
+[retention](docs/decisions/0010-retention.md) and the
+[incremental index](docs/decisions/0011-incremental-index.md).
