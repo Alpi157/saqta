@@ -294,6 +294,23 @@ fn resume_replays_every_step_of_shared_inode_repair_and_exchange() {
     }
 }
 #[test]
+fn resume_replays_deletes_with_deferred_completion_checkpoints() {
+    for stop in 1..=3 {
+        let (s, root) = capture_fixture("resume-deletes");
+        for name in ["a", "b", "c"] {
+            fs::write(root.join(name), format!("original {name}")).unwrap();
+        }
+        let before = tree_hash(&root);
+        assert_success(&script(&s, &root, "rm a b c"));
+        let id = last_id(&s);
+        let mut command = s.saqta(&["undo", &id.to_string()]);
+        command.env("SAQTA_TEST_ABORT_AFTER", stop.to_string());
+        assert_eq!(run(command).status.code(), Some(86));
+        assert_success(&run(s.saqta(&["undo", &id.to_string(), "--resume"])));
+        assert_tree(&before, &root);
+    }
+}
+#[test]
 fn syscall_helper_exercises_creation_and_write_through_symlink() {
     let (s, root) = capture_fixture("harness-driver");
     seed(&root);
