@@ -342,7 +342,23 @@ fn namespace_probe_reports_uid_map_denial() {
 }
 #[test]
 fn separate_bind_mount_five_thousand_deletes_restore() {
-    let (s, p) = capture_fixture("bind-delete");
+    // 5,000 cross-mount captures plus replayable undo checkpoints are a bulk-I/O
+    // stress test. Two-core CI machines need more than the ordinary 10 seconds.
+    const BULK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let fixture_started = std::time::Instant::now();
+    let (mut s, p) = capture_fixture("bind-delete");
+    let no_sync = std::env::var_os("SAQTA_NO_SYNC_WAKE").is_some_and(|v| v == "1");
+    if no_sync {
+        s.env.insert("SAQTA_NO_SYNC_WAKE".into(), "1".into());
+    }
+    note(format!(
+        "bind-delete settings: no_sync={no_sync}; {}",
+        fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("Cpus_allowed_list:"))
+            .unwrap()
+    ));
     if !namespace_available(&s, MOUNT_NAMESPACE, "unprivileged mount namespace") {
         return;
     }
@@ -367,8 +383,10 @@ fn separate_bind_mount_five_thousand_deletes_restore() {
     .arg(&home)
     .arg(BIN)
     .arg(&data);
+    let fixture_elapsed = fixture_started.elapsed();
+    note(format!("bind-delete fixture: {fixture_elapsed:?}"));
     let start = std::time::Instant::now();
-    let o = run(c);
+    let o = Running::spawn(c, None).output_with_timeout(BULK_TIMEOUT);
     if o.status.code() == Some(77) {
         note(format!(
             "SKIP: bind mount unavailable: {}",
@@ -377,6 +395,9 @@ fn separate_bind_mount_five_thousand_deletes_restore() {
         return;
     }
     assert_success(&o);
+    let delete_elapsed = start.elapsed();
+    note(format!("bind-delete delete: {delete_elapsed:?}"));
+    let inspect_started = std::time::Instant::now();
     let id = last_id(&s);
     let r = shown(&s, id);
     assert!(
@@ -387,8 +408,20 @@ fn separate_bind_mount_five_thousand_deletes_restore() {
             .filter(|e| e["op"] == "delete")
             .all(|e| e["note"]["kept"] == "copied (cross-mount)")
     );
-    assert_success(&undo(&s, id));
+    let inspect_elapsed = inspect_started.elapsed();
+    let undo_started = std::time::Instant::now();
+    assert_success(
+        &Running::spawn(s.saqta(&["undo", &id.to_string()]), None)
+            .output_with_timeout(BULK_TIMEOUT),
+    );
+    let undo_elapsed = undo_started.elapsed();
+    note(format!("bind-delete undo: {undo_elapsed:?}"));
+    let verify_started = std::time::Instant::now();
     assert_tree(&before, &data);
+    note(format!(
+        "BIND_DELETE_TIMING {}",
+        json!({"fixture_s":fixture_elapsed.as_secs_f64(),"delete_s":delete_elapsed.as_secs_f64(),"inspect_s":inspect_elapsed.as_secs_f64(),"undo_s":undo_elapsed.as_secs_f64(),"verify_s":verify_started.elapsed().as_secs_f64(),"no_sync":no_sync})
+    ));
     note(format!(
         "5000 cross-mount deletes and restore: {:?}",
         start.elapsed()

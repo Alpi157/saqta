@@ -1,11 +1,16 @@
 // Each integration test binary uses a different subset of these helpers.
 #![allow(dead_code)]
+#[path = "../../src/sys/test_support.rs"]
+mod test_support;
+mod timeout;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs,
     io::{Read, Write},
+    os::fd::AsRawFd,
     os::unix::ffi::OsStrExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
@@ -51,6 +56,9 @@ impl Sandbox {
         ] {
             env.remove(OsStr::new(key));
         }
+        // Enable diagnostics for the whole fixture, including direct commands,
+        // so tests of environment preservation still compare identical inputs.
+        env.insert("SAQTA_DEBUG".into(), "1".into());
         for key in [
             "HOME",
             "XDG_DATA_HOME",
@@ -161,14 +169,7 @@ pub fn process_group(pid: i32) -> i32 {
         .unwrap()
 }
 pub fn signal(pid: i32, sig: i32) {
-    // SAFETY: callers pass a pid owned by this test, or its explicitly created process group.
-    let result = unsafe { libc::kill(pid, sig) };
-    assert_eq!(
-        result,
-        0,
-        "kill({pid}, {sig}): {}",
-        std::io::Error::last_os_error()
-    );
+    test_support::signal(pid, sig).unwrap();
 }
 fn reader(mut stream: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
@@ -180,17 +181,25 @@ fn reader(mut stream: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
     rx
 }
 // Drain both pipes concurrently, and bound both process wait and pipe EOF waits.
-// Dropping a running wrapper kills it so S cleans up its descendants on test failure.
+// On timeout diagnose first, then kill the entire owned tree, including orphans
+// holding a pipe open. Ordinary commands retain the short ten-second deadline.
 pub struct Running {
     pub child: Child,
     stdout: Receiver<Vec<u8>>,
     stderr: Receiver<Vec<u8>>,
+    started: Instant,
+    watch: timeout::Watch,
 }
 impl Running {
     pub fn pid(&self) -> i32 {
         self.child.id() as i32
     }
     pub fn spawn(mut command: Command, input: Option<&[u8]>) -> Self {
+        let started = Instant::now();
+        // Freezing/killing a timeout's tree can orphan a stopped process group.
+        // Keep any resulting job-control SIGHUP away from the test runner and
+        // other tests. Saqta still shares its wrapper's group as in real use.
+        command.process_group(0);
         command.stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -198,6 +207,14 @@ impl Running {
         });
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
+        let pipes = [
+            child.stdout.as_ref().unwrap().as_raw_fd(),
+            child.stderr.as_ref().unwrap().as_raw_fd(),
+        ]
+        .into_iter()
+        .filter_map(|fd| fs::read_link(format!("/proc/self/fd/{fd}")).ok())
+        .collect();
+        let watch = timeout::Watch::new(&command, child.id() as i32, pipes);
         let stdout = reader(child.stdout.take().unwrap());
         let stderr = reader(child.stderr.take().unwrap());
         if let Some(input) = input {
@@ -207,41 +224,62 @@ impl Running {
             child,
             stdout,
             stderr,
+            started,
+            watch,
         }
     }
-    pub fn output(mut self) -> Output {
-        let deadline = Instant::now() + TIMEOUT;
+    pub fn output(self) -> Output {
+        self.output_with_timeout(TIMEOUT)
+    }
+    pub fn output_with_timeout(mut self, timeout: Duration) -> Output {
+        let deadline = self.started + timeout;
         let status = loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
             }
-            assert!(
-                Instant::now() < deadline,
-                "command {} timed out",
-                self.pid()
-            );
+            if Instant::now() >= deadline {
+                self.timed_out(timeout, "process exit");
+            }
             thread::sleep(Duration::from_millis(2));
         };
         let stdout = self
             .stdout
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("stdout never reached EOF");
+            .unwrap_or_else(|_| self.timed_out(timeout, "stdout EOF"));
         let stderr = self
             .stderr
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("stderr never reached EOF");
+            .unwrap_or_else(|_| self.timed_out(timeout, "stderr EOF"));
         Output {
             status,
             stdout,
             stderr,
         }
     }
+    fn timed_out(&mut self, limit: Duration, phase: &str) -> ! {
+        let elapsed = self.started.elapsed();
+        self.watch.diagnose(elapsed, limit, phase);
+        self.watch.kill_tree();
+        self.reap_bounded();
+        panic!(
+            "command {} timed out after {elapsed:.3?} (limit {limit:?}; {phase}); diagnostics printed above",
+            self.pid()
+        );
+    }
+    fn reap_bounded(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while self.child.try_wait().is_ok_and(|status| status.is_none())
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 impl Drop for Running {
     fn drop(&mut self) {
-        if self.child.try_wait().unwrap().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if self.child.try_wait().is_ok_and(|status| status.is_none()) {
+            self.watch.kill_tree();
+            self.reap_bounded();
         }
     }
 }

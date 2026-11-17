@@ -414,7 +414,7 @@ impl Capture {
         self.journal.append(e)?;
         Ok(())
     }
-    pub fn handle(&mut self, listener: i32, n: &sys::Notification) {
+    pub fn handle(&mut self, listener: i32, n: &sys::Notification) -> bool {
         self.complete(n.pid);
         let observed: Vec<_> = self
             .pending
@@ -436,20 +436,20 @@ impl Capture {
                     if let Err(err) = self.journal.append(e) {
                         self.journal.error(&err);
                     }
-                    sys::answer(listener, n.id, true);
-                    return;
+                    return sys::answer(listener, n.id, true);
                 }
                 if let Err(e) = self.capture(n, &call, &p, p2.as_ref()) {
                     self.failure(n, Some(&p), &e);
                 }
-                sys::answer(listener, n.id, false);
+                sys::answer(listener, n.id, false)
             }
-            Ok(None) => {} // ID is stale. Never act on its arguments.
+            Ok(None) => false, // ID is stale. Never act on its arguments.
             Err(e) => {
                 if sys::valid(listener, n.id) {
                     self.failure(n, None, &e);
-                    sys::answer(listener, n.id, false);
+                    return sys::answer(listener, n.id, false);
                 }
+                false
             }
         }
     }
