@@ -1389,3 +1389,53 @@ fn growing_truncate_restores_hard_link_alias_size() {
     assert_eq!(fs::metadata(p.join("b")).unwrap().len(), 1024);
     restore_exact(&s, &p, &before);
 }
+
+#[test]
+fn killed_command_recovers_only_complete_intents_and_keeps_the_raw_tail() {
+    use std::io::Write;
+    for ended in [false, true] {
+        let (s, p) = capture_fixture("partial-intent");
+        fs::write(p.join("file"), b"original").unwrap();
+        let before = tree_hash(&p);
+        assert_success(&script(&s, &p, "rm file"));
+        let id = last_id(&s);
+        let folder = PathBuf::from(&s.env[OsStr::new("SAQTA_HOME")]).join(format!("cmd/{id}"));
+        let log = folder.join("effects.log");
+        let prefix = fs::read(&log).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"2\tpartial")
+            .unwrap();
+        let raw = fs::read(&log).unwrap();
+        if !ended {
+            fs::remove_file(folder.join("end")).unwrap();
+        }
+        let result = run(s.saqta(&["undo", &id.to_string()]));
+        if ended {
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("partial effects.log"));
+            assert!(!folder.join("tail-recovery.json").exists());
+            assert!(!p.join("file").exists());
+        } else {
+            assert_success(&result);
+            assert_tree(&before, &p);
+            let recovery: serde_json::Value =
+                serde_json::from_slice(&fs::read(folder.join("tail-recovery.json")).unwrap())
+                    .unwrap();
+            assert_eq!(recovery["cut"], prefix.len());
+            assert!(
+                recovery["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unacknowledged tail")
+            );
+        }
+        assert_eq!(
+            fs::read(log).unwrap(),
+            raw,
+            "raw intent log must remain byte for byte"
+        );
+    }
+}

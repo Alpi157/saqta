@@ -113,6 +113,39 @@ pub fn state(p: &Path) -> io::Result<Option<State>> {
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other)?;
     sys::stat_at(libc::AT_FDCWD, &c).map(|s| s.as_ref().map(State::from_stat))
 }
+fn snapshot_state(p: &Path) -> io::Result<Option<State>> {
+    let root = sys::open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY, 0)?;
+    let parent = p
+        .parent()
+        .ok_or_else(|| io::Error::other("missing snapshot parent"))?
+        .strip_prefix("/")
+        .map_err(io::Error::other)?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let fd = match sys::open_restore_parent(root.as_raw_fd(), &parent) {
+        Ok(fd) => fd,
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let name = std::ffi::CString::new(
+        p.file_name()
+            .ok_or_else(|| io::Error::other("missing snapshot name"))?
+            .as_bytes(),
+    )
+    .map_err(io::Error::other)?;
+    sys::stat_at(fd.as_raw_fd(), &name).map(|s| s.as_ref().map(State::from_stat))
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Meta {
     pub id: u64,
@@ -190,7 +223,7 @@ pub struct End {
 }
 fn json_temp(p: &Path, value: &impl Serialize) -> io::Result<(PathBuf, File)> {
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-    let temp = p.with_extension(format!("tmp-{}", sys::pid()));
+    let temp = p.with_extension(format!("tmp-{}-{}", sys::pid(), now()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -203,7 +236,7 @@ pub fn json_write(p: &Path, value: &impl Serialize) -> io::Result<()> {
     let (temp, _file) = json_temp(p, value)?;
     fs::rename(temp, p)
 }
-fn synced_json_write(p: &Path, value: &impl Serialize) -> io::Result<()> {
+pub fn synced_json_write(p: &Path, value: &impl Serialize) -> io::Result<()> {
     let (temp, file) = json_temp(p, value)?;
     file.sync_all()?;
     fs::rename(temp, p)
@@ -358,7 +391,7 @@ impl Journal {
             .mode(0o600)
             .open(self.folder.join("post.log"))?;
         for p in &self.touched {
-            let st = match state(p) {
+            let st = match snapshot_state(p) {
                 Ok(s) => s,
                 Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => None,
                 Err(e) => return Err(e),
@@ -419,6 +452,7 @@ pub struct Record {
     pub undone: bool,
     pub effects: Vec<Effect>,
     pub warning: Option<String>,
+    pub recovery_note: Option<String>,
     #[serde(skip)]
     pub outcomes: BTreeMap<u64, bool>,
 }
@@ -444,11 +478,51 @@ pub fn read_effects(folder: &Path) -> Result<Vec<Effect>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
-    // A trailing partial line is never an acknowledged intent. Refuse undo rather than guess.
+    // A crash can interrupt a regular-file write. Only a separately qualified
+    // dead-command recovery marker permits reading its acknowledged prefix.
     if !text.is_empty() && !text.ends_with('\n') {
+        if let Ok(bytes) = fs::read(folder.join("tail-recovery.json")) {
+            let recovery: TailRecovery = serde_json::from_slice(&bytes)?;
+            if text.as_bytes().get(recovery.cut..) == Some(recovery.tail.as_slice())
+                && let Some(prefix) = text.get(..recovery.cut)
+                && (prefix.is_empty() || prefix.ends_with('\n'))
+            {
+                return prefix.lines().map(Effect::parse).collect();
+            }
+        }
         bail!("partial effects.log in {}", folder.display());
     }
     text.lines().map(Effect::parse).collect()
+}
+#[derive(Serialize, Deserialize)]
+struct TailRecovery {
+    cut: usize,
+    tail: Vec<u8>,
+    note: String,
+}
+fn recover_unacknowledged_tail(folder: &Path) -> Result<Vec<Effect>> {
+    let text = fs::read_to_string(folder.join("effects.log"))?;
+    if text.ends_with('\n') {
+        bail!("damaged complete effects.log in {}", folder.display());
+    }
+    let cut = text.rfind('\n').map_or(0, |i| i + 1);
+    let effects = text[..cut]
+        .lines()
+        .map(Effect::parse)
+        .collect::<Result<Vec<_>>>()?;
+    if effects.iter().any(|e| process_live(e.pid as i32)) {
+        bail!("partial effects.log still has live command processes");
+    }
+    let recovery = TailRecovery {
+        cut,
+        tail: text.as_bytes()[cut..].to_vec(),
+        note: format!(
+            "recovered complete effect prefix; unacknowledged tail retained in {}",
+            display(&folder.join("effects.log"))
+        ),
+    };
+    synced_json_write(&folder.join("tail-recovery.json"), &recovery)?;
+    Ok(effects)
 }
 pub fn load(home: &Path, id: u64) -> Result<Record> {
     let folder = home.join("cmd").join(id.to_string());
@@ -459,7 +533,19 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let effects = read_effects(&folder)?;
+    let effects = match read_effects(&folder) {
+        Ok(effects) => effects,
+        Err(_)
+            if !folder.join("end").exists()
+                && !folder.join("error").exists()
+                && meta.child > 0
+                && !running(home, &meta)
+                && !process_live(meta.child) =>
+        {
+            recover_unacknowledged_tail(&folder)?
+        }
+        Err(e) => return Err(e),
+    };
     let end = match fs::read(folder.join("end")) {
         Ok(b) => Some(serde_json::from_slice::<End>(&b)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -474,9 +560,6 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         "incomplete"
     }
     .to_owned();
-    if !active {
-        let _ = fs::remove_file(home.join("run").join(meta.supervisor.to_string()));
-    }
     let mut outcomes = BTreeMap::new();
     for line in fs::read_to_string(folder.join("outcomes.log"))
         .unwrap_or_default()
@@ -500,6 +583,11 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         undone: folder.join("undone").exists(),
         effects,
         warning: fs::read_to_string(folder.join("error")).ok(),
+        recovery_note: fs::read(folder.join("tail-recovery.json"))
+            .ok()
+            .map(|b| serde_json::from_slice::<TailRecovery>(&b))
+            .transpose()?
+            .map(|r| r.note),
         outcomes,
     })
 }
@@ -552,7 +640,7 @@ fn recover_posts(folder: &Path, r: &Record) -> Result<()> {
     let mut posts = Vec::new();
     for name in missing {
         let p = path(&name)?;
-        let st = match state(&p) {
+        let st = match snapshot_state(&p) {
             Ok(st) => st,
             Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => None,
             Err(e) => return Err(e.into()),
@@ -564,6 +652,15 @@ fn recover_posts(folder: &Path, r: &Record) -> Result<()> {
     }
     synced_json_write(&folder.join("recovered-post.json"), &posts)?;
     Ok(())
+}
+pub fn refresh(home: &Path, id: u64) -> Result<Record> {
+    prepare(home)?;
+    let record = load(home, id)?;
+    if !running(home, &record.meta) {
+        let _ = fs::remove_file(home.join("run").join(record.meta.supervisor.to_string()));
+    }
+    recover_posts(&home.join("cmd").join(id.to_string()), &record)?;
+    Ok(record)
 }
 pub fn import(home: &Path) -> Result<Vec<Record>> {
     prepare(home)?;
@@ -577,8 +674,7 @@ pub fn import(home: &Path) -> Result<Vec<Record>> {
         if !e.path().join("meta").exists() {
             continue;
         }
-        let record = load(home, id)?;
-        recover_posts(&e.path(), &record)?;
+        let record = refresh(home, id)?;
         records.push(record);
     }
     records.sort_by_key(|r| std::cmp::Reverse(r.meta.id));
@@ -730,6 +826,9 @@ pub fn show(id: u64, json: bool) -> Result<i32> {
             count("blocked"),
             count("not protected") + usize::from(r.warning.is_some())
         );
+        if let Some(note) = r.recovery_note {
+            println!("{note}");
+        }
         if let Some(warning) = r.warning {
             println!("not protected: {warning}");
         }
