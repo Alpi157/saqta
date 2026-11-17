@@ -770,13 +770,16 @@ fn restore_effects(
         })?;
         undo.remember_origins(e)?;
         undo.recovery.completed_through = Some(e.seq);
-        undo.save_state()?;
+        // The next plan checkpoints this completion before its first mutation.
+        // If killed first, replay recognizes the last action from its identities.
         summary.record(e);
         if verbose {
             undo.output
                 .line(format_args!("restored {} {}", e.op, e.path));
         }
     }
+    // Flush the final completion too, including an empty command.
+    undo.save_state()?;
     Ok(())
 }
 
