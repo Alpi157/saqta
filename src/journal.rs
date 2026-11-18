@@ -4,10 +4,10 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
         unix::{
@@ -27,7 +27,7 @@ pub fn now() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
         if (b' '..=b'~').contains(&b) && b != b'%' {
             out.push(b as char);
@@ -40,7 +40,10 @@ pub fn encode(bytes: &[u8]) -> String {
 }
 pub fn decode(text: &str) -> io::Result<Vec<u8>> {
     let bytes = text.as_bytes();
-    let mut out = Vec::new();
+    if !bytes.contains(&b'%') {
+        return Ok(bytes.to_vec());
+    }
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
@@ -117,8 +120,7 @@ pub fn state(p: &Path) -> io::Result<Option<State>> {
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other)?;
     sys::stat_at(libc::AT_FDCWD, &c).map(|s| s.as_ref().map(State::from_stat))
 }
-fn snapshot_state(p: &Path) -> io::Result<Option<State>> {
-    let root = sys::open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY, 0)?;
+fn snapshot_state(root: i32, p: &Path) -> io::Result<Option<State>> {
     let parent = p
         .parent()
         .ok_or_else(|| io::Error::other("missing snapshot parent"))?
@@ -130,7 +132,7 @@ fn snapshot_state(p: &Path) -> io::Result<Option<State>> {
         parent
     };
     let parent = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(io::Error::other)?;
-    let fd = match sys::open_restore_parent(root.as_raw_fd(), &parent) {
+    let fd = match sys::open_restore_parent(root, &parent) {
         Ok(fd) => fd,
         Err(e)
             if matches!(
@@ -252,7 +254,9 @@ pub struct Journal {
     pub meta: Meta,
     effects: File,
     outcomes: File,
-    pub touched: BTreeSet<PathBuf>,
+    positive_outcomes: Vec<u64>,
+    effect_batch: String,
+    pub touched: HashSet<PathBuf>,
     seq: u64,
     debug_fd: i32,
     notifications: Option<File>,
@@ -340,7 +344,9 @@ impl Journal {
             meta,
             effects,
             outcomes,
-            touched: BTreeSet::new(),
+            positive_outcomes: Vec::new(),
+            effect_batch: String::with_capacity(1024),
+            touched: HashSet::new(),
             seq: 0,
             debug_fd,
         })
@@ -350,7 +356,7 @@ impl Journal {
         let meta =
             serde_json::from_slice(&fs::read(folder.join("meta"))?).map_err(io::Error::other)?;
         let effects = read_effects(&folder).map_err(io::Error::other)?;
-        let mut touched = BTreeSet::new();
+        let mut touched = HashSet::new();
         for e in &effects {
             for p in [&e.path, &e.path2] {
                 if !p.is_empty() {
@@ -368,6 +374,8 @@ impl Journal {
             outcomes: OpenOptions::new()
                 .append(true)
                 .open(folder.join("outcomes.log"))?,
+            positive_outcomes: read_positive_outcomes(&folder)?,
+            effect_batch: String::with_capacity(1024),
             seq: effects.len() as u64,
             folder,
             touched,
@@ -401,7 +409,7 @@ impl Journal {
     pub fn next_seq(&self) -> u64 {
         self.seq + 1
     }
-    pub fn append(&mut self, mut e: Effect) -> io::Result<u64> {
+    fn prepare_effect(&mut self, e: &mut Effect) -> io::Result<()> {
         self.seq += 1;
         e.seq = self.seq;
         for p in [&e.path, &e.path2] {
@@ -409,10 +417,39 @@ impl Journal {
                 self.touched.insert(path(p)?);
             }
         }
+        Ok(())
+    }
+    pub fn append(&mut self, mut e: Effect) -> io::Result<u64> {
+        self.prepare_effect(&mut e)?;
         write_once(&self.effects, e.line()?.as_bytes())?;
         Ok(e.seq)
     }
-    pub fn outcome(&self, seq: u64, applied: bool) -> io::Result<()> {
+    pub fn append_batch(&mut self, mut effects: Vec<Effect>) -> io::Result<Vec<u64>> {
+        if effects.len() == 1 {
+            // The length check proves pop succeeds; keep the ordinary one-line path.
+            if let Some(e) = effects.pop() {
+                return Ok(vec![self.append(e)?]);
+            }
+        }
+        let mut seqs = Vec::with_capacity(effects.len());
+        self.effect_batch.clear();
+        for mut e in effects {
+            self.prepare_effect(&mut e)?;
+            self.effect_batch.push_str(&e.line()?);
+            seqs.push(e.seq);
+        }
+        if !self.effect_batch.is_empty() {
+            write_once(&self.effects, self.effect_batch.as_bytes())?;
+        }
+        Ok(seqs)
+    }
+    pub fn outcome(&mut self, seq: u64, applied: bool) -> io::Result<()> {
+        if applied {
+            // Unknown outcomes already replay as applied. Losing only a positive
+            // batch on supervisor death cannot change any recovery decision.
+            self.positive_outcomes.push(seq);
+            return Ok(());
+        }
         write_once(
             &self.outcomes,
             format!("{seq}\t{}\n", u8::from(applied)).as_bytes(),
@@ -420,13 +457,21 @@ impl Journal {
     }
     pub fn snapshot(&self) -> io::Result<()> {
         sys::debug_timestamp(self.debug_fd, b"snapshot_begin");
-        let mut file = OpenOptions::new()
+        if !self.positive_outcomes.is_empty() {
+            json_write(
+                &self.folder.join("outcomes-positive.json"),
+                &self.positive_outcomes,
+            )?;
+        }
+        let file = OpenOptions::new()
             .append(true)
             .create(true)
             .mode(0o600)
             .open(self.folder.join("post.log"))?;
+        let mut file = BufWriter::with_capacity(256 * 1024, file);
+        let root = sys::open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY, 0)?;
         for p in &self.touched {
-            let st = match snapshot_state(p) {
+            let st = match snapshot_state(root.as_raw_fd(), p) {
                 Ok(s) => s,
                 Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => None,
                 Err(e) => return Err(e),
@@ -441,6 +486,7 @@ impl Journal {
             .map_err(io::Error::other)?;
             file.write_all(b"\n")?;
         }
+        file.flush()?;
         sys::debug_timestamp(self.debug_fd, b"snapshot_end");
         Ok(())
     }
@@ -459,6 +505,13 @@ impl Journal {
     }
     pub fn error(&self, e: &io::Error) {
         let _ = fs::write(self.folder.join("error"), e.to_string());
+    }
+}
+fn read_positive_outcomes(folder: &Path) -> io::Result<Vec<u64>> {
+    match fs::read(folder.join("outcomes-positive.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
     }
 }
 fn write_once(file: &File, bytes: &[u8]) -> io::Result<()> {
@@ -611,6 +664,15 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
             outcomes.insert(seq.parse()?, applied == "1");
         }
     }
+    for seq in read_positive_outcomes(&folder)? {
+        if seq == 0
+            || seq > effects.last().map_or(0, |e| e.seq)
+            || outcomes.get(&seq) == Some(&false)
+        {
+            bail!("invalid or contradictory positive outcome {seq}");
+        }
+        outcomes.insert(seq, true);
+    }
     Ok(Record {
         meta,
         status,
@@ -669,6 +731,7 @@ fn recover_posts(folder: &Path, r: &Record) -> Result<()> {
     {
         return Ok(());
     }
+    let root = sys::open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY, 0)?;
     let recorded = post_states(folder)?;
     let mut missing = BTreeSet::new();
     for e in &r.effects {
@@ -683,7 +746,7 @@ fn recover_posts(folder: &Path, r: &Record) -> Result<()> {
     let mut posts = Vec::new();
     for name in missing {
         let p = path(&name)?;
-        let st = match snapshot_state(&p) {
+        let st = match snapshot_state(root.as_raw_fd(), &p) {
             Ok(st) => st,
             Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => None,
             Err(e) => return Err(e.into()),
@@ -708,6 +771,7 @@ fn source_stamp(folder: &Path) -> io::Result<Vec<u8>> {
         "child",
         "effects.log",
         "outcomes.log",
+        "outcomes-positive.json",
         "post.log",
         "end",
         "undone",

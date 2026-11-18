@@ -6,7 +6,7 @@ use crate::{
 };
 use context::{NotificationResolver, ResolutionRoot, TaskCache, resolve};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::{CString, OsStr, OsString},
     fs::{self, File},
     io,
@@ -229,7 +229,7 @@ pub struct Capture {
     page: usize,
     copied: HashMap<(u64, u64), (String, State)>,
     original_links: HashMap<(u64, u64), PathBuf>,
-    created: HashSet<PathBuf>,
+    created: BTreeSet<OsString>,
     filesystems: HashMap<u64, (bool, OwnedFd)>,
     pending: HashMap<u32, Pending>,
     linked: BTreeMap<String, State>,
@@ -260,7 +260,7 @@ impl Capture {
             },
             copied: HashMap::new(),
             original_links: HashMap::new(),
-            created: HashSet::new(),
+            created: BTreeSet::new(),
             filesystems: HashMap::new(),
             pending: HashMap::new(),
             linked: BTreeMap::new(),
@@ -555,7 +555,7 @@ impl Capture {
             return Ok(());
         }
         if c.kind == Kind::Link
-            && !self.created.contains(&p.path)
+            && !self.created.contains(p.path.as_os_str())
             && let Some(st) = p.state()
         {
             self.original_links.insert((st.dev, st.ino), p.path.clone());
@@ -600,7 +600,7 @@ impl Capture {
                     } else {
                         self.freeze_links(p)?;
                         let key = (st.st_dev, st.st_ino);
-                        if self.created.contains(&p.path)
+                        if self.created.contains(p.path.as_os_str())
                             && let Some(original) = self.original_links.get(&key)
                         {
                             e.path = journal::display(original);
@@ -608,7 +608,7 @@ impl Capture {
                         if self.copied.contains_key(&key) {
                             e.op = "modify".into();
                             self.keep_copy(p, &mut e, true)?;
-                        } else if self.created.contains(&p.path)
+                        } else if self.created.contains(p.path.as_os_str())
                             && !self.original_links.contains_key(&key)
                         {
                             return Ok(());
@@ -691,10 +691,7 @@ impl Capture {
         } else {
             c.kind
         };
-        let mut seqs = Vec::with_capacity(effects.len());
-        for effect in effects {
-            seqs.push(self.journal.append(effect)?);
-        }
+        let seqs = self.journal.append_batch(effects)?;
         if !seqs.is_empty() {
             self.pending.insert(
                 n.pid,
@@ -733,7 +730,7 @@ impl Capture {
         Ok(())
     }
     fn keep_link(&mut self, p: &Resolved, e: &mut Effect) -> io::Result<()> {
-        if self.created.contains(&p.path) {
+        if self.created.contains(p.path.as_os_str()) {
             e.note.kept = "created earlier".into();
             return Ok(());
         }
@@ -817,7 +814,7 @@ impl Capture {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
         self.freeze_links(p)?;
         let key = (st.dev, st.ino);
-        if self.created.contains(&p.path) {
+        if self.created.contains(p.path.as_os_str()) {
             let original = self.original_links.get(&key).filter(|path| {
                 journal::state(path)
                     .ok()
@@ -826,10 +823,12 @@ impl Capture {
             });
             if let Some(original) = original {
                 e.path = journal::display(original);
-            } else {
+            } else if p.stat.as_ref().is_none_or(|stat| stat.st_nlink <= 1) {
                 e.note.kept = "created earlier".into();
                 return Ok(());
             }
+            // A new name can still share a pre-command inode after its recorded
+            // origin was removed. Retain and repair it before dropping that name.
         }
         if deduplicate && let Some((q, original)) = self.copied.get(&key) {
             e.quarantine = q.clone();
@@ -900,10 +899,21 @@ impl Capture {
         let applied = Self::applied(&p);
         if applied {
             if p.kind == Kind::Create {
-                self.created.insert(p.path.clone());
+                self.created.insert(p.path.clone().into_os_string());
             }
             if matches!(p.kind, Kind::Delete | Kind::Rmdir) {
-                self.created.retain(|old| !old.starts_with(&p.path));
+                self.created.remove(p.path.as_os_str());
+                let mut prefix = p.path.clone().into_os_string();
+                prefix.push("/");
+                let removed: Vec<_> = self
+                    .created
+                    .range(prefix.clone()..)
+                    .take_while(|old| old.as_bytes().starts_with(prefix.as_bytes()))
+                    .cloned()
+                    .collect();
+                for path in removed {
+                    self.created.remove(&path);
+                }
                 self.original_links
                     .retain(|_, old| !old.starts_with(&p.path));
             }
@@ -927,14 +937,16 @@ impl Capture {
                 });
                 let previous = std::mem::take(&mut self.created);
                 for old in previous {
+                    let old = PathBuf::from(old);
                     if let Ok(tail) = old.strip_prefix(&p.path) {
-                        self.created.insert(relocated(dest, tail));
+                        self.created.insert(relocated(dest, tail).into_os_string());
                     } else if let Ok(tail) = old.strip_prefix(dest) {
                         if p.kind == Kind::Exchange {
-                            self.created.insert(relocated(&p.path, tail));
+                            self.created
+                                .insert(relocated(&p.path, tail).into_os_string());
                         }
                     } else {
-                        self.created.insert(old);
+                        self.created.insert(old.into_os_string());
                     }
                 }
             }
