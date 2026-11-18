@@ -281,12 +281,14 @@ pub struct Breaker {
     bytes: BTreeMap<(u64, u64), u64>,
     total: u64,
     irreplaceable: usize,
+    dirty: usize,
 }
 
 impl Breaker {
-    pub fn observe(&mut self, policy: &Policy, path: &Path, state: &journal::State) {
-        if self.files.insert(path.to_owned()) && policy.irreplaceable(path) {
-            self.irreplaceable += 1;
+    pub fn observe(&mut self, policy: &Policy, path: &Path, state: &journal::State, dirty: bool) {
+        if self.files.insert(path.to_owned()) {
+            self.irreplaceable += usize::from(policy.irreplaceable(path));
+            self.dirty += usize::from(dirty);
         }
         let size = state.size.max(0) as u64;
         let counted = self.bytes.entry((state.dev, state.ino)).or_default();
@@ -295,9 +297,27 @@ impl Breaker {
     }
 
     pub fn fired(&self, policy: &Policy) -> bool {
-        self.files.len() > policy.max_files
-            || self.total > policy.max_bytes
-            || self.irreplaceable > policy.max_irreplaceable
+        self.might_fire(policy, 0, 0, 0)
+    }
+
+    pub fn might_fire(
+        &self,
+        policy: &Policy,
+        files: usize,
+        bytes: u64,
+        irreplaceable: usize,
+    ) -> bool {
+        self.files.len().saturating_add(files) > policy.max_files
+            || self.total.saturating_add(bytes) > policy.max_bytes
+            || self.irreplaceable.saturating_add(irreplaceable) > policy.max_irreplaceable
+    }
+
+    pub fn counted(&self, path: &Path) -> bool {
+        self.files.contains(path)
+    }
+
+    pub fn mostly_dirty(&self) -> bool {
+        self.dirty > self.files.len() / 2
     }
 }
 
@@ -318,6 +338,7 @@ impl Rule {
         names: &BTreeSet<PathBuf>,
         project: &Path,
         mixed: bool,
+        mostly_dirty: bool,
     ) -> String {
         let count = names.len();
         let files = if count == 1 { "file" } else { "files" };
@@ -355,6 +376,7 @@ impl Rule {
             listed.push_str(&format!(" (+{} more)", count - 3));
         }
         let advice = match self {
+            Self::R1 if mostly_dirty => "\n  To set changes aside, use: git stash -u",
             Self::R1 => "\n  Review the command and narrow the paths it changes.",
             Self::R2 => {
                 ". Git doesn't have these changes.\n  To set changes aside, use: git stash -u"

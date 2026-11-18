@@ -1,6 +1,7 @@
 //! Decode a stopped syscall, pin its parent directories, and journal its pre-images.
 mod context;
 use crate::{
+    classify::{self, GitDeletion, Indexes},
     journal::{self, Detail, Effect, Journal, State},
     rules::{Breaker, Policy},
     sys,
@@ -210,6 +211,11 @@ impl Entry {
             .map(State::from_stat)
     }
 }
+enum Destruction {
+    Observed(PathBuf, State),
+    CheckGit(GitDeletion),
+}
+
 struct Pending {
     at: Entry,
     at2: Option<Entry>,
@@ -219,7 +225,8 @@ struct Pending {
     path2: Option<PathBuf>,
     before: Option<State>,
     before2: Option<State>,
-    destruction: Vec<(PathBuf, State)>,
+    destruction: Vec<Destruction>,
+    git_lock: Option<u64>,
 }
 pub struct Capture {
     pub journal: Journal,
@@ -228,6 +235,10 @@ pub struct Capture {
     pub policy: Option<Policy>,
     pub prior_created: std::collections::HashSet<crate::classify::Birth>,
     pub(crate) breaker: Breaker,
+    pub indexes: Indexes,
+    pending_git_deletions: Vec<GitDeletion>,
+    checked_git_batch: bool,
+    git_locks: BTreeMap<PathBuf, (u64, State)>,
     last_rule_candidate: u64,
     cache_roots: BTreeSet<PathBuf>,
     max_copy: u64,
@@ -263,6 +274,10 @@ impl Capture {
             policy: None,
             prior_created: Default::default(),
             breaker: Breaker::default(),
+            indexes: Indexes::default(),
+            pending_git_deletions: Vec::new(),
+            checked_git_batch: false,
+            git_locks: BTreeMap::new(),
             last_rule_candidate: 0,
             cache_roots: BTreeSet::new(),
             max_copy,
@@ -725,8 +740,16 @@ impl Capture {
         }
         let mut destruction = Vec::new();
         let mut last_candidate = None;
+        let mut git_lock = None;
         if let Some(policy) = &self.policy {
             for (index, e) in effects.iter_mut().enumerate() {
+                if e.op == "create"
+                    && e.path.ends_with(".lock")
+                    && classify::git_database(&journal::path(&e.path)?)
+                    && classify::git_process(n.pid)
+                {
+                    git_lock = Some(index);
+                }
                 if !matches!(e.op.as_str(), "delete" | "modify" | "not protected") {
                     continue;
                 }
@@ -750,21 +773,65 @@ impl Capture {
                     || (!self.prior_created.is_empty()
                         && crate::classify::Birth::read(&path)
                             .is_some_and(|id| self.prior_created.contains(&id)));
-                if crate::classify::git_database(&path) {
-                    e.note.git = crate::classify::git_process(n.pid);
+                let database = classify::git_database(&path);
+                if database {
+                    e.note.git = classify::git_process(n.pid);
                 }
-                if let Some(before) = e.note.before.as_ref().filter(|s| !s.directory()) {
-                    if matches!(e.op.as_str(), "delete" | "modify") && !e.quarantine.is_empty() {
-                        last_candidate = Some(index);
-                    }
-                    if e.note.kept != "created earlier"
-                        && (e.op == "delete"
-                            || c.kind == Kind::Truncate
-                            || c.flags & libc::O_TRUNC as u64 != 0
-                            || c.flags & libc::O_APPEND as u64 == 0)
+                let Some(before) = e.note.before.as_ref().filter(|s| !s.directory()) else {
+                    continue;
+                };
+                if matches!(e.op.as_str(), "delete" | "modify") && !e.quarantine.is_empty() {
+                    last_candidate = Some(index);
+                }
+                // Snapshot the old index before Git can replace it with the result
+                // of the same switch, reset, or merge.
+                let git = if !database || path.ends_with(".git/index") {
+                    self.indexes
+                        .observe(&path, &self.journal.folder, policy)
+                        .map(|(root, entry)| {
+                            (
+                                root,
+                                entry.is_some(),
+                                entry.is_some_and(|e| e.stat_matches(before)),
+                            )
+                        })
+                } else {
+                    None
+                };
+                if e.note.kept == "created earlier" || (database && e.note.git) {
+                    continue;
+                }
+                let deleted = c.kind == Kind::Delete;
+                let replaces_precious_or_outside = (policy.precious(&path)
+                    || !path.starts_with(&policy.project))
+                    && (e.op == "delete"
+                        || c.kind == Kind::Truncate
+                        || c.flags & libc::O_TRUNC as u64 != 0
+                        || c.flags & libc::O_APPEND as u64 == 0);
+                if !deleted && !replaces_precious_or_outside {
+                    continue;
+                }
+                match git {
+                    Some((_, _, true)) => {}
+                    Some((root, tracked, false))
+                        if tracked || (deleted && classify::git_process(n.pid)) =>
                     {
-                        destruction.push((path, before.clone()));
+                        if !e.quarantine.is_empty()
+                            && matches!(before.mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK)
+                        {
+                            destruction.push(Destruction::CheckGit(GitDeletion {
+                                root,
+                                path,
+                                before: before.clone(),
+                                retained: self.journal.quarantine.join(&e.quarantine),
+                                tracked,
+                            }));
+                        }
                     }
+                    _ if database || self.indexes.is_known(&path) => {
+                        destruction.push(Destruction::Observed(path, before.clone()));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -777,6 +844,7 @@ impl Capture {
         if let Some(seq) = last_candidate.and_then(|i| seqs.get(i)) {
             self.last_rule_candidate = *seq;
         }
+        let git_lock = git_lock.and_then(|index| seqs.get(index).copied());
         if !seqs.is_empty() {
             self.pending.insert(
                 n.pid,
@@ -810,6 +878,7 @@ impl Capture {
                     },
                     before2: p2.and_then(Resolved::state),
                     destruction,
+                    git_lock,
                 },
             );
         }
@@ -991,14 +1060,32 @@ impl Capture {
             let changed_in_place =
                 !matches!(p.kind, Kind::Open | Kind::Truncate) || p.at.state(&p.path) != p.before;
             if changed_in_place {
-                for (path, before) in &p.destruction {
-                    self.breaker.observe(policy, path, before);
+                for loss in p.destruction {
+                    match loss {
+                        Destruction::Observed(path, before) => {
+                            self.breaker.observe(policy, &path, &before, false);
+                        }
+                        Destruction::CheckGit(candidate) => {
+                            self.pending_git_deletions.push(candidate);
+                        }
+                    }
                 }
+                self.check_git_deletions(false);
             }
         }
         if applied {
             if p.kind == Kind::Create {
                 self.created.insert(p.path.clone().into_os_string());
+                if let Some(seq) = p.git_lock
+                    && let Some(state) =
+                        p.at.state(&p.path)
+                            .filter(|s| s.mode & libc::S_IFMT == libc::S_IFREG)
+                {
+                    self.git_locks.insert(p.path.clone(), (seq, state));
+                }
+            }
+            if matches!(p.kind, Kind::Delete | Kind::Rename | Kind::Exchange) {
+                self.git_locks.remove(&p.path);
             }
             if matches!(p.kind, Kind::Delete | Kind::Rmdir) {
                 self.created.remove(p.path.as_os_str());
@@ -1056,6 +1143,55 @@ impl Capture {
             }
         }
     }
+    pub fn interrupted_git_locks(&self) -> anyhow::Result<BTreeSet<u64>> {
+        if self.git_locks.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let posts = journal::post_states(&self.journal.folder)?;
+        Ok(self
+            .git_locks
+            .iter()
+            .filter_map(|(path, (seq, inode))| {
+                posts
+                    .get(&journal::display(path))
+                    .and_then(Option::as_ref)
+                    .is_some_and(|current| current.same_inode(inode))
+                    .then_some(*seq)
+            })
+            .collect())
+    }
+
+    pub fn check_git_deletions(&mut self, flush: bool) {
+        let Some(policy) = &self.policy else { return };
+        let pending = &self.pending_git_deletions;
+        if pending.is_empty() {
+            return;
+        }
+        // The first potentially decisive batch runs immediately. If its
+        // stat misses included clean files, collect another bounded batch
+        // before retrying so a near-threshold command cannot spawn Git per file.
+        if !flush && self.checked_git_batch && pending.len() < 32 {
+            return;
+        }
+        let mut bytes = 0u64;
+        let mut irreplaceable = 0;
+        for c in pending {
+            bytes = bytes.saturating_add(c.before.size.max(0) as u64);
+            irreplaceable += usize::from(policy.irreplaceable(&c.path));
+        }
+        if !self
+            .breaker
+            .might_fire(policy, pending.len(), bytes, irreplaceable)
+        {
+            return;
+        }
+        self.checked_git_batch = true;
+        let candidates = std::mem::take(&mut self.pending_git_deletions);
+        for c in classify::confirm_deletions(candidates, &self.indexes, &self.journal.folder) {
+            self.breaker.observe(policy, &c.path, &c.before, c.tracked);
+        }
+    }
+
     pub fn task_exit_fd(&self) -> i32 {
         self.tasks
             .task
@@ -1101,6 +1237,7 @@ impl Capture {
         for pid in pids {
             self.complete(pid);
         }
+        self.check_git_deletions(true);
     }
     pub fn snapshot(&mut self) {
         if self.policy.is_some() {

@@ -106,6 +106,13 @@ if [[ "$milestone" == m6-rules-r1* && -f target/m6-r1-evidence/rules-cost.json ]
     failed=1
   fi
 fi
+if [[ "$milestone" == m6-rules-r2* && -f target/m6-r2-evidence/rules-cost.json ]]; then
+  mkdir -p "$out/evidence"
+  if ! cp target/m6-r2-evidence/rules-cost.json target/m6-r2-evidence/rules-cost.py "$out/evidence/"; then
+    echo "evidence FAIL: could not copy M6 R2 rules measurements" >> "$summary"
+    failed=1
+  fi
+fi
 doctor_check() {
   local doctor_dir
   mkdir -p target/saqta-tests
