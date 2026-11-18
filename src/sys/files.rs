@@ -35,6 +35,82 @@ pub fn stat_fd(fd: i32) -> io::Result<libc::stat> {
     cv(unsafe { libc::fstat(fd, &mut st) })?;
     Ok(st)
 }
+pub fn stat_mount_at(base: i32, name: &CStr) -> io::Result<(Option<libc::stat>, Option<u64>)> {
+    stat_with_mount(base, name, 0)
+}
+pub fn stat_mount_fd(fd: i32) -> io::Result<(libc::stat, Option<u64>)> {
+    let (stat, mount) = stat_with_mount(fd, c"", libc::AT_EMPTY_PATH)?;
+    Ok((
+        stat.ok_or_else(|| io::Error::other("missing pinned directory"))?,
+        mount,
+    ))
+}
+fn stat_with_mount(
+    base: i32,
+    name: &CStr,
+    flags: i32,
+) -> io::Result<(Option<libc::stat>, Option<u64>)> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+    if !UNAVAILABLE.load(Ordering::Relaxed) {
+        // SAFETY: statx is a plain C output structure, initialized by the kernel.
+        let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: name is terminated and sx is writable for the whole syscall.
+        let result = unsafe {
+            libc::statx(
+                base,
+                name.as_ptr(),
+                flags | libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+                &mut sx,
+            )
+        };
+        if result == 0 && sx.stx_mask & libc::STATX_BASIC_STATS == libc::STATX_BASIC_STATS {
+            // SAFETY: libc::stat is plain integer storage; all public stat fields are assigned below.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            st.st_dev = libc::makedev(sx.stx_dev_major, sx.stx_dev_minor);
+            st.st_ino = sx.stx_ino;
+            st.st_mode = u32::from(sx.stx_mode);
+            st.st_nlink = sx.stx_nlink.into();
+            st.st_uid = sx.stx_uid;
+            st.st_gid = sx.stx_gid;
+            st.st_rdev = libc::makedev(sx.stx_rdev_major, sx.stx_rdev_minor);
+            st.st_size = i64::try_from(sx.stx_size).map_err(io::Error::other)?;
+            st.st_blksize = sx.stx_blksize.into();
+            st.st_blocks = i64::try_from(sx.stx_blocks).map_err(io::Error::other)?;
+            st.st_atime = sx.stx_atime.tv_sec;
+            st.st_atime_nsec = sx.stx_atime.tv_nsec.into();
+            st.st_mtime = sx.stx_mtime.tv_sec;
+            st.st_mtime_nsec = sx.stx_mtime.tv_nsec.into();
+            st.st_ctime = sx.stx_ctime.tv_sec;
+            st.st_ctime_nsec = sx.stx_ctime.tv_nsec.into();
+            #[cfg(debug_assertions)]
+            if std::env::var_os("SAQTA_TEST_NO_MOUNT_ID").is_some_and(|s| s == "1") {
+                return Ok((Some(st), None));
+            }
+            return Ok((
+                Some(st),
+                (sx.stx_mask & libc::STATX_MNT_ID != 0).then_some(sx.stx_mnt_id),
+            ));
+        }
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ENOENT) => return Ok((None, None)),
+                Some(libc::EPERM | libc::ENOSYS) => UNAVAILABLE.store(true, Ordering::Relaxed),
+                Some(libc::EOPNOTSUPP | libc::EINVAL) => {}
+                _ => return Err(error),
+            }
+        }
+    }
+    // Without a mount identity use the original metadata and fresh classification.
+    let stat = if flags & libc::AT_EMPTY_PATH != 0 {
+        Some(stat_fd(base)?)
+    } else {
+        stat_at(base, name)?
+    };
+    Ok((stat, None))
+}
 pub fn fs_type(fd: i32) -> io::Result<i64> {
     // SAFETY: zeroed statfs is valid output storage.
     let mut st = unsafe { std::mem::zeroed() };
@@ -230,6 +306,13 @@ pub fn alive(pid: i32) -> bool {
     unsafe {
         libc::kill(pid, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
+}
+
+pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    // SAFETY: pid and zero flags are values. Linux creates pidfds with CLOEXEC.
+    let fd = cv(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 })?;
+    // SAFETY: pidfd_open returned a fresh descriptor owned by this function.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(debug_assertions)]

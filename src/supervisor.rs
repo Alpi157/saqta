@@ -183,22 +183,30 @@ fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: capture.task_exit_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         sys::poll(&mut fds, 100);
+        if fds[0].revents == 0 || fds[3].revents != 0 {
+            capture.prune_tasks();
+        }
         // HUP means all filtered tasks are gone. Reap before reporting status.
         let mut hup = listener >= 0 && fds[0].revents & libc::POLLHUP != 0;
         if hup {
             while let Some((pid, st)) = sys::wait(-1, true) {
-                capture.complete(pid as u32);
+                capture.exited(pid as u32);
                 if pid == child {
                     done = true;
                     status = st;
                 }
             }
-        } else {
+        } else if fds[1].revents != 0 {
             while sys::signal_event(sf).is_some() {}
             while let Some((pid, st)) = sys::wait(-1, false) {
-                capture.complete(pid as u32);
+                capture.exited(pid as u32);
                 if pid == child {
                     done = true;
                     status = st;
