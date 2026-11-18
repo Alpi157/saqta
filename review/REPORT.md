@@ -1,417 +1,241 @@
-# M4 harness, R2: report
+# M5 speed: report
 
 ## What works now (5 lines max)
-- Three filesystem properties exercise sequential commands, concurrent subtrees and interrupted undo.
-- Undo resumes from explicit recovery actions and preserves hard-link alias lineage across commands.
-- GC applies retention in the requested order and labels collected content during undo.
-- Log, show and one-file undo avoid importing unrelated effects on repeated calls.
-- Timeout tests validate build provenance and establish fault states before the 350 ms deadline.
+- Capture uses bounded task caches and keeps pre-images and complete intents before CONTINUE.
+- Undo uses append-only plans, periodic checkpoints and pinned private store parents.
+- Tests cover exec with a readable old mm, actual PID reuse, root and mount changes, and interrupted cross-mount publication.
+- The extended harness found an M4 shared-alias defect. The fix, minimized regression and seed are retained.
+- Delete and create meet 25 us. Same-mount undo meets five seconds. Review accepted the rename-over limit.
 
 ## How it works
 
-`tests/harness.rs` generates 1 to 40 direct operations over six directories and
-twelve file names. The fixture starts with ordinary files, empty names, an empty
-directory and a pre-existing hard-link pair. The debug-only `__harness` driver in
-`src/harness.rs` reads JSON, pins parents without following symlinks, checks final
-symlink targets stay inside the fixture, and calls thin syscall wrappers. Its
-concurrent workers each own a subtree. Syscall failures are allowed inputs and
-are printed with the process, fixture, operation and errno.
+filter::CONTEXT_CALLS sends exec and filesystem-context changes to the supervisor.
+TaskCache in src/capture/context.rs discards its one cached task before continuing
+such a call. Only the issuer's next notification can repopulate it. Other tids
+use temporary context. This prevents another thread from retaining an old mm or
+root while a context change is in flight. A pinned pidfd checks lifetime. If
+unavailable, a pinned proc-stat descriptor checks the original task's start time.
+That descriptor cannot follow a reused PID number. Read failure reopens memory
+once. Reap, idle checks and command end close cached descriptors.
 
-The sequential property uses one to three exact consecutive commands. It checks
-every intermediate snapshot while undoing newest first. The hash covers type,
-mode, file size, bytes, symlink target and file mtime. Directory allocation size
-and directory mtime are excluded. The interruption property first obtains an
-uninterrupted result, repeats the operations, then aborts after a mutation and
-before its completion checkpoint. It checks pre-command and post-command byte
-versions in that command's tree, quarantine and undo folder only. Earlier undo
-folders cannot mask a missing version. Resume must match the uninterrupted tree.
+PathReader in src/sys/memory.rs remembers VM-read denial and reads bounded pages
+through proc memory. Page bytes live only for one stopped notification. Both
+notification validity checks remain. Cwd display names are refreshed; numbered
+dirfds open afresh. Simple names, including ./file, use a pinned base. Other
+paths retain the restricted root walk. Filesystem decisions use statx mount identity and pin the mount against ID reuse. Mount-context calls release classification and observation
+pins before CONTINUE, so the caches cannot keep mounts busy.
 
-`src/restore.rs` plans reverse effects and handles conflicts, original prefixes
-and alias lineage. `src/restore/steps.rs` executes moves, staged copies, inode
-repairs, directory recreation and exchanges. Plans and checkpoints use atomic
-replacement. Move and exchange identities distinguish a completed step from one
-that still needs execution. The recovery map remains synced before displacement. Numeric snapshots are
-independent copies when an entry shares an inode. Separate mutable inode handles
-allow older aliases to be repaired without changing those snapshots.
-Original data and independent post versions remain available before inode repair.
-Plain alias observations connect identities across consecutive undos. The
-`SAQTA_TEST_ABORT_AFTER` hook exists only in debug builds.
+Capture::complete updates creation and inode bookkeeping before later calls can
+obscure it. Ordered subtree ranges replace whole-set deletion scans.
+Journal::append_batch writes one notification's effects together, after its
+pre-images and before its reply. Positive outcomes wait for atomic snapshot
+publication. Unknown already replays exactly like true, so losing unpublished
+positives changes no recovery decision. False outcomes still write immediately.
+Post-state serialization flushes before status or end publication. Intent never
+waits past its dependent CONTINUE.
 
-`src/gc.rs` validates retained pre-images before collection. It takes a global
-collector lock and the same per-command locks as undo. It first collects
-regenerable content after one day, then commands past the age limit, then oldest
-commands until under the size limit. The newest three ids, live commands and incomplete journals are protected. Any
-interrupted undo defers collection, including collection of borrowed inode handles
-in older undo folders. Every reference to a
-shared pre-image must be regenerable. CACHEDIR.TAG signatures are recognized in
-current directories and retained deleted tags. Expiry records precede unlink;
-whole-command metadata is removed last. Undo reports expired paths and restores
-other effects. Dry-run writes no locks, markers or content.
+restore::Checkpoints appends each full plan before mutation. It publishes
+state.json every 128 frames or 250 ms, and at completion, before truncating
+state.log. Resume validates all complete frames and uses the latest. An
+incomplete final frame authorizes no mutation; its exact bytes are retained.
+Existing move, exchange and copy-publication identities recognize completed
+actions. The synced displacement map is unchanged. Only command quarantine and
+private undo parent fds are reused across effects, under the command lock.
+Working-tree parents keep fresh secure walks.
 
-Interactive commands reserve one GC attempt per 24 hours under a lock and launch
-the collector after printing with closed standard streams. New stores begin the
-first interval at creation. Status reports retained size, last successful GC and
-any prior collection refusal.
+Undo remembers absences proved by preflight or completed moves. Copies, exchanges
+and directory moves invalidate that knowledge. NOREPLACE still protects entries
+that appear later. Resume starts without remembered absences. Directory
+observation collection uses a hash set. Reverse path mapping visits affected
+subtrees. Observation values and conflict checks remain unchanged.
 
-`journal::import` fingerprints each command and caches summaries in SQLite. It
-reimports only changed journals. `journal::refresh` lets show and undo load only
-the requested command. First import and explicit database rebuild still read the
-source effects. No dependencies were added.
-
-R1 combines an effect's completion checkpoint with the next effect's plan in
-`restore_effects`. The final completion is still flushed. Each mutation retains
-its existing identity checks and recovery map. `Journal::notification_progress`
-overwrites a fixed observation record only with debug logging enabled.
-`tests/common/timeout.rs` samples the owned process tree, successful kernel
-replies and undo state one second apart, then prints bounded journal tails.
-Cleanup stops and kills descendants, orphan supervisors and inherited pipe
-holders, checking process start times before signalling. Reaping is bounded.
-Fixtures enable debug logging consistently for direct and supervised commands.
-Each helper command has its own process group. This prevents job-control HUP
-signals from reaching parallel tests while cleanup freezes a process tree.
-
-R2 checks the debug executable's compiled manifest path and observation protocol
-once per test binary with `verify_build`. `__harness --build-info` returns static
-metadata without opening a store. Review builds use `target/review-build`, and
-each validation snapshot must have its own Cargo target directory. Timeout
-tests use `wait_ready` before `output_after_setup`. A stdin barrier establishes
-the blocked tracee; `SAQTA_TEST_STOP_UNDO=1` stops a debug undo before mutation.
-Reports show total elapsed, setup and fault-window time, plus actual observation
-read errors. Capture behavior is unchanged. A separate saved-seed fix relocates
-directory observations through reverse moves and freezes their input map once
-per undo, so resume cannot apply an exchange twice.
+The alias regression links an original inode under a new name, deletes its
+recorded origin, then writes through that new name. Untouched M4 leaves another
+surviving alias changed. M5 conservatively captures shared created aliases and
+repairs their inode before removing the new name.
 
 ## Acceptance checklist
 
 | # | Item | Result | Proven by (test name or command) |
-| --- | --- | --- | --- |
-| 1 | All requested operation kinds, colliding namespace, direct debug helper | PASS | `consecutive_commands_restore_every_snapshot`, `syscall_helper_exercises_creation_and_write_through_symlink` |
-| 2 | One to three commands; newest-only and complete undo match snapshots | PASS | `consecutive_commands_restore_every_snapshot` |
-| 3 | Two to four concurrent processes on separate subtrees | PASS | `concurrent_subtrees_restore_exactly` |
-| 4 | Interrupted undo retains both boundary versions and resumes exactly | PASS | `interrupted_undo_preserves_versions_and_resumes` |
-| 5 | Every action boundary for shared inode repair and exchange | PASS | `resume_replays_every_step_of_shared_inode_repair_and_exchange` |
-| 6 | 64 cases by default; override; saved seeds; failing fixtures | PASS | `config` in `tests/harness.rs`; regression file; fixture preservation |
-| 7 | Nightly and manual 5,000-case Ubuntu 24.04 workflow; failure artifacts | AUTHORED | `.github/workflows/harness.yml`; not run on GitHub during this session |
-| 8 | Minimized product failures become named regressions | PASS | Bug table below |
-| 9 | Age and size limits; regenerable content first; newest three protected | PASS | `age_size_dry_run_and_newest_three` |
-| 10 | Shared pre-images and tagged caches | PASS | `cachedir_tag_and_shared_preimages_keep_nonregenerable_references` |
-| 11 | Running commands and interrupted undos protected | PASS | `running_and_interrupted_undo_are_protected` |
-| 12 | Expired paths reported; remaining content restored | PASS | `regenerable_content_expires_first_and_undo_restores_other_content` |
-| 13 | Dry-run changes nothing | PASS | Full store hash in `age_size_dry_run_and_newest_three` |
-| 14 | Opportunistic GC at most once daily; status size and timestamp | PASS | `opportunistic_gc_runs_after_output_at_most_once_per_day` |
-| 15 | Incremental import with 70,000-effect history; loose timing bound | PASS | `incremental_history_does_not_reparse_seventy_thousand_effects`; SQLite trigger rejects reimport |
-| 16 | Non-zero undo categories and preferred source examples | PASS | `undo_and_dry_run_print_only_nonzero_categories`, `summary_examples_prefer_source_paths` |
-| 17 | Supervised doctor gives info, no blocked store writes, real capture probe | PASS | `supervised_doctor_reports_info_without_store_write_attempts`; existing two Codex doctor tests |
-| 18 | GC preserves recovery copies when an older hard link changed | PASS | `gc_keeps_a_newer_copy_when_an_older_retained_hard_link_was_changed` |
-| 19 | A dead incomplete exec recovers a partial trailing intent; raw log retained | PASS | `killed_command_recovers_only_complete_intents_and_keeps_the_raw_tail` |
-| 20 | A retained post version stays immutable after later alias writes | PASS | `preserved_created_hard_link_is_immutable_after_later_write` |
-| 21 | Formatting, clippy, full suite, forced proc-memory fallback, release configuration | PASS | `scripts/review-bundle.sh m4-harness`; `cargo check --release --locked` |
-| R1.1 | Three M3 and three M4 runs on CPUs 0,1 without synchronous wakeups; phase timings | PASS | Table below; raw logs and M3 instrumentation patch in the R1 bundle's `evidence/` |
-| R1.2 | Diagnose timeouts before killing the full owned tree | PASS | Four fault-injection tests in `tests/timeouts.rs`, including an older undo and an orphan holding stdout |
-| R1.3 | Explicit sixty-second bulk timeout; byte-exact restore unchanged | PASS | `separate_bind_mount_five_thousand_deletes_restore`; ordinary helper deadline remains ten seconds |
-| R1.4 | Investigate >25% regression and fix cheap recovery overhead | PASS, residual recorded | Checkpoint count and before/after table below; `resume_replays_deletes_with_deferred_completion_checkpoints` |
-| R1.5 | Repeat constrained checks on both CI operating systems; retain timeout artifacts | AUTHORED | `.github/workflows/ci.yml`; remote rerun awaits publication |
-| R1.6 | Full checks and revised review bundle | PASS | `scripts/review-bundle.sh m4-harness-r1`: fmt, clippy, 156 tests, proc-memory fallback, release build, constrained checks, doctor and cargo-deny |
-| R2.1 | Reproduce the user's terminal failure outside the sandbox and compare inside | PASS | `evidence/r2/r2-outside-before.log`, `r2-inside-before.log`, `stale-build.json`: the same three failures in both |
-| R2.2 | Reject stale or foreign binaries before fault injection; isolate validation builds | PASS | `foreign_build_is_rejected_before_fault_injection`; `verify_build`; review script and AGENTS.md |
-| R2.3 | Explicit readiness, including startup exceeding 350 ms; assertions retained | PASS | All four original timeout tests; stopped-supervisor setup includes a deliberate 500 ms delay |
-| R2.4 | Loaded 24-CPU and 2-CPU runs | PASS | Three runs per configuration, all five tests pass; `loaded-checks.json` and individual logs |
-| R2.5 | Whole suite inside and outside the sandbox, with approval for outside | PASS | 160 tests in each: `evidence/r2/full-inside.log` and `full-outside.log` |
-| R2.6 | Revised review bundle | PASS | `scripts/review-bundle.sh m4-harness-r2`: fmt, clippy, 160 tests, proc-memory fallback, release configuration, constrained checks, doctor and cargo-deny |
-| R2.7 | New directory-observation harness regression, exact resume and later-edit refusal | PASS | `regression_directory_observations_follow_exchanges_of_ancestors`, `resumed_directory_observations_are_not_exchanged_twice`, `restored_directory_observations_reject_later_user_edits`; saved seed |
-
-### Bugs found and fixed
-
-Persisted failure seeds remain in `tests/harness.proptest-regressions`. Names
-below are in `tests/harness.rs` unless another file is named. Several minimized
-sequences share one underlying bug; all remain as separate regressions.
-
-| Failure | Fix | Named regression |
-| --- | --- | --- |
-| A pure append survived undo | Notify on append-capable write opens | `regression_pure_append_is_undone` |
-| A failed directory rename caused a conflict after undoing a later child write | Ignore failed intents; compare restored file metadata and recorded directory observations | `regression_failed_directory_rename_then_child_write` |
-| Exchange could not reverse after a created input was removed | Move the surviving input back when the other side is absent | `regression_exchange_then_remove_a_created_input` |
-| Growth between repeated writes restored an impossible intermediate size | Use the existing full pre-image once one exists | `regression_write_then_grow_then_write_does_not_restore_an_intermediate_size` |
-| Original bytes existed only as a prefix during interrupted growth undo | Materialize complete original prefix files before mutation | `regression_grown_prefix_survives_interrupted_undo` |
-| A grown file disappeared from its recorded pathname after a directory exchange | Follow later successful moves to find its prefix | `regression_grown_file_moves_with_exchanged_directory` |
-| Undo of a newer command changed an inode and blocked an older growth undo | Use restored metadata and alias observations | `regression_growth_then_a_later_command_replaces_the_inode` |
-| Snapshot followed a removed directory replaced by a symlink | Snapshot without traversing symlink parents | `regression_removed_directory_replaced_by_a_symlink` |
-| A moved parent replaced by a symlink loop damaged post-state recording | Record inaccessible children as absent and verify the recorded ancestor before accepting that absence | `regression_moved_parent_replaced_by_a_symlink_loop` |
-| Exchanging a symlink over a touched parent made safe undo look inaccessible | Apply the same recorded-ancestor check | `regression_exchange_a_symlink_over_a_touched_parent` |
-| An exchanged hard-link source acquired a trailing slash, so capture treated an original alias as created | Preserve the exact basename when a moved suffix is empty | `regression_write_new_hard_link_after_original_name_is_exchanged` |
-| Growth through a new alias restored the wrong name after the original name was replaced | Record growth against its surviving original name | `regression_growth_through_new_hard_link_then_replace_original_name` |
-| Growth, deletion and a write through a pre-existing alias left the other name wrong | Preserve inode identity and repair recorded aliases | `regression_grow_delete_and_write_a_preexisting_alias` |
-| Repeated writes around an alias deletion left a frozen restored alias at an intermediate version | Track original and actual identities during recovery | `regression_repeated_write_after_alias_deletion_repairs_both_names` |
-| The same frozen-alias failure occurred after a rename | Relocate recovery lineage with names | `regression_repair_alias_after_rename_and_later_write` |
-| Equal-length truncate after an earlier copy omitted an alias and its changed mtime | Record a modify effect using the existing full pre-image | `regression_rename_over_alias_then_equal_length_truncate` |
-| Undoing a newer command detached an alias needed by the older command | Retain validated lineage and inode handles across undo folders | `regression_alias_lineage_survives_undo_of_a_newer_command` |
-| GC could remove the last good copy when a later command changed an older retained hard link | Refuse collection before mutation when retained pre-images changed; preserve all recovery copies and report why | `tests/retention.rs`: `gc_keeps_a_newer_copy_when_an_older_retained_hard_link_was_changed` |
-| R2 recheck: nested directory exchanges left undo observations at old paths and blocked an older undo | Relocate observations and record final names; freeze the input map for idempotent publication | `regression_directory_observations_follow_exchanges_of_ancestors`, `resumed_directory_observations_are_not_exchanged_twice`, `restored_directory_observations_reject_later_user_edits` |
-
-The forced memory-fallback check also found a supervisor killed during a log
-write. Only a dead incomplete exec may recover its complete prefix. The raw
-log stays byte for byte. Completed or live journals still refuse that damage.
-`tests/capture.rs`: `killed_command_recovers_only_complete_intents_and_keeps_the_raw_tail`
-is the named regression. A related retained-version check now separates immutable
-numeric snapshots from mutable inode handles, proved by
-`preserved_created_hard_link_is_immutable_after_later_write`.
-
-The harness itself also needed corrections. openat2 is intentionally blocked in
-the filtered command, so the driver now walks pinned parents with openat and
-O_NOFOLLOW. Truncate uses a checked fixture pathname instead of a proc magic
-link. A smoke test proves actual creation and symlink writes occur. Fixture ids
-include a short timestamp because sandbox PID namespaces can reuse process ids;
-the short form also fits Unix socket path limits. The interruption oracle was
-restricted to the current command's recovery locations.
+|---|---|---|---|
+| 0 | Build main first into a separate target | PASS | Main e138ea2; cargo build --release --locked --target-dir target/baseline-m4; provenance.json |
+| 1 | Every workload, both wake modes, normal and CPUs 0,1, medians of three | PASS | scripts/overhead.sh; baseline.json and m5.json |
+| 2 | Added delete cost below 25 us | PASS, 19.01/18.77 us | Final timing table |
+| 3 | Added create cost below 25 us | PASS, 18.48/16.82 us | Final timing table |
+| 4 | Added rename-over cost below 25 us | ACCEPTED LIMIT, 25.31/88.75 us | Final timing table; user review passed 2026-11-18 |
+| 5 | Read-only workloads unchanged | PASS | Stat and git-status rows; argument-aware filter tests |
+| 6 | Same-mount rescue undo below five seconds | PASS, max median 4.561 s | Separate timers and exact file snapshots |
+| 7 | Cross-mount restore remains proportional | PASS, 2.20x undo for 2x files | 30,000 and 60,000 file measurements |
+| 8 | Existing suite passes | PASS, 176 tests | cargo test --locked |
+| 9 | Unchanged interrupted-undo property at 256 cases | PASS, 47.42 s | SAQTA_HARNESS_CASES=256 cargo test --locked --test harness; 29 tests |
+| 10 | Forced proc-memory run | PASS | Capture and speed suites with SAQTA_FORCE_PROC_MEM=1 |
+| 11 | Exec invalidation, including a readable retained old mm | PASS | exec_between_deletes_reads_the_new_address_space; exec_invalidates_readable_old_mm_retained_by_clone_vm |
+| 12 | Actual PID reuse, pidfd and proc-stat fallback | PASS | reused_pid_reads_the_new_process_memory, prints reused PID in both modes |
+| 13 | Root, cwd and numbered dirfd changes | PASS | chroot_between_deletes_uses_the_new_root; fchdir_between_deletes_invalidates_cached_cwd; directory_fd_reuse_and_cwd_rename_use_fresh_parents |
+| 14 | Mount change and pins do not block unmount | PASS | bind_mount_change_on_cached_device_still_captures_the_new_file; skipped_filesystem_cache_does_not_keep_a_mount_busy |
+| 15 | Partial plans retained; damaged complete plans refuse | PASS | resume_keeps_a_partial_plan_tail_and_replays_the_last_complete_plan; malformed_complete_plan_refuses_resume_without_mutations |
+| 16 | Cross-mount source removal can resume | PASS | cross_mount_publication_resumes_after_source_removal |
+| 17 | Positive batching preserves crash replay and rejects damage | PASS | unpublished_positive_batch_keeps_failed_outcomes_and_recovers_successes; damaged_published_positive_batch_refuses_undo |
+| 18 | Interrupted grouped intents keep both original names | PASS | unacknowledged_rename_batch_prefix_preserves_both_original_names |
+| 19 | Shared created alias repairs surviving inode | PASS | regression_write_new_alias_after_removing_origin_repairs_surviving_inode; saved seed f7c0d98c... |
+| 20 | Formatting, clippy, release configuration and bundle | PASS | scripts/review-bundle.sh m5-speed |
+| 21 | Mount identity separates stacked filesystem decisions; uncached fallback | PASS; backing-device collision subcase SKIP on this kernel | overlay_backing_device_does_not_reuse_tmpfs_skip_decision |
 
 ## Decisions
 
-- [0009: resumable undo](../docs/decisions/0009-resumable-undo.md): replayable actions, alias lineage and process-crash guarantees.
-- [0010: retention](../docs/decisions/0010-retention.md): collection order, protection, expiry and daily scheduling.
-- [0011: incremental index](../docs/decisions/0011-incremental-index.md): changed-journal imports and append interception.
+- [0016](../docs/decisions/0016-bounded-task-context-cache.md): task identity, context barriers, bounded memory and root caches, and filesystem pins.
+- [0017](../docs/decisions/0017-append-plans-and-batched-checkpoints.md): write plans before mutation and publish periodic checkpoints.
+- [0018](../docs/decisions/0018-linear-path-bookkeeping.md): subtree updates, post-state buffering and shared aliases.
+- [0019](../docs/decisions/0019-batch-only-positive-outcomes.md): positive batches preserve the unknown-equals-true replay rule.
+- [0020](../docs/decisions/0020-write-one-notifications-effects-together.md): one stopped syscall's effect lines share a write.
+- [0021](../docs/decisions/0021-key-filesystem-decisions-by-mount.md): distinguish overlay and backing mounts, with uncached fallback.
 
-- [0012: unacknowledged tail](../docs/decisions/0012-unacknowledged-tail.md): preserve a killed writer's raw log and qualify prefix recovery.
-- [0013: bulk undo checkpoints and diagnostics](../docs/decisions/0013-bulk-undo-checkpoints-and-diagnostics.md): combine redundant checkpoints, retain short ordinary deadlines and measure actual replies on timeout.
-- [0014: artifact provenance and fault readiness](../docs/decisions/0014-artifact-provenance-and-fault-readiness.md): isolate builds, verify the executable, and synchronize each injected fault.
-- [0015: directory observation relocation](../docs/decisions/0015-relocate-directory-observations.md): follow reverse moves and reuse a frozen input map on resume.
+No dependencies were added or changed. S remains single threaded. A thread pool
+would not shorten the serialized one-notification-at-a-time workloads, and
+would add ordering and shared-inode obligations.
 
 ## Measurements
 
-Machine: AMD Ryzen 9 9900X, 24 logical CPUs, ext4 on WSL2.
-Kernel: `6.18.58.1-microsoft-standard-WSL2`, x86_64.
-Toolchain: rustc 1.100.0 and cargo 1.100.0. Measurements use debug builds.
+Machine: AMD Ryzen 9 9900X, 24 logical CPUs, WSL2 x86_64, ext4.
+CPUs 0 and 1 are the two SMT threads of core 0.
+Kernel: 6.18.58.1-microsoft-standard-WSL2. Rust: stable 1.100.0.
+Measurements ran inside the Codex sandbox. M4 was built from main e138ea2 before
+production changes, using target/baseline-m4. Experimental snapshots used their
+own target directories. M5 uses target/m5-speed. provenance.json records binary
+and source hashes. The final M5 timing pass ran without concurrent test jobs.
+The dependency audit uses a disposable snapshot of the cached advisory database
+under target/saqta-tests. Its policy is unchanged, and it does not take a lock
+in the real home directory.
 
-- Recorded green full-suite run: 151 tests, 27.76 seconds across test binaries. The final bundle repeats the final source checks.
-- Default harness with pre-existing hard links and immutable post snapshots: 24 tests, 15.96 seconds in that green run.
-- Extended run with pre-existing hard links: 128 cases per property, all 22 tests passed in 27.52 seconds.
-- Earlier extended run: 256 cases per property passed before the pre-existing alias fixture was added.
-- 70,000-effect first import: 695 ms. Cached log: 4.55 ms; show: 2.42 ms; one-file undo: 8.69 ms. The test asserts only a generous two-second sanity bound and separately rejects any unchanged-effect reimport with a SQLite trigger.
-- Scheduling background GC from log: 42.4 ms including normal log work.
-- Existing 5,000-file cross-mount deletion and undo: 3.56 seconds.
-- Existing 500-file undo after stdout closes: 359 ms normally and 317 ms with verbose output.
+Every table cell is the median of three fresh fixtures. Setup, hashing and
+cleanup are untimed. Capture and undo have separate timers. Every rescue undo
+is checked against its complete pre-command file snapshot: mode, mtime and
+SHA-256 bytes.
 
-### R1: Ubuntu 22.04 timeout investigation
+Rescue has 60,000 project files in 1,800 leaf directories, plus Git metadata
+and the tracked ignore file. It contains 600 dirty tracked files, 39,600
+untracked files and 19,800 ignored files, from empty to 64 KiB. Git uses
+--no-optional-locks. The cross-mount worker binds SAQTA_HOME separately and
+retains that namespace for both capture and undo, exercising EXDEV in both
+directions. Affinity applies to each timed command and undo. Namespace setup
+is untimed.
 
-The [failed CI job](https://github.com/Alpi157/saqta/actions/runs/44053076770/job/133935447902)
-reports only `command 5197 timed out`. It does not record the command arguments,
-phase or process state. Local constrained runs reproduce a bulk undo slowdown;
-none hangs. This supports slowness as the explanation, but cannot retrospectively
-prove what that CI process was doing. The new diagnostics remove that ambiguity
-on the next timeout.
+All times in the next two tables are milliseconds. Capture includes startup and final publication.
 
-M3 is `main` at `73eb644`, in the detached worktree `target/m3-r1`. M4 is
-`663fb2c` before R1 edits. Both use debug builds on the machine and kernel above,
-with `taskset -c 0,1` and `SAQTA_NO_SYNC_WAKE=1`. M3 received test instrumentation
-only, preserved as `evidence/m3-timing.patch`. The first six runs alternated M3
-and M4, with no overlapping benchmark processes. R1 then ran three times.
-The fixtures originally cleared `SAQTA_NO_SYNC_WAKE`; this test now deliberately
-passes it through. Every log confirms `no_sync=true` and CPU affinity `0-1`.
-R1 also enables the new debug reply observations.
+CPU affinity: all.
 
-All values are seconds. Fixture includes the namespace probe, creating 5,000
-files and hashing them. Inspect is `log` plus `show`. Verify hashes the restored
-tree, including bytes, mode, size and file mtime. Total sums all five phases.
+| Workload | M4 bare | M5 bare | M4 no sync | M5 no sync | M4 sync | M5 sync |
+|---|---:|---:|---:|---:|---:|---:|
+| deletes | 213.8 | 201.4 | 3297.3 | 2463.9 | 1580.1 | 869.1 |
+| creates | 1061.6 | 980.5 | 5232.5 | 3607.2 | 2819.6 | 1623.7 |
+| rename-overs | 492.2 | 475.4 | 5562.8 | 3294.1 | 3788.0 | 1522.3 |
+| read-only stats | 47.5 | 40.6 | 46.5 | 45.1 | 50.1 | 45.5 |
+| git status | 45.1 | 45.0 | 47.5 | 44.1 | 49.6 | 56.3 |
+| clean cargo build | 7458.7 | 6582.1 | 7814.8 | 6970.6 | 7087.7 | 6866.2 |
+| rescue | 799.3 | 750.0 | 16253.9 | 8271.0 | 11432.7 | 3303.2 |
+| rescue-cross-mount | 745.8 | 750.6 | 19297.0 | 12119.9 | 13712.9 | 6356.6 |
 
-| Version | Run | Fixture | Delete under Saqta | Inspect | Undo | Verify | Total |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| M3 | 1 | 0.442 | 1.708 | 0.411 | 0.364 | 0.051 | 2.977 |
-| M3 | 2 | 0.452 | 1.844 | 0.382 | 0.366 | 0.056 | 3.100 |
-| M3 | 3 | 0.418 | 1.767 | 0.360 | 0.355 | 0.053 | 2.953 |
-| M4 before R1 | 1 | 0.267 | 1.374 | 0.333 | 3.992 | 0.054 | 6.020 |
-| M4 before R1 | 2 | 0.269 | 1.431 | 0.320 | 3.011 | 0.051 | 5.082 |
-| M4 before R1 | 3 | 0.271 | 1.377 | 0.269 | 1.913 | 0.048 | 3.877 |
-| M4 with R1 | 1 | 0.278 | 1.386 | 0.293 | 2.145 | 0.052 | 4.153 |
-| M4 with R1 | 2 | 0.461 | 1.817 | 0.308 | 2.097 | 0.051 | 4.734 |
-| M4 with R1 | 3 | 0.278 | 1.426 | 0.323 | 1.823 | 0.052 | 3.903 |
 
-M4's median delete was 1.377 s versus M3's 1.767 s. Its median undo grew from
-0.364 s to 3.011 s. R1 reduces that to 2.097 s, a 30% reduction. Storage and cache
-variation are visible in the individual runs; three samples are not a precise
-throughput estimate.
 
-The bind-mounted store forces `EXDEV` during capture, so deletion keeps copies.
-After the mount namespace exits, undo can rename those copies on the same
-filesystem. M4 added replayable plans and inode checks that repeat secure parent
-walks for each restored entry, plus directory and alias observations. M3 already
-used secure parent walks, but kept the quarantine directory open and moved the
-saved files without recovery checkpoints. Incremental import makes inspection
-faster here; the measured regression is in undo.
+CPU affinity: 0,1.
 
-For 5,000 simple deletions, M4 replaced `state.json` 10,001 times: an initial
-checkpoint, then a plan and completion per file. R1 needs 5,002 replacements:
-initial state, each plan incorporating the preceding completion, and one final
-completion. No mutation runs before its plan is saved. Killing undo before the
-next save replays the previous action using its persisted identity. The named
-three-delete regression aborts at every restored file and checks exact resume;
-the existing interruption properties and exchange regressions remain unchanged.
+| Workload | M4 bare | M5 bare | M4 no sync | M5 no sync | M4 sync | M5 sync |
+|---|---:|---:|---:|---:|---:|---:|
+| deletes | 219.9 | 199.7 | 3419.4 | 2461.3 | 1507.2 | 879.2 |
+| creates | 961.7 | 996.5 | 5346.6 | 3608.0 | 2745.9 | 1644.3 |
+| rename-overs | 515.1 | 525.8 | 5618.8 | 3313.0 | 4789.9 | 2552.5 |
+| read-only stats | 40.7 | 41.8 | 46.4 | 48.0 | 46.0 | 47.8 |
+| git status | 47.6 | 37.5 | 86.8 | 80.2 | 43.1 | 52.0 |
+| clean cargo build | 9921.8 | 10102.7 | 10355.8 | 10532.6 | 11314.9 | 10329.9 |
+| rescue | 744.9 | 760.2 | 15039.6 | 8283.3 | 10557.2 | 3254.6 |
+| rescue-cross-mount | 765.9 | 762.7 | 19784.4 | 12097.1 | 14075.6 | 6419.4 |
 
-Median delete + inspect + undo remains about 54% slower than M3 after R1.
-Per-effect atomic plan replacement and repeated secure pathname checks remain
-the main structural costs. Further plan batching or directory descriptor reuse
-needs more recovery and rename-race design; record this for the performance
-milestone. The cheap redundant completion writes are removed now.
 
-This reproduces two-CPU affinity and the no-sync listener path. It does not
-emulate Azure storage latency, CPU speed or Ubuntu 22.04's older kernel. All
-nine runs restored exactly. No product hang or data-loss bug was found in R1.
 
-Reproduction after applying the included measurement-only patch to M3:
+Rescue undo, seconds. Every cell is a median of three. Undo runs without the supervisor; wake-up columns identify the preceding capture.
 
-```sh
-taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --manifest-path target/m3-r1/Cargo.toml --target-dir target/r1-m3-build --test codex separate_bind_mount_five_thousand_deletes_restore -- --exact --nocapture --test-threads=1
-taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test codex separate_bind_mount_five_thousand_deletes_restore -- --exact --nocapture --test-threads=1
-```
+| CPUs | Workload | M4 no sync | M5 no sync | M4 sync | M5 sync |
+|---|---|---:|---:|---:|---:|
+| all | rescue | 19.671 | 4.129 | 19.769 | 4.375 |
+| all | rescue-cross-mount | 31.105 | 16.625 | 31.863 | 17.394 |
+| 0,1 | rescue | 21.793 | 4.561 | 21.040 | 4.020 |
+| 0,1 | rescue-cross-mount | 37.834 | 19.942 | 37.984 | 19.976 |
 
-The four diagnostic tests inject an answering supervisor, a stopped supervisor,
-an orphan holding stdout, and a stopped resume of an older command. In the
-constrained run, the active supervisor produced replies during the sample. The
-stopped supervisor showed state `T`, a tracee waiting in seccomp and zero reply
-progress. The older undo report found its real recovery checkpoint and map.
-Every injected timeout killed its remaining owned processes. CI uploads these
-private diagnostic files on failure. A zero reply delta alone is reported as
-observed inactivity, since one long filesystem operation can also cause it.
-Parallel fault injection initially exposed a cleanup-helper bug: stopped commands
-in the test runner's shared group could trigger an orphan-group SIGHUP. Giving
-each helper command its own group fixes it; both parallel and constrained serial
-diagnostic runs now pass. No product signal behavior was changed.
 
-R1 verification outside the sandbox: all 156 tests passed in 30.0 seconds across
-the test binaries. Forced proc-memory fallback passed all 57 capture tests. The
-two-CPU bulk and diagnostic checks, formatting, clippy, release configuration,
-doctor and offline cargo-deny all passed. The first bundle's only check failure
-was the advisory-cache lock on a read-only path; the outside-sandbox repeat passed.
 
-### R2: missing observations in the normal terminal
+The following per-operation values exclude startup and final snapshots. Each sample is the median of 20,000 timed operations; each cell is the median of three samples. Names are prepared before the clock. Create includes open, write and close. Added cost subtracts the corresponding bare median. Raw nanosecond arrays are retained in latency.json.
 
-The unmodified tests reproduced the same three failures both outside and inside
-the sandbox: one passed, three failed, in 1.50 s and 1.47 s respectively. The
-user's original `target/timeouts-local.log` is preserved in the bundle. The
-earlier sandbox and CI passes used a fresh executable.
+| CPUs | Operation | Bare us | M4 no sync | M5 no sync | M4 sync | M5 sync | M5 added sync us |
+|---|---|---:|---:|---:|---:|---:|---:|
+| all | deletes | 8.630 | 144.843 | 100.652 | 51.841 | 27.640 | 19.010 |
+| all | creates | 37.230 | 183.393 | 143.523 | 79.442 | 55.711 | 18.481 |
+| all | rename-overs | 20.261 | 203.504 | 151.553 | 107.097 | 45.571 | 25.310 |
+| 0,1 | deletes | 8.670 | 133.673 | 110.462 | 53.731 | 27.441 | 18.771 |
+| 0,1 | creates | 38.731 | 173.163 | 148.263 | 83.371 | 55.547 | 16.816 |
+| 0,1 | rename-overs | 20.711 | 205.974 | 148.112 | 177.404 | 109.462 | 88.751 |
 
-The failing executable was from the standalone R1 commit-validation snapshot.
-That validation used `--manifest-path target/r1-commit-check-bj57wulg/Cargo.toml
---target-dir target`, which overwrote the branch's executable and build cache.
-This was an agent validation mistake. Cargo reported a fresh test build in
-0.02 s and kept running the older executable. Its SHA-256 was
-`c32b1f413130a29d20c781a7be72b1ade50b90e555ea97cf9dc62157c2de28ec`.
-The binary contained the snapshot's manifest path and lacked
-`notification_progress`. There was no observation file in any failing command,
-although effects, debug logs, process samples and undo checkpoints were present.
-The helper was reading the correct journal path from the wrong executable.
 
-`cargo clean -p saqta` removed the contaminated crate artifacts. Rebuilding the
-branch restored observations. This did not require any change to capture or to
-the observation writer. The permanent guard now rejects an older or foreign
-executable before starting workloads and gives the clean/rebuild command.
-`foreign_build_is_rejected_before_fault_injection` runs the real provenance
-endpoint against an expected foreign checkout and verifies rejection. New
-review builds and future snapshot checks use separate target directories.
 
-The environment comparison below comes from the recorded executions. Fixture
-variables have the same controlled values. Namespace differences are real but
-did not account for the failure: both environments failed with the stale binary
-and passed after rebuilding it.
+Cross-mount scaling with synchronous wake-up, unrestricted CPUs. Seconds, medians of three. Scaling and per-operation comparisons use the retained immutable M4 binary after implementation.
 
-| Detail | Sandboxed | Approved outside-sandbox run |
-| --- | --- | --- |
-| Test process PID in the context sample | 250 | 1752426 |
-| PID namespace | `4026532473` | `4026532215` |
-| Mount namespace | `4026532471` | `4026532216` |
-| User namespace | `4026532533` | `4026531837` |
-| NoNewPrivs / Seccomp / filter count | 1 / 2 / 1 | 0 / 0 / 0 |
-| CPU affinity | 0-23 | 0-23 |
-| Fixture SAQTA_DEBUG / SAQTA_NO_SYNC_WAKE | 1 / 1 for supervised cases | 1 / 1 for supervised cases |
-| HOME, XDG and SAQTA_HOME | Unique fixture folders under `target/saqta-tests` | Same layout, distinct fixture ids |
-| `/proc` state, wchan, cmdline and journal reads | Readable, PIDs match the supervisor | Readable, PIDs match the supervisor |
-| Observation file before rebuilding | Absent | Absent |
-| Observation file after rebuilding | Present, forty bytes, replies advance | Present, forty bytes, replies advance |
+| Files | M4 capture | M5 capture | M4 undo | M5 undo |
+|---:|---:|---:|---:|---:|
+| 30000 | 5.477 | 3.162 | 13.642 | 7.902 |
+| 60000 | 13.713 | 6.357 | 31.863 | 17.394 |
 
-Readiness no longer depends on completing setup in 350 ms. Each readiness
-condition has the ordinary ten-second bound and diagnoses failure before
-cleanup. The actual injected timeout remains 350 ms. The answering supervisor
-must first publish two successful replies. The stopped supervisor is confirmed
-in state T before stdin releases its tracee, which must then reach seccomp wait.
-The undo stops itself before changing data; the orphan case waits for wrapper
-exit. Reports separate setup from the fault window while retaining total elapsed.
-All original reply, process-state, recovery-map, cleanup and exact-restore
-assertions remain. No missing-record condition counts as success.
 
-Loaded checks used three independent runs per configuration with the default
-parallel test runner. CPU workers were Python processes doing an infinite busy
-loop, pinned to the same CPUs as Cargo and the tests, then terminated and reaped.
-The bundle includes `evidence/r2/timeout-load.py`; run it from the repository root
-to repeat the load check. The stopped-supervisor setup deliberately includes a
-500 ms startup delay, followed by explicit handshakes. Recorded setup reached
-520.6 to 534.3 ms under load, beyond the old spawn-relative deadline.
+Doubling files multiplies M5 cross-mount undo by 2.20.
 
-| R2 check | Runs / tests per run | Results | Wall time per Cargo invocation |
-| --- | --- | --- | --- |
-| CPUs 0-23 with 24 CPU workers | 3 / 5 | All pass | 2.933, 2.174, 2.172 s |
-| CPUs 0-1 with 4 CPU workers | 3 / 5 | All pass | 3.673, 3.573, 3.623 s |
-| Whole suite, sandboxed | 1 / 160 | All pass | 32.10 s across test binaries |
-| Whole suite, approved outside run | 1 / 160 | All pass | 32.21 s across test binaries |
+The first exploratory fixture used 20,400 dirty tracked files instead of 600.
+Its first M4 no-sync sample measured capture 162.398 s and undo 211.485 s,
+before production changes. This exposed whole-set scans and is retained in
+heavy-initial-baseline.*. It is separate from the fixed three-run comparison.
+Baseline collection continued against unchanged M4 code while development used
+an isolated snapshot. The fixed baseline therefore includes development load.
 
-Both full runs used `cargo test --locked`. The sandbox explicitly skipped the
-Unix socket fixture and bare i386 comparison; those checks ran outside. Both
-runs explicitly skipped the privileged tmpfs mount. Source, release configuration,
-forced proc-memory fallback, constrained tests and audit are also checked by the
-R2 review bundle. No notification-writer or data-loss bug was found. The final
-recheck did find and fix the independent product refusal below.
+Supervisor-only affinity did not consistently help. Its two-CPU rename added
+cost was 55.81 us versus 51.79 us without that change. The experiment was
+rejected and is absent from the final source.
 
-### R2: additional saved-seed regression found during final verification
-
-The final bundle rerun found seed
-`26546bdf3fd3d1ff372af8e24943c20281dcfb1ffc02479370ed72ed4abab538`.
-The retained seed has twelve operations; the named regression reduces it to four:
-exchange `d1` with `d0/f0`, exchange `d4` with `d0`, exchange `d5` with `d4/f0`,
-then unlink `d5/f0`. Splitting these across three commands and undoing newest
-first restored each newer tree but falsely refused the oldest undo.
-
-Directory mtime changes caused by restoring the deleted child were recorded at
-an intermediate path. Moving its ancestor left that observation behind.
-`reverse_names` now supplies the same path mapping for directory observations
-and inode origins. Unchanged observation values move with their names. Newly
-restored directories are observed at their final names. Conflict comparisons
-remain strict; a regression creates later user work and proves refusal preserves
-it byte for byte.
-
-Undo saves the original observation map once in its private folder. Replaying
-finalization derives from that frozen map, including after publishing the home
-map. `resumed_directory_observations_are_not_exchanged_twice` aborts at exactly
-that boundary using a debug hook, resumes, then successfully undoes the older
-command. Both the two-command and three-command exact-tree cases remain as a
-named regression. The initial failing log is in `evidence/r2/`.
+M2's code inventory counted 29 calls per steady-state deletion and 26 per
+creation, including deferred outcome and the event loop. M5's warm simple-name
+path with cached cwd uses about 12 and 11: outer poll, receive, prior outcome
+stat, pidfd poll, memory pread, two validity ioctls, cwd readlink, final stat,
+optional link, effect write and reply. Numbered dirfds, cold caches, multiple
+pages, errors and context changes add calls. This is a code inventory, not
+strace. Positive publication and final snapshots are command-end work. The
+timing table includes them.
 
 ## Known gaps and risks
 
-- These finite properties are evidence within the generated model, not a mathematical proof over every syscall and filesystem race. Metadata-only operations, shared-subtree races between processes, skipped filesystems and failed captures remain outside that model.
-- First index import or rebuilding journal.db still scales with effects. The steady-state target is met; a cold 70,000-effect import takes about 0.7 seconds here.
-- Recovery checkpoints guarantee process-crash replay. They do not add power-loss durability. The existing synced displacement map remains. Older partial undos without an M4 plan require manual recovery.
-- Hard links may return as separate files. Recorded lineage restores bytes across tested command boundaries. External edits during recovery can require manual inspection rather than automatic completion.
-- Cross-filesystem moves of nonempty directories can refuse. Entries and recovery copies remain available.
-- Retention size counts logical bytes in `cmd/` and `q/`, once per inode. It excludes the rebuildable index and diagnostic logs. Protected commands, incomplete journals and orphaned recovery content may keep retained size over the limit.
-- Any in-progress undo defers GC to protect shared inode handles in older undo folders.
-- GC refuses when an older retained hard link has changed. This preserves a good copy held by another command. Undo newer commands first or inspect the recovery copies. Background refusals appear in status.
-- Ordinary retention tests run inside physical `target/` fixtures. The mixed source/cache test temporarily gives only its stored effect paths a synthetic prefix to test classification, then restores the real paths before undo. No syscall executes against that prefix.
-- Sandboxed runs skipped Unix sockets, tmpfs mounting and the bare i386 comparison with explicit SKIP messages. The green bundle outside the sandbox ran the socket and i386 checks. Tmpfs mounting still requires privileges and was skipped. See the bundle for exact skips.
-- The original five M4 commits and both R1 commits remain unchanged. R2 changes are uncommitted and have not run remotely.
-- Bulk undo still exceeds M3 by more than 25% under the constrained setup. The remaining per-effect recovery cost is recorded above for the performance milestone.
+- Rename-over remains above 25 us, including on two SMT siblings. The user accepted this known performance limit when review passed on 2026-11-18. README records the measurements.
+- One task cache deliberately gives up hits when other tids intervene. Numbered dirfds reopen for each notification.
+- CONTINUE retains the existing races with unrelated filesystem changes and hostile argument mutation. No broader security or power-loss guarantee is claimed.
+- New interrupted undo logs need the M5 resume reader. M5 still reads older state.json-only recovery plans.
+- Unpublished positive outcomes remain unknown to inspection. Replay already treats them as applied. Failed outcomes stay explicit immediately.
+- The OverlayFS collision configuration is unavailable on this kernel. Overlay capture and the no-mount-ID fallback both ran and restored bytes.
+- The fixed rescue has 600 dirty tracked files. The first, much larger dirty tracked population was not measured three times.
+- Cross-mount regular-file copying remains more expensive. Existing refusals for nonempty directory and special-file cross-filesystem copies remain.
+- Hard-link freezing and origin tracking retain their existing full-set scans. These timings do not characterize those workloads.
+- Exact conditional skips are retained in validation logs.
 
 ## Questions for review
 
-Review the executable provenance check, readiness handshakes and separate build
-directories. The 350 ms fault deadline and every original assertion remain.
-The existing recovery, retention and bulk-performance review remains relevant.
+- Check the single-issuer cache barrier against concurrent exec, CLONE_FS and nonleader exec.
+- Check positive-only batching across supervisor death and index rebuilds.
+- Check checkpoint publication before truncation, incomplete-frame retention and cross-mount resume after source removal.
+- The rename-over target remains unmet. Review accepted the measured limit without weakening capture or undo guarantees.
 
-### Follow-up commit plan after R2 review passes
+## Commit plan
 
-Keep the five M4 commits and both R1 commits unchanged. Add one commit:
+The user approved review and this five-commit plan on 2026-11-18. Each staged
+snapshot is validated with its own Cargo target directory before committing.
 
-1. `test: fix timeout provenance and directory observation regressions`
+1. perf: add repeatable rescue and capture measurements, binary selection and raw samples.
+2. capture: cache task context behind lifecycle barriers, including syscall wrappers and cache tests.
+3. capture: bound path bookkeeping and batch safe journal writes, including the alias fix and crash tests.
+4. undo: append plans and reuse locked store parents, including diagnostics and interrupted cross-mount tests.
+5. docs: report M5 results and package validation, including decisions and review checks.
 
-The first bundle caught the partial-log recovery bug above. Its audit also hit
-a sandbox read-only advisory-cache lock. `cargo deny --offline check` passed
-outside the sandbox. The final bundle is rerun with that cache lock available.
-
-Include decisions 0014 and 0015 and the updated report. Commit only after the user says R2
-review passed. Do not push.
+Each code commit includes its relevant test hunks. The mixed speed tests are
+split by feature when staging. This plan does not include a push.

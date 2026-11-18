@@ -51,7 +51,29 @@ check() {  # check <name> <command...>: run, keep full output, record PASS or FA
 check fmt cargo fmt --all -- --check
 check clippy cargo clippy --all-targets --locked -- -D warnings
 check test cargo test --locked
-if [[ "$milestone" == m2-capture* || "$milestone" == m2b-undo* || "$milestone" == m3-codex* || "$milestone" == m4-harness* ]]; then check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture; fi
+if [[ "$milestone" == m2-capture* || "$milestone" == m2b-undo* || "$milestone" == m3-codex* || "$milestone" == m4-harness* || "$milestone" == m5-speed* ]]; then check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture; fi
+if [[ "$milestone" == m5-speed* ]]; then
+  check harness-256 env SAQTA_HARNESS_CASES=256 cargo test --locked --test harness
+  check proc-cache env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test speed
+  check release cargo check --release --locked
+  if command -v taskset >/dev/null 2>&1 && taskset -c 0,1 true; then
+    check bulk-two-cpu taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test codex separate_bind_mount_five_thousand_deletes_restore -- --exact --nocapture --test-threads=1
+    check timeouts-two-cpu taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test timeouts -- --test-threads=1
+  else
+    echo "SKIP: taskset or CPUs 0,1 unavailable for constrained checks" >> "$summary"
+  fi
+  if [ -d target/m5-evidence ]; then
+    mkdir -p "$out/evidence"
+    if ! cp target/m5-evidence/baseline.* target/m5-evidence/m5.* \
+      target/m5-evidence/heavy-initial-baseline.* target/m5-evidence/provenance.json \
+      target/m5-evidence/m4-alias-regression.json target/m5-evidence/latency.* \
+      target/m5-evidence/scaling-* target/m5-evidence/final-harness-256.log \
+      target/m5-evidence/final-forced.log target/m5-evidence/final-full.log "$out/evidence/"; then
+      echo "evidence FAIL: could not copy every M5 measurement artifact" >> "$summary"
+      failed=1
+    fi
+  fi
+fi
 if [[ "$milestone" == m4-harness-r1* || "$milestone" == m4-harness-r2* ]]; then
   check release cargo check --release --locked
   if command -v taskset >/dev/null 2>&1 && taskset -c 0,1 true; then
@@ -86,7 +108,7 @@ if cargo run -q --locked -- doctor --help >/dev/null 2>&1; then check doctor doc
 if command -v cargo-deny >/dev/null 2>&1; then
   advisory_dbs=("${CARGO_HOME:-$HOME/.cargo}"/advisory-dbs/*/.git)
   if [ -d "${advisory_dbs[0]}" ]; then
-    check deny cargo deny --offline check
+    check deny python3 scripts/deny-offline.py
   else
     check deny cargo deny --offline check licenses bans sources
     echo "SKIP: advisory database not fetched; run cargo deny fetch outside the sandbox" >> "$summary"
