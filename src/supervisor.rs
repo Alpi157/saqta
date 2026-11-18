@@ -6,6 +6,76 @@ use crate::{
     journal::Journal,
     sys,
 };
+use std::{
+    collections::HashSet,
+    ffi::{CStr, CString, OsStr},
+    fs, io,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    path::{Path, PathBuf},
+};
+
+fn proc_directory(path: &CStr, flags: i32) -> io::Result<std::os::fd::OwnedFd> {
+    sys::open_at(
+        libc::AT_FDCWD,
+        path,
+        libc::O_PATH | libc::O_DIRECTORY | flags,
+        0,
+    )
+}
+
+fn proc_parent(directory: &Path) -> io::Result<u32> {
+    let status = fs::read(directory.join("status"))?;
+    status
+        .split(|&b| b == b'\n')
+        .find_map(|line| {
+            std::str::from_utf8(line.strip_prefix(b"PPid:")?)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .ok_or_else(|| io::Error::other("missing or invalid PPid in proc status"))
+}
+
+/// A subreaper remains an ancestor after its command daemonizes. Any failed
+/// proc read leaves release unable to establish that it is outside that tree.
+pub fn in_ancestry() -> io::Result<bool> {
+    let mut task = proc_directory(c"/proc/self", 0)?;
+    let executable = fs::metadata("/proc/self/exe")?;
+    let directory = |fd| PathBuf::from(format!("/proc/self/fd/{fd}"));
+    let mut parent = proc_parent(&directory(task.as_raw_fd()))?;
+    let mut seen = HashSet::new();
+    while parent != 0 {
+        if !seen.insert(parent) {
+            return Err(io::Error::other("cyclic proc ancestry"));
+        }
+        // Pin the proc directory so subsequent reads cannot follow a reused PID.
+        let path = CString::new(format!("/proc/{parent}"))?;
+        let ancestor = proc_directory(&path, libc::O_NOFOLLOW)?;
+        let proc = directory(ancestor.as_raw_fd());
+        let arguments = fs::read(proc.join("cmdline"))?;
+        if arguments.split(|&b| b == 0).nth(1) == Some(b"__supervisor") {
+            let link = proc.join("exe");
+            let image = fs::read_link(&link)?;
+            if matches!(image.file_name(), Some(name) if name == OsStr::new("saqta") || name == OsStr::new("saqta (deleted)"))
+            {
+                return Ok(true);
+            }
+            let image = fs::metadata(link)?;
+            if (image.dev(), image.ino()) == (executable.dev(), executable.ino()) {
+                return Ok(true);
+            }
+        }
+        let next = proc_parent(&proc)?;
+        if proc_parent(&directory(task.as_raw_fd()))? != parent {
+            return Err(io::Error::other("process reparented during release check"));
+        }
+        task = ancestor;
+        parent = next;
+    }
+    Ok(false)
+}
+
 fn report(fd: i32, status: i32, detached: bool, message: &str) {
     let mut msg = [0u8; 12];
     msg[..4].copy_from_slice(&status.to_ne_bytes());
@@ -321,8 +391,9 @@ fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut
             }
             let (reported, message) = if !final_now
                 && capture.policy.is_some()
-                && assess(capture, 0).is_ok_and(|(_, decision)| decision.rule().is_some())
-            {
+                && assess(capture, 0).is_ok_and(|assessment| {
+                    assessment.is_some_and(|(_, decision)| decision.rule().is_some())
+                }) {
                 sys::freeze_tree();
                 let result = match capture.background() {
                     Ok(mut background) => {
@@ -415,12 +486,14 @@ fn settle(
 fn assess(
     capture: &Capture,
     after: u64,
-) -> anyhow::Result<(crate::journal::Record, classify::Decision)> {
+) -> anyhow::Result<Option<(crate::journal::Record, classify::Decision)>> {
+    let Some(policy) = &capture.policy else {
+        return Ok(None);
+    };
+    if !capture.needs_rule_evaluation(after) {
+        return Ok(None);
+    }
     let j = &capture.journal;
-    let policy = capture
-        .policy
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("rules are off"))?;
     let record = crate::journal::load(&j.home, j.meta.id)?;
     let decision = classify::evaluate(
         &record,
@@ -430,7 +503,7 @@ fn assess(
         capture.tripped(),
         after,
     )?;
-    Ok((record, decision))
+    Ok(Some((record, decision)))
 }
 
 fn evaluate(
@@ -448,7 +521,9 @@ fn evaluate(
     } else {
         after
     };
-    let (record, decision) = assess(capture, after)?;
+    let Some((record, decision)) = assess(capture, after)? else {
+        return Ok(None);
+    };
     let id = j.meta.id;
     if let Some(rule) = decision.rule() {
         if finish {

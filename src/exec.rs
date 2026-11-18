@@ -101,7 +101,7 @@ pub fn under_filter() -> bool {
     filter_mode() == Some(2)
 }
 
-pub fn filter_mode() -> Option<u8> {
+fn filter_mode() -> Option<u8> {
     std::fs::read_to_string("/proc/self/status")
         .ok()?
         .lines()

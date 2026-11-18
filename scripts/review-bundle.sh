@@ -51,9 +51,9 @@ check() {  # check <name> <command...>: run, keep full output, record PASS or FA
 check fmt cargo fmt --all -- --check
 check clippy cargo clippy --all-targets --locked -- -D warnings
 check test cargo test --locked
-if [[ "$milestone" == m2-capture* || "$milestone" == m2b-undo* || "$milestone" == m3-codex* || "$milestone" == m4-harness* || "$milestone" == m5-speed* ]]; then check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture; fi
+check proc-mem env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture
+check harness-256 env SAQTA_HARNESS_CASES=256 cargo test --locked --test harness
 if [[ "$milestone" == m5-speed* ]]; then
-  check harness-256 env SAQTA_HARNESS_CASES=256 cargo test --locked --test harness
   check proc-cache env SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test speed
   check release cargo check --release --locked
   if command -v taskset >/dev/null 2>&1 && taskset -c 0,1 true; then
@@ -97,6 +97,14 @@ fi
 if [[ "$milestone" == m4-harness-r2* && -d target/r2-evidence ]]; then
   mkdir -p "$out/evidence/r2"
   cp target/r2-evidence/*.log target/r2-evidence/*.json target/r2-evidence/*.py "$out/evidence/r2/"
+fi
+if [[ "$milestone" == m6-rules-r1* && -f target/m6-r1-evidence/rules-cost.json ]]; then
+  mkdir -p "$out/evidence"
+  if ! cp target/m6-r1-evidence/rules-cost.json target/m6-r1-evidence/rules-cost-baseline.json \
+    target/m6-r1-evidence/rules-cost.py "$out/evidence/"; then
+    echo "evidence FAIL: could not copy M6 rules measurements" >> "$summary"
+    failed=1
+  fi
 fi
 doctor_check() {
   local doctor_dir

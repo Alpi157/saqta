@@ -285,9 +285,6 @@ pub struct Breaker {
 
 impl Breaker {
     pub fn observe(&mut self, policy: &Policy, path: &Path, state: &journal::State) {
-        if state.directory() || policy.regenerable(path) {
-            return;
-        }
         if self.files.insert(path.to_owned()) && policy.irreplaceable(path) {
             self.irreplaceable += 1;
         }

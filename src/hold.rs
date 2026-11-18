@@ -430,7 +430,7 @@ pub fn resume(home: &Path, mut record: Record) -> Result<()> {
 
 pub fn release(id: u64) -> Result<i32> {
     if std::env::var_os("SAQTA_SUPERVISED").is_some()
-        || crate::exec::filter_mode() != Some(0)
+        || crate::supervisor::in_ancestry().unwrap_or(true)
         || (!io::stdin().is_terminal() && !crate::rules::release_without_terminal()?)
     {
         bail!("release must be run by a person in their own terminal");
