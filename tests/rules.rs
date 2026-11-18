@@ -915,3 +915,337 @@ fn index_and_head_copies_prevent_a_hold() {
         b"staged version\n"
     );
 }
+
+fn bulk_tracked(s: &Sandbox, p: &Path, size: usize) -> Vec<PathBuf> {
+    repo(s, p);
+    let root = p.join("bulk");
+    fs::create_dir(&root).unwrap();
+    let paths: Vec<_> = (0..size)
+        .map(|i| root.join(format!("file-{i:04}.txt")))
+        .collect();
+    for path in &paths {
+        fs::write(path, b"committed content\n").unwrap();
+    }
+    git(s, p, &["add", "bulk"]);
+    git(s, p, &["commit", "-qm", "add bulk fixtures"]);
+    paths
+}
+
+fn same_bytes(paths: &[PathBuf], expected: &[u8]) {
+    for path in paths {
+        assert_eq!(fs::read(path).unwrap(), expected, "{}", path.display());
+    }
+}
+
+#[test]
+fn dirty_rustfmt_sed_and_bulk_python_rewrites_remain_edits() {
+    let (s, p) = fixture("rules-dirty-edits");
+    let bulk = bulk_tracked(&s, &p, 300);
+    fs::write(p.join("src/dirty.rs"), "fn before() {}\n").unwrap();
+    git(&s, &p, &["add", "src/dirty.rs"]);
+    git(&s, &p, &["commit", "-qm", "track Rust source"]);
+    let rustfmt = Path::new(env!("CARGO")).with_file_name("rustfmt");
+    if rustfmt.is_file() {
+        fs::write(
+            p.join("src/dirty.rs"),
+            "fn dirty( ){println!(\"local\");}\n",
+        )
+        .unwrap();
+        let mut c = s.exec(&["--"]);
+        c.arg(rustfmt).arg("src/dirty.rs").current_dir(&p);
+        let o = run(c);
+        assert_success(&o);
+        assert!(err(&o).lines().count() <= 1, "{}", err(&o));
+        assert_eq!(
+            fs::read(p.join("src/dirty.rs")).unwrap(),
+            b"fn dirty() {\n    println!(\"local\");\n}\n"
+        );
+    } else {
+        note("SKIP: rustfmt unavailable");
+    }
+    fs::write(p.join("src/app.ts"), "dirty before sed\n").unwrap();
+    let o = script(&s, &p, "sed -i 's/before/after/' src/app.ts");
+    assert_success(&o);
+    assert!(err(&o).lines().count() <= 1, "{}", err(&o));
+    assert_eq!(
+        fs::read(p.join("src/app.ts")).unwrap(),
+        b"dirty after sed\n"
+    );
+    if !python(&s) {
+        return;
+    }
+    for path in &bulk {
+        fs::write(path, b"dirty before python\n").unwrap();
+    }
+    let o = script(
+        &s,
+        &p,
+        r#"python3 -c 'from pathlib import Path
+for p in Path("bulk").iterdir():
+    p.write_bytes(b"dirty after python\n")'"#,
+    );
+    assert_success(&o);
+    assert!(err(&o).lines().count() <= 1, "{}", err(&o));
+    same_bytes(&bulk, b"dirty after python\n");
+}
+
+#[test]
+fn clean_switch_and_fast_forward_merge_do_not_trip_the_breaker() {
+    let (s, p) = fixture("rules-clean-switch-merge");
+    let paths = bulk_tracked(&s, &p, 1000);
+    git(&s, &p, &["switch", "-qc", "base"]);
+    git(&s, &p, &["switch", "-qc", "switch-target"]);
+    for path in &paths {
+        fs::write(path, b"switched contents\n").unwrap();
+    }
+    git(&s, &p, &["commit", "-qam", "change all 1000 files"]);
+    git(&s, &p, &["switch", "-q", "base"]);
+    silent(script(
+        &s,
+        &p,
+        "git --no-optional-locks switch -q switch-target",
+    ));
+    same_bytes(&paths, b"switched contents\n");
+    assert_eq!(shown(&s, 1)["held"], false);
+
+    git(&s, &p, &["switch", "-qc", "merge-target"]);
+    for path in &paths[..500] {
+        fs::write(path, b"merged contents\n").unwrap();
+    }
+    git(&s, &p, &["commit", "-qam", "change 500 files"]);
+    git(&s, &p, &["switch", "-q", "switch-target"]);
+    silent(script(
+        &s,
+        &p,
+        "git --no-optional-locks merge --ff-only --quiet merge-target",
+    ));
+    same_bytes(&paths[..500], b"merged contents\n");
+    same_bytes(&paths[500..], b"switched contents\n");
+    assert_eq!(shown(&s, 2)["held"], false);
+}
+
+#[test]
+fn checkout_hard_reset_restore_and_removal_have_the_exact_r2_message() {
+    for (name, command) in [
+        ("checkout", "git --no-optional-locks checkout -- ."),
+        (
+            "hard-reset",
+            "git --no-optional-locks reset --hard --quiet HEAD",
+        ),
+        ("restore", "git --no-optional-locks restore src/app.ts"),
+        ("rm-tracked", "rm src/app.ts"),
+    ] {
+        let (s, p) = fixture(name);
+        repo(&s, &p);
+        fs::write(p.join("src/app.ts"), b"unsaved changes\n").unwrap();
+        let o = script(&s, &p, command);
+        assert_eq!(o.status.code(), Some(77), "{}", err(&o));
+        assert_eq!(
+            err(&o),
+            "[saqta 1] Restored 1 file with uncommitted edits that this command discarded:\n  src/app.ts. Git doesn't have these changes.\n  To set changes aside, use: git stash -u\n  If the user really wants them discarded, they can run: saqta release 1\n"
+        );
+        assert_eq!(
+            fs::read(p.join("src/app.ts")).unwrap(),
+            b"unsaved changes\n"
+        );
+        assert_eq!(shown(&s, 1)["hold_rule"], "R2");
+    }
+}
+
+#[test]
+fn moving_a_dirty_file_or_its_parent_keeps_the_content() {
+    let (s, p) = fixture("rules-moved-dirty");
+    repo(&s, &p);
+    fs::write(p.join("src/app.ts"), b"dirty content\n").unwrap();
+    silent(script(&s, &p, "mv src/app.ts src/moved.ts"));
+    assert_eq!(
+        fs::read(p.join("src/moved.ts")).unwrap(),
+        b"dirty content\n"
+    );
+
+    fs::rename(p.join("src/moved.ts"), p.join("src/app.ts")).unwrap();
+    let o = script(
+        &s,
+        &p,
+        "sed -i s/content/edited/ src/app.ts; mv src renamed",
+    );
+    assert_success(&o);
+    assert!(err(&o).lines().count() <= 1, "{}", err(&o));
+    assert!(!p.join("src").exists());
+    assert_eq!(
+        fs::read(p.join("renamed/app.ts")).unwrap(),
+        b"dirty edited\n"
+    );
+    assert_eq!(shown(&s, 2)["held"], false);
+}
+
+#[test]
+fn deleting_500_clean_tracked_files_with_stale_stats_is_undoable() {
+    let (s, p) = fixture("rules-clean-removal");
+    let paths = bulk_tracked(&s, &p, 500);
+    git(&s, &p, &["mv", "bulk", "src/bulk"]);
+    git(&s, &p, &["rm", "src/app.ts"]);
+    git(
+        &s,
+        &p,
+        &["commit", "-qm", "make src an exactly 500-file tree"],
+    );
+    let paths: Vec<_> = paths
+        .iter()
+        .map(|old| p.join("src/bulk").join(old.file_name().unwrap()))
+        .collect();
+    for path in &paths {
+        // Keep the bytes and make the index stat cache stale.
+        fs::write(path, b"committed content\n").unwrap();
+    }
+    let o = script(&s, &p, "rm -rf -- src");
+    assert_success(&o);
+    assert!(err(&o).lines().count() <= 1, "{}", err(&o));
+    assert!(!p.join("src").exists());
+    assert_eq!(shown(&s, 1)["held"], false);
+    assert_success(&undo(&s, 1));
+    same_bytes(&paths, b"committed content\n");
+}
+
+#[test]
+fn bulk_dirty_checkout_uses_default_limits_and_keeps_stash_advice() {
+    let (s, p) = fixture("rules-dirty-checkout-breaker");
+    let paths = bulk_tracked(&s, &p, 600);
+    for path in &paths {
+        fs::write(path, b"dirty tracked contents\n").unwrap();
+    }
+    let o = script(&s, &p, "git --no-optional-locks checkout -- .");
+    assert_eq!(o.status.code(), Some(77), "{}", err(&o));
+    let record = shown(&s, 1);
+    match record["hold_rule"].as_str().unwrap() {
+        "R1" => {
+            assert_eq!(
+                err(&o),
+                "[saqta 1] Stopped this command and restored 201 files after too much data was discarded:\n  bulk/file-0000.txt, bulk/file-0001.txt, bulk/file-0002.txt (+198 more)\n  To set changes aside, use: git stash -u\n  If the user really wants them discarded, they can run: saqta release 1\n"
+            );
+        }
+        "R2" => {
+            // A Git build that replaces files without unlinking them can finish
+            // the checkout, then R2 restores all 600 paths.
+            assert_eq!(
+                err(&o),
+                "[saqta 1] Restored 600 files with uncommitted edits that this command discarded:\n  bulk/file-0000.txt, bulk/file-0001.txt, bulk/file-0002.txt (+597 more). Git doesn't have these changes.\n  To set changes aside, use: git stash -u\n  If the user really wants them discarded, they can run: saqta release 1\n"
+            );
+        }
+        rule => panic!("unexpected rule {rule}: {}", err(&o)),
+    }
+    same_bytes(&paths, b"dirty tracked contents\n");
+    assert!(!p.join(".git/index.lock").exists());
+    silent(script(
+        &s,
+        &p,
+        "git --no-optional-locks stash -u -qm after-breaker",
+    ));
+    same_bytes(&paths, b"committed content\n");
+}
+
+#[test]
+fn git_clean_of_300_untracked_user_files_trips_the_breaker() {
+    let (s, p) = fixture("rules-untracked-breaker");
+    repo(&s, &p);
+    let paths: Vec<_> = (0..300).map(|i| p.join(format!("user-{i:03}"))).collect();
+    for path in &paths {
+        fs::write(path, b"untracked user content\n").unwrap();
+    }
+    let o = script(&s, &p, "git --no-optional-locks clean -qfdx");
+    assert_eq!(o.status.code(), Some(77), "{}", err(&o));
+    assert_eq!(
+        err(&o),
+        "[saqta 1] Stopped this command and restored 201 files after too much data was discarded:\n  user-000, user-001, user-002 (+198 more)\n  Review the command and narrow the paths it changes.\n  If the user really wants them discarded, they can run: saqta release 1\n"
+    );
+    same_bytes(&paths, b"untracked user content\n");
+}
+
+#[test]
+fn bulk_stash_preserves_the_git_contents_and_does_not_trip() {
+    let (s, p) = fixture("rules-bulk-stash");
+    let paths = bulk_tracked(&s, &p, 300);
+    for path in &paths {
+        fs::write(path, b"dirty content to stash\n").unwrap();
+    }
+    let scratch: Vec<_> = (0..300).map(|i| p.join(format!("user-{i:03}"))).collect();
+    for path in &scratch {
+        fs::write(path, b"local file to stash\n").unwrap();
+    }
+    silent(script(&s, &p, "git --no-optional-locks stash -u -qm bulk"));
+    same_bytes(&paths, b"committed content\n");
+    assert!(scratch.iter().all(|p| !p.exists()));
+    assert_eq!(
+        git(&s, &p, &["show", "stash:bulk/file-0000.txt"]).stdout,
+        b"dirty content to stash\n"
+    );
+    assert_eq!(
+        git(&s, &p, &["show", "stash^3:user-000"]).stdout,
+        b"local file to stash\n"
+    );
+}
+
+#[test]
+fn breaker_restores_deleted_paths_and_keeps_an_unrelated_dirty_edit() {
+    let (s, p) = fixture("rules-breaker-keeps-edits");
+    repo(&s, &p);
+    fs::write(p.join("src/app.ts"), b"dirty before edit\n").unwrap();
+    let user_files: Vec<_> = (0..300).map(|i| p.join(format!("user-{i:03}"))).collect();
+    for path in &user_files {
+        fs::write(path, b"untracked user content\n").unwrap();
+    }
+    let o = script(&s, &p, "sed -i s/before/after/ src/app.ts; rm -- user-*");
+    held(
+        &o,
+        "[saqta 1] Stopped this command and restored 201 files after too much data was discarded:",
+    );
+    assert_eq!(
+        fs::read(p.join("src/app.ts")).unwrap(),
+        b"dirty after edit\n"
+    );
+    same_bytes(&user_files, b"untracked user content\n");
+    assert_success(&undo(&s, 1));
+    assert_eq!(
+        fs::read(p.join("src/app.ts")).unwrap(),
+        b"dirty before edit\n"
+    );
+}
+
+#[test]
+fn rewriting_untracked_user_files_does_not_trigger_r3() {
+    let (s, p) = fixture("rules-untracked-rewrites");
+    repo(&s, &p);
+    for name in ["one", "two", "three"] {
+        fs::write(p.join(name), b"untracked old contents\n").unwrap();
+    }
+    let o = script(
+        &s,
+        &p,
+        "for f in one two three; do printf 'updated\\n' > \"$f\"; done",
+    );
+    assert_success(&o);
+    assert_eq!(
+        err(&o),
+        "[saqta 1] kept 3 edited files (undo: saqta undo 1)\n"
+    );
+    for name in ["one", "two", "three"] {
+        assert_eq!(fs::read(p.join(name)).unwrap(), b"updated\n");
+    }
+}
+
+#[test]
+fn breaker_checks_a_short_git_batch_when_the_tracee_goes_idle() {
+    let (s, p) = fixture("rules-breaker-idle");
+    let paths = bulk_tracked(&s, &p, 202);
+    // With one stale-but-clean pre-image, the first batch leaves 200 proven losses.
+    fs::write(&paths[0], b"committed content\n").unwrap();
+    for path in &paths[1..] {
+        fs::write(path, b"dirty tracked contents\n").unwrap();
+    }
+    let started = Instant::now();
+    let o = script(&s, &p, "rm -- bulk/*; sleep 6");
+    held(&o, "[saqta 1] Stopped this command and restored 201 files");
+    assert!(err(&o).contains("To set changes aside, use: git stash -u"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    same_bytes(&paths[1..], b"dirty tracked contents\n");
+}

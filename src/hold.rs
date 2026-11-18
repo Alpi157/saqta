@@ -33,6 +33,8 @@ struct Hold {
     effects: BTreeSet<u64>,
     posts: Posts,
     agent: Vec<Effect>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    interrupted_locks: BTreeSet<String>,
     detached: bool,
 }
 
@@ -307,7 +309,7 @@ fn select(record: &Record, decision: &Decision, after: u64) -> Result<BTreeSet<u
                             .next()
                             .is_some_and(|child| child.starts_with(p)))
             };
-            if (all && matches!(e.op.as_str(), "delete" | "modify" | "rmdir" | "size"))
+            if (all && e.op == "rmdir")
                 || overlaps(first)
                 || second.as_ref().is_some_and(|p| overlaps(p))
             {
@@ -350,10 +352,17 @@ pub fn start(
     };
     let lock = journal::private_file(&j.folder.join("undo.lock"))?;
     sys::flock_exclusive(lock.as_raw_fd(), true)?;
-    let effects = select(&record, decision, after)?;
-    let names = names(&record, &effects);
+    let mut effects = select(&record, decision, after)?;
+    let agent_names = names(&record, &effects);
+    // Reverse surviving Git lock creations without following old renames into
+    // the index. The undo engine keeps the locks in the recovery directory.
+    let interrupted_locks = names(&record, &decision.interrupted_locks);
+    effects.extend(&decision.interrupted_locks);
     let root = root()?;
-    let posts = guarded_posts(root.as_raw_fd(), names.iter().cloned())?;
+    let posts = guarded_posts(
+        root.as_raw_fd(),
+        agent_names.union(&interrupted_locks).cloned(),
+    )?;
     let observed = journal::post_states(&j.folder)?;
     for (name, state) in &posts {
         if observed.get(name).is_some_and(|p| p != state) {
@@ -384,7 +393,13 @@ pub fn start(
         }
     }
     in_place.retain(|name| !replaced.contains(name));
-    let agent = snapshot_plan(root.as_raw_fd(), &agent_dir, &names, &posts, &in_place)?;
+    let agent = snapshot_plan(
+        root.as_raw_fd(),
+        &agent_dir,
+        &agent_names,
+        &posts,
+        &in_place,
+    )?;
     journal::synced_json_write(
         &dir.join("plan"),
         &Hold {
@@ -397,6 +412,7 @@ pub fn start(
             effects,
             posts,
             agent,
+            interrupted_locks,
             detached,
         },
     )?;
@@ -444,9 +460,10 @@ pub fn release(id: u64) -> Result<i32> {
         bail!("command {id} has no open hold");
     }
     let plan: Hold = read(&folder.join("plan"))?;
-    let restored: Posts = read(&folder.join("restored-posts"))?;
+    let mut restored: Posts = read(&folder.join("restored-posts"))?;
+    restored.retain(|name, _| !plan.interrupted_locks.contains(name));
     let mut record = journal::load(&home, id)?;
-    let names = names(&record, &plan.effects);
+    let names = plan.agent.iter().map(|e| e.path.clone()).collect();
     let root = root()?;
     let release = folder.join("release");
     journal::private_dir(&release)?;

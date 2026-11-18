@@ -346,6 +346,11 @@ fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut
         if done && !hup && capture.policy.is_some() {
             capture.observe_pending();
         }
+        if fds[0].revents == 0 {
+            // Flush a potentially decisive Git batch at an idle poll so a
+            // sleeping tracee cannot postpone the breaker after its last delete.
+            capture.check_git_deletions(true);
+        }
         if !hup && !killed && capture.tripped() {
             sys::kill_tree();
             killed = true;
@@ -401,6 +406,7 @@ fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut
                         // foreground post-state is sealed before the tree resumes.
                         let result = settle(capture, status, true, false, 0);
                         background.breaker = std::mem::take(&mut capture.breaker);
+                        background.indexes = std::mem::take(&mut capture.indexes);
                         *capture = background;
                         foreground = 0;
                         result
@@ -495,14 +501,18 @@ fn assess(
     }
     let j = &capture.journal;
     let record = crate::journal::load(&j.home, j.meta.id)?;
-    let decision = classify::evaluate(
+    let mut decision = classify::evaluate(
         &record,
         &j.folder,
         &j.quarantine,
         policy,
-        capture.tripped(),
+        &capture.indexes,
+        capture.tripped().then_some(&capture.breaker),
         after,
     )?;
+    if capture.tripped() {
+        decision.interrupted_locks = capture.interrupted_git_locks()?;
+    }
     Ok(Some((record, decision)))
 }
 
@@ -532,6 +542,7 @@ fn evaluate(
                 &decision.names(),
                 &policy.project,
                 decision.groups.len() > 1,
+                capture.breaker.mostly_dirty(),
             );
             if record
                 .effects
