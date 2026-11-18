@@ -1,5 +1,90 @@
 # M5 speed: report
 
+## R1 nightly harness follow-up
+
+Nightly run 44078249591 failed on main at `e138ea2`. This follow-up keeps the
+full M5 history and adds the two nightly seeds alongside every existing seed.
+The M5 measurements below still describe the reviewed M5 release.
+
+| Case | M4, `e138ea2` | M5, `5ec5453` |
+|---|---|---|
+| Sequential seed `78d30b…` and its minimized case | Undo of command 1 refuses `d5` as changed, leaving the directories exchanged | Same refusal and misplaced files |
+| Parallel seed `ee8a79…`, original generated case | Undo succeeds, but `p1/d2/f1` keeps the 20 bytes written by the command | Same wrong bytes. M5 saves the pre-image, but undo loses the path to the shared inode |
+| Parallel seed `ee8a79…`, minimized case | `p0/d2/f1` is empty after undo | Passes. M5's existing `f7c0d98c…` fix captures the write through the surviving new link |
+
+**Sequential case.** Command 1 exchanges empty `d5` with `d2`. Command 2
+truncates `d1/f0`. Command 3 truncates `d5/f1`, its hard-link alias. The
+other operations try to create `d0` exclusively and fail because it exists.
+Undoing command 2 repairs both names, including moving `d5/f1` out of its
+directory and back. Its journal names only `d1/f0`, so the old code keeps the
+earlier observation of `d5`. The final undo exits 125 when that observation
+fails to match. The CI fixture's last observation has mtime nanoseconds
+157893633, from undo 3. Command 1's journal has 119240004 for the same inode.
+No final tree comparison runs in the original failure. An extra local digest
+dump on refusal shows that `d2/f0` and `d2/f1` are missing and the exact
+same digests are present at the unexpected `d5` names:
+
+| Replay | Expected at `d2/f0` | Expected at `d2/f1` | After refusal |
+|---|---:|---:|---|
+| M4 | 16851875721381718565 | 3767676593089380471 | Both digests at `d5` |
+| M5 | 2990509131686055965 | 3421552722013363478 | Both digests at `d5` |
+
+**Parallel case.** In the minimized fixture, worker 0 links `d1/f0` to
+`d4/f1`, removes `d1/f0`, and truncates `d4/f1` to zero bytes. Worker 1
+tries the same harmless exclusive create of its own `d0`. M4 leaves the
+untouched `p0/d2/f1` empty instead of restoring `original 1 0\0`. The
+nightly digest for that entry is 13318026702233790426 expected and
+11664781167837571801 actual. The local M4 minimized replay gives
+9809126341857481371 expected and 1154086790986191009 actual. Digests include
+file mtime, so they differ between fixtures.
+
+The original generated seed exercises the same link, unlink and overwrite
+in worker 1, then unlinks the new name too. Other workers use separate
+subtrees. The broken M5 shortcut skips retaining a removed name created by
+the command. Undo cannot reach the inode through that name when it reverses
+the earlier overwrite. The untouched `p1/d2/f1` keeps the overwrite bytes
+`6574e19471055437452e3ca09a34c7f867705be1`. The local original seed digests
+are 14867676275603041856 expected and 16559499485075225641 actual on M4,
+and 7003930830616439831 expected and 1440481754322025832 actual on M5.
+
+**Fixes.** Keep a removed created name if it still shares an inode. Undo can
+then restore that name, repair the inode through it, and remove the name
+when reversing creation. Checkpoint the parent identities of extra alias
+repairs. Carry them through reverse moves and publish final observations only
+for the same directories. The resumed repair test also verifies that later
+user edits still block undo. See [decision 0022](../docs/decisions/0022-retain-alias-repair-paths.md).
+
+The first 2,000-case run found a related lineage failure after 387 new
+sequential cases. Two commands write `d2/f1`. A third unlinks that name and
+writes its surviving alias `d1/f0`. Undoing the third command restores
+`d2/f1` on a separate inode and records both names. Undoing the second
+command repairs both, but previously refreshed only `d2/f1` in the lineage
+map. The first undo then skipped `d1/f0` because its saved state was stale.
+Record the extra repaired name in the same recovery frame as its parent.
+Refresh its lineage when the same inode is still at the final name. Seed
+`92ffc5af…` and the named three-command regression cover this case.
+
+**Why 256 missed them.** The nightly failures first occurred after 3,386 and
+4,602 successful new cases. The saved seeds replay their original generated
+inputs. The comments record what the shrinker found. Each seed failed in
+isolation on both unpatched releases on WSL2 ext4, kernel
+6.18.58.1-microsoft-standard-WSL2, with all 24 logical CPUs and under
+`taskset -c 0,1` and `taskset -c 0`. The named regressions exercise the required operation order
+directly. These results support rare generated operation sequences as the
+explanation, with no special kernel, affinity or worker interleaving needed.
+
+| R1 check | Result |
+|---|---|
+| Both original seeds and minimized cases replayed on M4 and M5 | Done. Separate snapshots and Cargo targets at `target/n4` and `target/n5` |
+| Original saved seeds and named regressions on R1 | Pass |
+| Named tests on CPU 0 | Pass. 31 tests in 7.50 s |
+| All three properties, 2,000 new cases each | Pass. 34 tests in 375.07 s with `SAQTA_HARNESS_CASES=2000` and RNG seed `44078249591` |
+| Full `m5-speed-r1` bundle | See the bundle's `SUMMARY.txt` and `checks/` |
+
+R1 review passed. The first commit adds the capture and undo fixes, decision
+record, named tests and saved seeds. The second records the report and bundle
+script changes.
+
 ## What works now (5 lines max)
 - Capture uses bounded task caches and keeps pre-images and complete intents before CONTINUE.
 - Undo uses append-only plans, periodic checkpoints and pinned private store parents.

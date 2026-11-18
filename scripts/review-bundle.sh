@@ -74,6 +74,13 @@ if [[ "$milestone" == m5-speed* ]]; then
     fi
   fi
 fi
+if [[ "$milestone" == m5-speed-r1* && -d target/m5-r1-evidence ]]; then
+  mkdir -p "$out/evidence/r1"
+  if ! cp target/m5-r1-evidence/*.log target/m5-r1-evidence/*.json "$out/evidence/r1/"; then
+    echo "evidence FAIL: could not copy M5 R1 regression evidence" >> "$summary"
+    failed=1
+  fi
+fi
 if [[ "$milestone" == m4-harness-r1* || "$milestone" == m4-harness-r2* ]]; then
   check release cargo check --release --locked
   if command -v taskset >/dev/null 2>&1 && taskset -c 0,1 true; then
