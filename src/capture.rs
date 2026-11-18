@@ -219,7 +219,7 @@ struct Pending {
     path2: Option<PathBuf>,
     before: Option<State>,
     before2: Option<State>,
-    destruction: Vec<(PathBuf, State, bool)>,
+    destruction: Vec<(PathBuf, State)>,
 }
 pub struct Capture {
     pub journal: Journal,
@@ -228,6 +228,7 @@ pub struct Capture {
     pub policy: Option<Policy>,
     pub prior_created: std::collections::HashSet<crate::classify::Birth>,
     pub(crate) breaker: Breaker,
+    last_rule_candidate: u64,
     cache_roots: BTreeSet<PathBuf>,
     max_copy: u64,
     vm_unavailable: bool,
@@ -262,6 +263,7 @@ impl Capture {
             policy: None,
             prior_created: Default::default(),
             breaker: Breaker::default(),
+            last_rule_candidate: 0,
             cache_roots: BTreeSet::new(),
             max_copy,
             vm_unavailable: std::env::var_os("SAQTA_FORCE_PROC_MEM").is_some_and(|s| s == "1"),
@@ -278,6 +280,10 @@ impl Capture {
             linked: BTreeMap::new(),
         })
     }
+    pub fn needs_rule_evaluation(&self, after: u64) -> bool {
+        self.last_rule_candidate > after || self.tripped()
+    }
+
     pub fn tripped(&self) -> bool {
         self.policy.as_ref().is_some_and(|p| self.breaker.fired(p))
     }
@@ -718,20 +724,13 @@ impl Capture {
             }
         }
         let mut destruction = Vec::new();
+        let mut last_candidate = None;
         if let Some(policy) = &self.policy {
-            for e in &mut effects {
+            for (index, e) in effects.iter_mut().enumerate() {
                 if !matches!(e.op.as_str(), "delete" | "modify" | "not protected") {
                     continue;
                 }
                 let path = journal::path(&e.path)?;
-                e.note.agent_created = self.created.contains(path.as_os_str())
-                    && !e
-                        .note
-                        .before
-                        .as_ref()
-                        .is_some_and(|st| self.original_links.contains_key(&(st.dev, st.ino)))
-                    || crate::classify::Birth::read(&path)
-                        .is_some_and(|id| self.prior_created.contains(&id));
                 if path.file_name().is_some_and(|n| n == "CACHEDIR.TAG")
                     && let Some(parent) = path.parent().filter(|p| crate::gc::cache_marker(p))
                 {
@@ -739,17 +738,33 @@ impl Capture {
                 }
                 e.note.regenerable = self.cache_roots.iter().any(|p| path.starts_with(p))
                     || policy.regenerable(&path);
+                if e.note.regenerable {
+                    continue;
+                }
+                e.note.agent_created = self.created.contains(path.as_os_str())
+                    && !e
+                        .note
+                        .before
+                        .as_ref()
+                        .is_some_and(|st| self.original_links.contains_key(&(st.dev, st.ino)))
+                    || (!self.prior_created.is_empty()
+                        && crate::classify::Birth::read(&path)
+                            .is_some_and(|id| self.prior_created.contains(&id)));
                 if crate::classify::git_database(&path) {
                     e.note.git = crate::classify::git_process(n.pid);
                 }
-                if let Some(before) = &e.note.before
-                    && e.note.kept != "created earlier"
-                    && (e.op == "delete"
-                        || c.kind == Kind::Truncate
-                        || c.flags & libc::O_TRUNC as u64 != 0
-                        || c.flags & libc::O_APPEND as u64 == 0)
-                {
-                    destruction.push((path, before.clone(), e.note.regenerable));
+                if let Some(before) = e.note.before.as_ref().filter(|s| !s.directory()) {
+                    if matches!(e.op.as_str(), "delete" | "modify") && !e.quarantine.is_empty() {
+                        last_candidate = Some(index);
+                    }
+                    if e.note.kept != "created earlier"
+                        && (e.op == "delete"
+                            || c.kind == Kind::Truncate
+                            || c.flags & libc::O_TRUNC as u64 != 0
+                            || c.flags & libc::O_APPEND as u64 == 0)
+                    {
+                        destruction.push((path, before.clone()));
+                    }
                 }
             }
         }
@@ -759,6 +774,9 @@ impl Capture {
             c.kind
         };
         let seqs = self.journal.append_batch(effects)?;
+        if let Some(seq) = last_candidate.and_then(|i| seqs.get(i)) {
+            self.last_rule_candidate = *seq;
+        }
         if !seqs.is_empty() {
             self.pending.insert(
                 n.pid,
@@ -973,10 +991,8 @@ impl Capture {
             let changed_in_place =
                 !matches!(p.kind, Kind::Open | Kind::Truncate) || p.at.state(&p.path) != p.before;
             if changed_in_place {
-                for (path, before, regenerable) in &p.destruction {
-                    if !regenerable {
-                        self.breaker.observe(policy, path, before);
-                    }
+                for (path, before) in &p.destruction {
+                    self.breaker.observe(policy, path, before);
                 }
             }
         }

@@ -300,20 +300,68 @@ fn paths_are_bounded_and_controls_are_stripped_from_stderr() {
     );
 }
 
-#[test]
-fn release_is_refused_without_terminal_and_inside_supervision() {
-    let (s, p) = fixture("rules-release-deny");
-    for o in [
-        run(s.saqta(&["release", "1"])),
-        script(&s, &p, "saqta release 1"),
-        script(&s, &p, "env -u SAQTA_SUPERVISED saqta release 1"),
-    ] {
-        assert_eq!(o.status.code(), Some(125));
-        assert_eq!(
-            err(&o),
-            "saqta: release must be run by a person in their own terminal\n"
-        );
+const RELEASE_DENIAL: &str = "saqta: release must be run by a person in their own terminal\n";
+
+const PTY_LAUNCHER: &str = r#"
+import ctypes, errno, os, pty, subprocess, sys
+
+mode, *command = sys.argv[1:]
+try:
+    master, slave = pty.openpty()
+except OSError as error:
+    print(f"PTY unavailable: {error}", file=sys.stderr)
+    sys.exit(78)
+assert os.isatty(slave)
+
+if mode == "filter":
+    class Filter(ctypes.Structure):
+        _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
+                    ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint)]
+    class Program(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ushort), ("filters", ctypes.POINTER(Filter))]
+
+    def status():
+        return dict(line.split(":", 1) for line in open("/proc/self/status"))
+    before = int(status()["Seccomp_filters"])
+    instruction = Filter(0x06, 0, 0, 0x7fff0000)  # BPF_RET | BPF_K, SECCOMP_RET_ALLOW
+    program = Program(1, ctypes.pointer(instruction))
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(38, 1, 0, 0, 0) or libc.prctl(22, 2, ctypes.byref(program)):
+        number = ctypes.get_errno()
+        if number in (errno.EACCES, errno.EINVAL, errno.ENOSYS, errno.EPERM):
+            print(f"no-op seccomp filter unavailable: {os.strerror(number)}", file=sys.stderr)
+            sys.exit(78)
+        raise OSError(number, os.strerror(number))
+    assert int(status()["Seccomp"]) == 2
+    assert int(status()["Seccomp_filters"]) == before + 1
+elif mode == "drop-marker":
+    assert os.environ.pop("SAQTA_SUPERVISED") == "1"
+
+if command:
+    sys.exit(subprocess.run(command, stdin=slave).returncode)
+"#;
+
+fn terminal_available(s: &Sandbox, mode: &str) -> bool {
+    if !python(s) {
+        return false;
     }
+    let mut c = s.command("python3");
+    c.args(["-c", PTY_LAUNCHER, mode]);
+    let probe = run(c);
+    if probe.status.code() == Some(78) {
+        note(format!("SKIP: {}", err(&probe).trim()));
+        return false;
+    }
+    assert_success(&probe);
+    true
+}
+
+fn release_denied(o: Output) {
+    assert_eq!(o.status.code(), Some(125), "{}", err(&o));
+    assert_eq!(err(&o), RELEASE_DENIAL);
+}
+
+fn enable_release_override(s: &Sandbox) {
     let config = PathBuf::from(&s.env[OsStr::new("HOME")]).join(".config/saqta");
     fs::create_dir_all(&config).unwrap();
     fs::write(
@@ -321,12 +369,94 @@ fn release_is_refused_without_terminal_and_inside_supervision() {
         "release_without_terminal = true\n",
     )
     .unwrap();
-    let o = script(&s, &p, "env -u SAQTA_SUPERVISED saqta release 1");
-    assert_eq!(o.status.code(), Some(125));
-    assert_eq!(
-        err(&o),
-        "saqta: release must be run by a person in their own terminal\n"
+}
+
+#[test]
+fn release_is_refused_without_terminal_and_inside_supervision() {
+    let (s, p) = fixture("rules-release-deny");
+    release_denied(run(s.saqta(&["release", "1"])));
+    release_denied(script(&s, &p, "saqta release 1"));
+    enable_release_override(&s);
+    release_denied(script(&s, &p, "env -u SAQTA_SUPERVISED saqta release 1"));
+}
+
+#[test]
+fn supervisor_ancestry_refuses_release_with_a_pty_and_without_the_marker() {
+    let (s, p) = fixture("rules-supervised-pty");
+    if !terminal_available(&s, "plain") {
+        return;
+    }
+    fs::write(p.join(".env"), "keep").unwrap();
+    held(
+        &script(&s, &p, "rm .env"),
+        "[saqta 1] Restored 1 precious file",
     );
+    let mut c = s.exec(&[
+        "--",
+        "python3",
+        "-c",
+        PTY_LAUNCHER,
+        "drop-marker",
+        BIN,
+        "release",
+        "1",
+    ]);
+    c.current_dir(&p);
+    release_denied(run(c));
+    assert_eq!(fs::read_to_string(p.join(".env")).unwrap(), "keep");
+    assert_eq!(shown(&s, 1)["released"], false);
+}
+
+#[test]
+fn supervisor_adopts_a_double_fork_and_refuses_release_after_wrapper_exit() {
+    let (s, p) = fixture("rules-detached-release");
+    if !python(&s) {
+        return;
+    }
+    enable_release_override(&s);
+    fs::write(p.join(".env"), "keep").unwrap();
+    held(
+        &script(&s, &p, "rm .env"),
+        "[saqta 1] Restored 1 precious file",
+    );
+
+    let worker = r#"
+import os, pathlib, subprocess, sys, time
+
+if os.fork():
+    os._exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+null = os.open("/dev/null", os.O_RDWR)
+for fd in (0, 1, 2):
+    os.dup2(null, fd)
+os.close(null)
+assert not os.isatty(0)
+assert os.environ.pop("SAQTA_SUPERVISED") == "1"
+go = pathlib.Path("go")
+deadline = time.monotonic() + 5
+while not go.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+assert os.getppid() == int(go.read_text())
+out = subprocess.run([sys.argv[1], "release", "1"], capture_output=True)
+pathlib.Path("result.tmp").write_bytes(str(out.returncode).encode() + b"\n" + out.stderr)
+os.rename("result.tmp", "result")
+"#;
+    let mut c = s.exec(&["--", "python3", "-c", worker, BIN]);
+    c.current_dir(&p);
+    silent(run(c));
+    let supervisors = s.run_markers();
+    assert_eq!(supervisors.len(), 1);
+    fs::write(p.join("go.tmp"), supervisors[0].to_string()).unwrap();
+    fs::rename(p.join("go.tmp"), p.join("go")).unwrap();
+    wait_until(Duration::from_secs(8), || p.join("result").is_file());
+    assert_eq!(
+        fs::read_to_string(p.join("result")).unwrap(),
+        format!("125\n{RELEASE_DENIAL}")
+    );
+    assert_eq!(fs::read_to_string(p.join(".env")).unwrap(), "keep");
+    assert_eq!(shown(&s, 1)["released"], false);
 }
 
 #[test]
@@ -344,21 +474,7 @@ fn release_applies_agent_version_and_can_be_undone_after_a_delayed_undo() {
     assert_eq!(fs::read_to_string(p.join(".env")).unwrap(), "human");
     assert!(!p.join("artifact").exists());
 
-    if fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .any(|s| s.split_whitespace().eq(["Seccomp:", "2"]))
-    {
-        note("SKIP: positive release requires an unfiltered process");
-        return;
-    }
-    let config = PathBuf::from(&s.env[OsStr::new("HOME")]).join(".config/saqta");
-    fs::create_dir_all(&config).unwrap();
-    fs::write(
-        config.join("config.toml"),
-        "release_without_terminal = true\n",
-    )
-    .unwrap();
+    enable_release_override(&s);
     assert_success(&run(s.saqta(&["release", "1"])));
     assert_eq!(fs::read_to_string(p.join(".env")).unwrap(), "agent\n");
     assert_success(&undo(&s, 2));
@@ -673,18 +789,9 @@ fn clean_git_line_endings_and_dirty_crlf_content_are_distinguished() {
 }
 
 #[test]
-fn release_from_a_terminal_preserves_aliases_and_rejects_newer_content() {
+fn release_from_a_terminal_under_unrelated_seccomp_preserves_aliases_and_checks_conflicts() {
     let (s, p) = fixture("rules-release-terminal");
-    if fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .any(|s| s.split_whitespace().eq(["Seccomp:", "2"]))
-    {
-        note("SKIP: terminal release requires an unfiltered process");
-        return;
-    }
-    if !tool_available(&s, "script") {
-        note("SKIP: util-linux script for a PTY is unavailable");
+    if !terminal_available(&s, "filter") {
         return;
     }
     fs::write(p.join(".env"), "human").unwrap();
@@ -694,18 +801,17 @@ fn release_from_a_terminal_preserves_aliases_and_rejects_newer_content() {
         "[saqta 1] Restored 1 precious file",
     );
     assert_eq!(fs::read_to_string(p.join("alias")).unwrap(), "human");
-    let terminal = |command: &str| {
-        let mut c = s.command("script");
-        c.args(["-qefc", command, "/dev/null"]).current_dir(&p);
+    let terminal = |id: &str, supervised: bool| {
+        let mut c = s.command("python3");
+        c.args(["-c", PTY_LAUNCHER, "filter", BIN, "release", id])
+            .current_dir(&p);
+        if supervised {
+            c.env("SAQTA_SUPERVISED", "1");
+        }
         run(c)
     };
-    let denied = terminal("SAQTA_SUPERVISED=1 saqta release 1");
-    assert_eq!(denied.status.code(), Some(125));
-    assert!(
-        String::from_utf8_lossy(&denied.stdout)
-            .contains("release must be run by a person in their own terminal")
-    );
-    assert_success(&terminal("saqta release 1"));
+    release_denied(terminal("1", true));
+    assert_success(&terminal("1", false));
     for name in [".env", "alias"] {
         assert_eq!(fs::read_to_string(p.join(name)).unwrap(), "agent\n");
     }
@@ -716,7 +822,7 @@ fn release_from_a_terminal_preserves_aliases_and_rejects_newer_content() {
     let o = script(&s, &p, "echo agent-again > .env");
     assert_eq!(o.status.code(), Some(77), "{}", err(&o));
     fs::write(p.join(".env"), "new user edit").unwrap();
-    assert_eq!(terminal("saqta release 3").status.code(), Some(125));
+    assert_eq!(terminal("3", false).status.code(), Some(125));
     assert_eq!(fs::read_to_string(p.join(".env")).unwrap(), "new user edit");
     assert_eq!(shown(&s, 3)["released"], false);
 }
@@ -724,26 +830,12 @@ fn release_from_a_terminal_preserves_aliases_and_rejects_newer_content() {
 #[test]
 fn interrupted_release_resumes_with_a_single_undo_id() {
     let (s, p) = fixture("rules-release-resume");
-    if fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .any(|s| s.split_whitespace().eq(["Seccomp:", "2"]))
-    {
-        note("SKIP: release recovery requires an unfiltered process");
-        return;
-    }
     fs::write(p.join(".env"), "human").unwrap();
     held(
         &script(&s, &p, "echo agent > .env"),
         "[saqta 1] Restored 1 precious file",
     );
-    let config = PathBuf::from(&s.env[OsStr::new("HOME")]).join(".config/saqta");
-    fs::create_dir_all(&config).unwrap();
-    fs::write(
-        config.join("config.toml"),
-        "release_without_terminal = true\n",
-    )
-    .unwrap();
+    enable_release_override(&s);
     let mut release = s.saqta(&["release", "1"]);
     release.env("SAQTA_TEST_ABORT_AFTER", "1");
     assert_eq!(run(release).status.code(), Some(86));
