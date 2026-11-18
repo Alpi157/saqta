@@ -2,6 +2,7 @@
 mod context;
 use crate::{
     journal::{self, Detail, Effect, Journal, State},
+    rules::{Breaker, Policy},
     sys,
 };
 use context::{NotificationResolver, ResolutionRoot, TaskCache, resolve};
@@ -218,11 +219,16 @@ struct Pending {
     path2: Option<PathBuf>,
     before: Option<State>,
     before2: Option<State>,
+    destruction: Vec<(PathBuf, State, bool)>,
 }
 pub struct Capture {
     pub journal: Journal,
     qfd: OwnedFd,
-    home: PathBuf,
+    deny_roots: Vec<PathBuf>,
+    pub policy: Option<Policy>,
+    pub prior_created: std::collections::HashSet<crate::classify::Birth>,
+    pub(crate) breaker: Breaker,
+    cache_roots: BTreeSet<PathBuf>,
     max_copy: u64,
     vm_unavailable: bool,
     tasks: TaskCache,
@@ -250,7 +256,13 @@ impl Capture {
         Ok(Self {
             journal,
             qfd,
-            home,
+            deny_roots: std::iter::once(home)
+                .chain(crate::paths::protected_configs())
+                .collect(),
+            policy: None,
+            prior_created: Default::default(),
+            breaker: Breaker::default(),
+            cache_roots: BTreeSet::new(),
             max_copy,
             vm_unavailable: std::env::var_os("SAQTA_FORCE_PROC_MEM").is_some_and(|s| s == "1"),
             page: sys::page_size()?,
@@ -266,6 +278,10 @@ impl Capture {
             linked: BTreeMap::new(),
         })
     }
+    pub fn tripped(&self) -> bool {
+        self.policy.as_ref().is_some_and(|p| self.breaker.fired(p))
+    }
+
     /// Capture exactly one patch-named entry. Patches replace entries, so retain copies.
     pub fn patch_path(&mut self, path: &Path, update: bool) -> io::Result<()> {
         let mut ancestor = path.parent().unwrap_or(Path::new("/"));
@@ -331,16 +347,32 @@ impl Capture {
         self.journal.append(e)?;
         Ok(())
     }
-    pub fn handle(&mut self, listener: i32, n: &sys::Notification) -> bool {
-        self.complete(n.pid);
+    pub fn observe_pending(&mut self) {
         let observed: Vec<_> = self
             .pending
             .iter()
-            .filter(|(pid, p)| Self::applied(p) || !sys::alive(**pid as i32))
+            .filter(|(pid, p)| {
+                !sys::alive(**pid as i32)
+                    || if matches!(p.kind, Kind::Open | Kind::Truncate) {
+                        self.policy.is_none()
+                            || (!p.destruction.is_empty() && p.at.state(&p.path) != p.before)
+                    } else {
+                        Self::applied(p)
+                    }
+            })
             .map(|(pid, _)| *pid)
             .collect();
         for pid in observed {
             self.complete(pid);
+        }
+    }
+
+    pub fn handle(&mut self, listener: i32, n: &sys::Notification) -> bool {
+        self.complete(n.pid);
+        self.observe_pending();
+        if self.tripped() {
+            // Leave this notification stopped until the supervisor freezes and kills the tree.
+            return false;
         }
         if crate::filter::CONTEXT_CALLS.contains(&(n.data.nr as i64)) {
             // Other tids cannot repopulate a cache while this context call is
@@ -455,13 +487,12 @@ impl Capture {
             .any(|path| self.denied_path(path, kind, p.state().is_some_and(|s| s.directory())))
     }
     fn denied_path(&self, path: &Path, kind: Kind, directory: bool) -> bool {
-        if path.starts_with(&self.home) {
-            return true;
-        }
-        if matches!(kind, Kind::Rmdir | Kind::Rename | Kind::Exchange)
-            && directory
-            && self.home.starts_with(path)
-        {
+        if self.deny_roots.iter().any(|root| {
+            path.starts_with(root)
+                || (matches!(kind, Kind::Rmdir | Kind::Rename | Kind::Exchange)
+                    && directory
+                    && root.starts_with(path))
+        }) {
             return true;
         }
         let name = path.file_name().and_then(OsStr::to_str);
@@ -686,6 +717,42 @@ impl Capture {
                 }
             }
         }
+        let mut destruction = Vec::new();
+        if let Some(policy) = &self.policy {
+            for e in &mut effects {
+                if !matches!(e.op.as_str(), "delete" | "modify" | "not protected") {
+                    continue;
+                }
+                let path = journal::path(&e.path)?;
+                e.note.agent_created = self.created.contains(path.as_os_str())
+                    && !e
+                        .note
+                        .before
+                        .as_ref()
+                        .is_some_and(|st| self.original_links.contains_key(&(st.dev, st.ino)))
+                    || crate::classify::Birth::read(&path)
+                        .is_some_and(|id| self.prior_created.contains(&id));
+                if path.file_name().is_some_and(|n| n == "CACHEDIR.TAG")
+                    && let Some(parent) = path.parent().filter(|p| crate::gc::cache_marker(p))
+                {
+                    self.cache_roots.insert(parent.to_owned());
+                }
+                e.note.regenerable = self.cache_roots.iter().any(|p| path.starts_with(p))
+                    || policy.regenerable(&path);
+                if crate::classify::git_database(&path) {
+                    e.note.git = crate::classify::git_process(n.pid);
+                }
+                if let Some(before) = &e.note.before
+                    && e.note.kept != "created earlier"
+                    && (e.op == "delete"
+                        || c.kind == Kind::Truncate
+                        || c.flags & libc::O_TRUNC as u64 != 0
+                        || c.flags & libc::O_APPEND as u64 == 0)
+                {
+                    destruction.push((path, before.clone(), e.note.regenerable));
+                }
+            }
+        }
         let pending_kind = if effects.iter().any(|e| e.op == "create") {
             Kind::Create
         } else {
@@ -724,6 +791,7 @@ impl Capture {
                         p.state()
                     },
                     before2: p2.and_then(Resolved::state),
+                    destruction,
                 },
             );
         }
@@ -901,6 +969,17 @@ impl Capture {
             return;
         };
         let applied = Self::applied(&p);
+        if applied && let Some(policy) = &self.policy {
+            let changed_in_place =
+                !matches!(p.kind, Kind::Open | Kind::Truncate) || p.at.state(&p.path) != p.before;
+            if changed_in_place {
+                for (path, before, regenerable) in &p.destruction {
+                    if !regenerable {
+                        self.breaker.observe(policy, path, before);
+                    }
+                }
+            }
+        }
         if applied {
             if p.kind == Kind::Create {
                 self.created.insert(p.path.clone().into_os_string());
@@ -977,17 +1056,46 @@ impl Capture {
             self.tasks.task = None;
         }
     }
-    pub fn snapshot(&mut self) {
-        if let Err(e) = self.journal.snapshot() {
-            self.journal.error(&e);
-        }
+    pub fn background(&self) -> anyhow::Result<Self> {
+        let cwd = journal::path(&self.journal.meta.cwd)?;
+        let label = format!("background of command {}", self.journal.meta.id);
+        let j = Journal::start_session(
+            self.journal.home.clone(),
+            &[label.into()],
+            &cwd,
+            -1,
+            self.journal.meta.session.clone(),
+        )?;
+        let mut next = Self::new(j)?;
+        next.policy = self.policy.clone();
+        next.prior_created = self.prior_created.clone();
+        next.prior_created.extend(
+            self.created_paths()
+                .filter_map(crate::classify::Birth::read),
+        );
+        Ok(next)
     }
-    pub fn finish(&mut self, status: i32) {
+
+    pub fn created_paths(&self) -> impl Iterator<Item = &Path> {
+        self.created.iter().map(Path::new)
+    }
+    pub fn settle(&mut self) {
         self.tasks.task = None;
         let pids: Vec<_> = self.pending.keys().copied().collect();
         for pid in pids {
             self.complete(pid);
         }
+    }
+    pub fn snapshot(&mut self) {
+        if self.policy.is_some() {
+            self.observe_pending();
+        }
+        if let Err(e) = self.journal.snapshot() {
+            self.journal.error(&e);
+        }
+    }
+    pub fn finish(&mut self, status: i32) {
+        self.settle();
         if let Err(e) = self.journal.finish(status) {
             self.journal.error(&e);
         }

@@ -33,10 +33,25 @@ fn cached(p: &Path) -> bool {
     if regenerable(p) {
         return true;
     }
-    p.ancestors().skip(1).any(|dir| {
-        fs::read(dir.join("CACHEDIR.TAG"))
-            .is_ok_and(|b| b.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
-    })
+    p.ancestors().skip(1).any(cache_marker)
+}
+pub fn cache_marker(dir: &Path) -> bool {
+    use std::io::Read;
+    let signature = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let Ok(name) = std::ffi::CString::new(dir.join("CACHEDIR.TAG").as_os_str().as_encoded_bytes())
+    else {
+        return false;
+    };
+    let Ok(fd) = sys::open_at(
+        libc::AT_FDCWD,
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    ) else {
+        return false;
+    };
+    let mut bytes = [0; 43];
+    std::fs::File::from(fd).read_exact(&mut bytes).is_ok() && bytes == *signature
 }
 pub fn quantity(s: &str, age: bool) -> Result<u64> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -86,7 +101,9 @@ pub fn store_size(home: &Path) -> io::Result<u64> {
         }
     }
     let mut seen = HashSet::new();
-    Ok(walk(&home.join("cmd"), &mut seen)?.saturating_add(walk(&home.join("q"), &mut seen)?))
+    Ok(walk(&home.join("cmd"), &mut seen)?
+        .saturating_add(walk(&home.join("q"), &mut seen)?)
+        .saturating_add(walk(&home.join("holds"), &mut seen)?))
 }
 #[derive(Serialize)]
 struct Collection {
@@ -138,6 +155,7 @@ fn candidates(home: &Path) -> Result<Vec<Candidate>> {
 }
 fn protected(home: &Path, c: &Candidate, newest: &BTreeSet<u64>) -> bool {
     newest.contains(&c.meta.id)
+        || crate::hold::protected(home, c.meta.id)
         || c.folder.join("undo-in-progress").exists()
         || journal::running(home, &c.meta)
         || !c.folder.join("end").exists()
@@ -278,8 +296,12 @@ fn validate_preimages(home: &Path, rows: &[Candidate]) -> Result<()> {
             continue;
         }
         let expired = expired(&c.folder)?;
+        let restored = crate::hold::restored_sequences(home, c.meta.id)?;
         for e in journal::read_effects(&c.folder)? {
-            if e.quarantine.is_empty() || expired.contains(&e.quarantine) {
+            if e.quarantine.is_empty()
+                || expired.contains(&e.quarantine)
+                || restored.contains(&e.seq)
+            {
                 continue;
             }
             let saved = journal::state(&qpath(home, c.meta.id).join(&e.quarantine))?;
@@ -306,10 +328,9 @@ fn validate_preimages(home: &Path, rows: &[Candidate]) -> Result<()> {
 }
 fn collect(home: &Path, dry: bool, age: u64, max: u64) -> Result<Report> {
     let rows = candidates(home)?;
-    if rows
-        .iter()
-        .any(|c| c.folder.join("undo-in-progress").exists())
-    {
+    if rows.iter().any(|c| {
+        c.folder.join("undo-in-progress").exists() || crate::hold::pending(home, c.meta.id)
+    }) {
         let bytes = store_size(home)?;
         return Ok(Report {
             dry_run: dry,
@@ -507,6 +528,9 @@ pub fn status(home: &Path) -> Result<()> {
         .map(sys::local_time)
         .transpose()?
         .unwrap_or_else(|| "never".into());
+    for id in crate::hold::open_holds(home)? {
+        println!("open hold: {id} (saqta show {id})");
+    }
     println!("store size: {} bytes; last gc: {last}", store_size(home)?);
     if let Ok(bytes) = fs::read(home.join("last-gc-error"))
         && let Ok(error) = serde_json::from_slice::<String>(&bytes)

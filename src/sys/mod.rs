@@ -581,16 +581,19 @@ pub fn tree_signal(sig: i32) -> (usize, u64) {
     }
     (count, fingerprint)
 }
-pub fn kill_tree() {
+pub fn freeze_tree() {
     // Stop roots first, then rescan to catch forks that raced the first snapshot.
     let mut previous = (usize::MAX, 0);
-    loop {
+    for _ in 0..64 {
         let current = tree_signal(libc::SIGSTOP);
         if current == previous {
             break;
         }
         previous = current;
     }
+}
+pub fn kill_tree() {
+    freeze_tree();
     tree_signal(libc::SIGKILL);
 }
 pub fn filesystem(path: &CString) -> io::Result<(i64, u64)> {

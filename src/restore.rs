@@ -625,7 +625,30 @@ impl Undo {
     }
 }
 
-fn current_secure(root: i32, p: &Path) -> io::Result<Option<State>> {
+pub fn snapshot_entry(root: i32, path: &Path, target: i32, name: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .and_then(|p| p.strip_prefix("/").ok())
+        .ok_or_else(|| io::Error::other("invalid snapshot path"))?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let source = sys::open_restore_parent(root, &cstr(parent.as_os_str())?)?;
+    let source_name = cstr(
+        path.file_name()
+            .ok_or_else(|| io::Error::other("missing snapshot name"))?,
+    )?;
+    Undo::copy_tree(
+        source.as_raw_fd(),
+        &source_name,
+        target,
+        &CString::new(name)?,
+    )
+}
+
+pub(crate) fn current_secure(root: i32, p: &Path) -> io::Result<Option<State>> {
     let parent = p
         .parent()
         .ok_or_else(|| io::Error::other("path has no parent"))?
@@ -927,7 +950,6 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
     if std::env::var_os("SAQTA_TEST_STOP_UNDO").is_some_and(|s| s == "1") {
         sys::kill(sys::pid(), libc::SIGSTOP);
     }
-    let started = Instant::now();
     let mut output = Progress::new(io::stdout());
     if std::env::var_os("SAQTA_SUPERVISED").is_some() {
         bail!("run undo in your own terminal");
@@ -947,6 +969,16 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
         bail!("command {id} already undone");
     }
     let folder = home.join("cmd").join(id.to_string());
+    let release_from = folder.join("release-from");
+    if release_from.exists() {
+        let held: u64 = serde_json::from_slice(&fs::read(release_from)?)?;
+        if !crate::hold::directory(&home, held)
+            .join("released")
+            .exists()
+        {
+            bail!("release for command {held} is incomplete. Run `saqta release {held}` to resume");
+        }
+    }
     let lock = journal::private_file(&folder.join("undo.lock"))?;
     sys::flock_exclusive(lock.as_raw_fd(), true).context("another undo is in progress")?;
     if folder.join("undone").exists() {
@@ -957,12 +989,87 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
         }
         bail!("command {id} already undone");
     }
-    if let Some(warning) = r.warning {
-        bail!("journal writes failed: {warning}; inspect quarantine before restoring by hand");
+    if resume && crate::hold::pending(&home, id) {
+        crate::hold::resume(&home, r)?;
+        if !folder.join("end").exists() {
+            journal::Journal::reopen(home, id)?.end(77 << 8)?;
+        }
+        output.line(format_args!("finished automatic restore for command {id}"));
+        return Ok(0);
     }
+    if crate::hold::pending(&home, id) {
+        bail!("an automatic restore stopped partway. Run `saqta undo {id} --resume`");
+    }
+    let mut r = r;
+    let mut posts = journal::post_states(&folder)?;
+    crate::hold::exclude_restored(&home, &mut r, &mut posts)?;
     let backup_path = home
         .join("q/main")
         .join(format!("undo-{id}-{}", r.meta.start_ns));
+    let qpath = home.join("q/main").join(id.to_string());
+    apply(
+        r,
+        Apply {
+            home: &home,
+            folder: &folder,
+            backup_path,
+            qpath,
+            posts,
+            dry_run,
+            force,
+            verbose,
+            resume,
+            automatic: false,
+            seal: None,
+        },
+    )
+}
+
+pub struct Apply<'a> {
+    pub home: &'a Path,
+    pub folder: &'a Path,
+    pub backup_path: PathBuf,
+    pub qpath: PathBuf,
+    pub posts: BTreeMap<String, Option<State>>,
+    pub dry_run: bool,
+    pub force: bool,
+    pub verbose: bool,
+    pub resume: bool,
+    pub automatic: bool,
+    pub seal: Option<&'a Path>,
+}
+
+pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
+    let Apply {
+        home,
+        folder,
+        backup_path,
+        qpath,
+        mut posts,
+        dry_run,
+        force,
+        verbose,
+        resume,
+        automatic,
+        seal,
+    } = options;
+    let id = r.meta.id;
+    let started = Instant::now();
+    let mut output = if automatic {
+        Progress::silent(io::stdout())
+    } else {
+        Progress::new(io::stdout())
+    };
+    if folder.join("undone").exists() {
+        if resume {
+            let _ = fs::remove_file(folder.join("undo-in-progress"));
+            return Ok(0);
+        }
+        bail!("command {id} already undone");
+    }
+    if let Some(warning) = &r.warning {
+        bail!("journal writes failed: {warning}; inspect quarantine before restoring by hand");
+    }
     let resuming = folder.join("undo-in-progress").exists()
         || (resume && backup_path.join("state.json").exists());
     if resuming && !resume {
@@ -972,7 +1079,6 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
         );
     }
     let root = sys::open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY, 0)?;
-    let mut posts = journal::post_states(&folder)?;
     let observations: std::collections::BTreeMap<String, Option<State>> =
         fs::read(home.join("undo-posts.json"))
             .ok()
@@ -995,10 +1101,14 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
             match current {
                 Ok(current) => {
                     if let Some(expected) = posts.get(name) {
-                        if !same_post(expected.as_ref(), current.as_ref())
-                            && !(expected.as_ref().is_some_and(State::directory)
-                                && observations.get(name) == Some(&current))
-                        {
+                        let matches = if automatic {
+                            expected == &current
+                        } else {
+                            same_post(expected.as_ref(), current.as_ref())
+                                || (expected.as_ref().is_some_and(State::directory)
+                                    && observations.get(name) == Some(&current))
+                        };
+                        if !matches {
                             conflicts.push(name.clone());
                         }
                     } else if r.status == "incomplete" {
@@ -1028,15 +1138,37 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
             }
         }
     }
+    if automatic && !resuming {
+        for (name, expected) in &posts {
+            if current_secure(root.as_raw_fd(), &journal::path(name)?)
+                .as_ref()
+                .ok()
+                != Some(expected)
+            {
+                conflicts.push(name.clone());
+            }
+        }
+    }
     conflicts.sort();
     conflicts.dedup();
     let (git_indexes, conflicts): (Vec<_>, Vec<_>) = conflicts.into_iter().partition(|name| {
-        !inaccessible.contains(name) && journal::path(name).is_ok_and(|p| is_git_index(&p))
+        !automatic
+            && !inaccessible.contains(name)
+            && journal::path(name).is_ok_and(|p| is_git_index(&p))
     });
-    let backup_path = home
-        .join("q/main")
-        .join(format!("undo-{id}-{}", r.meta.start_ns));
     if !conflicts.is_empty() && !force && !dry_run {
+        if automatic {
+            let visible = conflicts
+                .iter()
+                .take(10)
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            bail!(
+                "checked post-state changed for {} path(s): {}. Retained versions kept.",
+                conflicts.len(),
+                visible.join(", ")
+            );
+        }
         bail!("{}", conflict_message(id, &conflicts, &backup_path));
     }
     if !inaccessible.is_empty() && !dry_run {
@@ -1050,7 +1182,6 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
                 .join("\n")
         );
     }
-    let qpath = home.join("q/main").join(id.to_string());
     let q = sys::open_at(
         libc::AT_FDCWD,
         &cstr(qpath.as_os_str())?,
@@ -1137,7 +1268,9 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
     let recovery = if resuming {
         checkpoints::load(&backup_path)?
     } else {
-        fs::DirBuilder::new().mode(0o700).create(&backup_path)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).recursive(automatic && resume);
+        builder.create(&backup_path)?;
         let mut origins = BTreeMap::new();
         for (name, (origin, actual)) in &alias_posts {
             if alias_keys.contains(&(origin.dev, origin.ino))
@@ -1221,13 +1354,18 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
     let mut summary = Summary::default();
     let result = restore_effects(&mut undo, &r, verbose, &mut summary).and_then(|()| {
         let restored = restored_origins(&r)?;
-        undo.save_directory_observations(&home, &r, &restored, observations)?;
-        undo.save_alias_observations(&home, restored, alias_posts)?;
+        undo.save_directory_observations(home, &r, &restored, observations)?;
+        undo.save_alias_observations(home, restored, alias_posts)?;
+        if let Some(path) = seal {
+            crate::hold::seal_posts(undo.root.as_raw_fd(), &r.effects, path)?;
+        }
         #[cfg(debug_assertions)]
-        if std::env::var_os("SAQTA_TEST_ABORT_UNDO_FINALIZE").is_some_and(|s| s == "1") {
+        if !automatic
+            && std::env::var_os("SAQTA_TEST_ABORT_UNDO_FINALIZE").is_some_and(|s| s == "1")
+        {
             sys::exit(86);
         }
-        journal::mark_undone(&folder)?;
+        journal::mark_undone(folder)?;
         fs::remove_file(folder.join("undo-in-progress"))?;
         Ok(())
     });

@@ -66,6 +66,9 @@ impl Sandbox {
         // Enable diagnostics for the whole fixture, including direct commands,
         // so tests of environment preservation still compare identical inputs.
         env.insert("SAQTA_DEBUG".into(), "1".into());
+        // M1-M5 fixtures and the property harness exercise explicit undo.
+        // The rules suite enables the production policy.
+        env.insert("SAQTA_RULES".into(), "off".into());
         for key in [
             "HOME",
             "XDG_DATA_HOME",

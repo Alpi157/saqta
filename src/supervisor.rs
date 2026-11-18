@@ -1,15 +1,18 @@
 use crate::{
     capture::Capture,
+    classify,
     exec::{Prepared, fallback},
-    filter,
+    filter, hold,
     journal::Journal,
     sys,
 };
-fn report(fd: i32, status: i32, detached: bool) {
-    let mut msg = [0u8; 8];
+fn report(fd: i32, status: i32, detached: bool, message: &str) {
+    let mut msg = [0u8; 12];
     msg[..4].copy_from_slice(&status.to_ne_bytes());
-    msg[4..].copy_from_slice(&(detached as i32).to_ne_bytes());
+    msg[4..8].copy_from_slice(&(detached as i32).to_ne_bytes());
+    msg[8..].copy_from_slice(&(message.len() as u32).to_ne_bytes());
     sys::write(fd, &msg);
+    sys::write(fd, message.as_bytes());
 }
 // W re-execs this entry before any dynamic supervisor work. Only C takes the
 // restricted post-fork path; S is now a fresh single-threaded Rust process.
@@ -38,28 +41,49 @@ pub fn internal(args: Vec<std::ffi::OsString>) -> anyhow::Result<i32> {
             .ok_or_else(|| anyhow::anyhow!("missing supervisor home"))?,
     );
     let argv = args
-        .get(6..)
+        .get(7..)
         .ok_or_else(|| anyhow::anyhow!("missing command"))?
         .to_vec();
+    let cwd = std::env::current_dir()?;
+    let session = args
+        .get(6)
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let command = Prepared::new(argv.clone())?;
     let bpf = filter::program();
     let cs = sys::pair()?;
     let sf = sys::signal_fd(&[libc::SIGCHLD])?;
     let chld = sys::action(libc::SIGCHLD, None)?;
-    let journal = match Journal::start(home.clone(), &argv, &std::env::current_dir()?, log_fd) {
+    let journal = match Journal::start_session(home.clone(), &argv, &cwd, log_fd, session.clone()) {
         Ok(j) => j,
         Err(_) => {
-            report(ws, -2, false);
+            report(ws, -2, false, "");
             return Ok(0);
         }
     };
     let mut capture = match Capture::new(journal) {
         Ok(c) => c,
         Err(_) => {
-            report(ws, -1, false);
+            report(ws, -1, false, "");
             return Ok(0);
         }
     };
+    if std::env::var_os("SAQTA_RULES").is_none_or(|s| s != "off") {
+        let (policy, errors) = crate::rules::Policy::load(&cwd);
+        capture.policy = Some(policy);
+        for error in errors {
+            sys::write(log_fd, format!("rules configuration: {error}\n").as_bytes());
+        }
+        if let Some(session) = &session {
+            match hold::prior(&home, session, capture.journal.meta.id) {
+                Ok(created) => capture.prior_created = created,
+                Err(error) => {
+                    sys::write(log_fd, format!("session history: {error}\n").as_bytes());
+                }
+            }
+        }
+    }
     let mut prefix = home.join("run").into_os_string().as_bytes().to_vec();
     prefix.push(b'/');
     start(
@@ -97,14 +121,14 @@ fn start(
         || sys::set_group(0).is_err()
         || sys::block(&[libc::SIGCHLD]).is_err()
     {
-        report(ws, -1, false);
+        report(ws, -1, false, "");
         sys::exit(0);
     }
     sys::disposition(libc::SIGCHLD, libc::SIG_DFL);
     let child = match sys::fork() {
         Ok(p) => p,
         Err(_) => {
-            report(ws, -1, false);
+            report(ws, -1, false, "");
             sys::exit(0);
         }
     };
@@ -165,6 +189,8 @@ fn start(
 fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut Capture) {
     let (mut done, mut status, mut sent, mut gone) = (false, 0, false, false);
     let mut deadline = None;
+    let mut killed = false;
+    let mut foreground = 0;
     let (mut received, mut answered) = (0u64, 0u64);
     loop {
         let mut fds = [
@@ -247,6 +273,13 @@ fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut
                 .journal
                 .notification_progress(received, answered, n.id, n.pid);
         }
+        if done && !hup && capture.policy.is_some() {
+            capture.observe_pending();
+        }
+        if !hup && !killed && capture.tripped() {
+            sys::kill_tree();
+            killed = true;
+        }
         if done && !sent {
             if listener < 0 {
                 hup = true;
@@ -271,22 +304,184 @@ fn serve(ws: i32, sf: i32, listener: i32, child: i32, log_fd: i32, capture: &mut
                     b"supervisor: background tasks remain\n"
                 },
             );
-            if hup || sys::parent_pid() == 1 {
-                // PID 1 exiting destroys this namespace, including S.
-                capture.finish(status);
-            } else {
-                capture.snapshot();
+            let final_now = hup || killed || sys::parent_pid() == 1;
+            if final_now && !hup {
+                // PID 1 exiting would destroy the remaining tasks and S.
+                sys::kill_tree();
+                while let Some((pid, _)) = sys::wait(-1, true) {
+                    capture.exited(pid as u32);
+                }
+                hup = true;
             }
+            if !final_now {
+                foreground = capture.journal.next_seq() - 1;
+                if capture.policy.is_some() {
+                    capture.snapshot();
+                }
+            }
+            let (reported, message) = if !final_now
+                && capture.policy.is_some()
+                && assess(capture, 0).is_ok_and(|(_, decision)| decision.rule().is_some())
+            {
+                sys::freeze_tree();
+                let result = match capture.background() {
+                    Ok(mut background) => {
+                        // Keep both journal phases under the same supervisor. The
+                        // foreground post-state is sealed before the tree resumes.
+                        let result = settle(capture, status, true, false, 0);
+                        background.breaker = std::mem::take(&mut capture.breaker);
+                        *capture = background;
+                        foreground = 0;
+                        result
+                    }
+                    Err(error) => {
+                        let _ = std::fs::write(
+                            capture.journal.folder.join("rules-error"),
+                            format!("{error:#}"),
+                        );
+                        settle(capture, status, false, false, 0)
+                    }
+                };
+                sys::tree_signal(libc::SIGCONT);
+                result
+            } else {
+                settle(capture, status, final_now, false, 0)
+            };
             if !gone {
-                report(ws, status, !hup);
+                report(ws, reported, !hup, &message);
             }
             sent = true;
         }
         if hup {
             if sent && !capture.journal.folder.join("end").exists() {
-                capture.finish(status);
+                settle(capture, status, true, true, foreground);
             }
             break;
         }
     }
+}
+
+fn settle(
+    capture: &mut Capture,
+    status: i32,
+    finish: bool,
+    detached: bool,
+    after: u64,
+) -> (i32, String) {
+    if finish {
+        capture.settle();
+    }
+    if capture.policy.is_none() {
+        if finish {
+            capture.finish(status);
+        } else {
+            capture.snapshot();
+        }
+        return (status, String::new());
+    }
+    capture.snapshot();
+    let result = evaluate(capture, finish, detached, after);
+    let (status, message) = match result {
+        Ok(Some((true, text))) => (77 << 8, text),
+        Ok(Some((false, text))) => (status, text),
+        Ok(None) => (status, String::new()),
+        Err(e) => {
+            let j = &capture.journal;
+            let _ = std::fs::write(j.folder.join("rules-error"), format!("{e:#}"));
+            let id = j.meta.id;
+            (
+                125 << 8,
+                format!(
+                    "[saqta {id}] Automatic protection could not finish. See: saqta show {id}\n"
+                ),
+            )
+        }
+    };
+    if capture.journal.meta.session.is_some() {
+        let created: std::collections::HashSet<_> = capture
+            .created_paths()
+            .filter_map(classify::Birth::read)
+            .collect();
+        if !created.is_empty() {
+            let _ = crate::journal::json_write(&capture.journal.folder.join("created"), &created);
+        }
+    }
+    if finish && let Err(e) = capture.journal.end(status) {
+        capture.journal.error(&e);
+    }
+    (status, message)
+}
+
+fn assess(
+    capture: &Capture,
+    after: u64,
+) -> anyhow::Result<(crate::journal::Record, classify::Decision)> {
+    let j = &capture.journal;
+    let policy = capture
+        .policy
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("rules are off"))?;
+    let record = crate::journal::load(&j.home, j.meta.id)?;
+    let decision = classify::evaluate(
+        &record,
+        &j.folder,
+        &j.quarantine,
+        policy,
+        capture.tripped(),
+        after,
+    )?;
+    Ok((record, decision))
+}
+
+fn evaluate(
+    capture: &Capture,
+    finish: bool,
+    detached: bool,
+    after: u64,
+) -> anyhow::Result<Option<(bool, String)>> {
+    let Some(policy) = &capture.policy else {
+        return Ok(None);
+    };
+    let j = &capture.journal;
+    let after = if j.folder.join("defer-rules").exists() {
+        0
+    } else {
+        after
+    };
+    let (record, decision) = assess(capture, after)?;
+    let id = j.meta.id;
+    if let Some(rule) = decision.rule() {
+        if finish {
+            let mut message = rule.message(
+                id,
+                &decision.names(),
+                &policy.project,
+                decision.groups.len() > 1,
+            );
+            if record
+                .effects
+                .iter()
+                .any(|e| e.op == "not protected" && record.outcomes.get(&e.seq) != Some(&false))
+            {
+                message.push_str(&format!(
+                    "  Some effects could not be protected. See: saqta show {id}\n"
+                ));
+            }
+            hold::start(j, record, &decision, detached, after)?;
+            return Ok(Some((true, message)));
+        }
+        // A live background process can still modify these paths. Defer the
+        // restore until its final post-state has been captured.
+        crate::journal::json_write(&j.folder.join("defer-rules"), &true)?;
+        return Ok(None);
+    }
+    if decision.valuable != 0 && !detached {
+        let count = decision.valuable;
+        let noun = if count == 1 { "file" } else { "files" };
+        return Ok(Some((
+            false,
+            format!("[saqta {id}] kept {count} edited {noun} (undo: saqta undo {id})\n"),
+        )));
+    }
+    Ok(None)
 }
