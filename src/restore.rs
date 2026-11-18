@@ -63,6 +63,10 @@ enum Action {
 struct Recovery {
     completed_through: Option<u64>,
     origins: BTreeMap<String, (State, State)>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    alias_parents: BTreeMap<String, State>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    repaired_aliases: BTreeMap<String, (State, State)>,
     serial: u64,
     conflicts: HashSet<String>,
     git_indexes: HashSet<String>,
@@ -332,6 +336,10 @@ impl Undo {
         Ok(aliases)
     }
     fn remember_origins(&mut self, e: &Effect) -> io::Result<()> {
+        if matches!(e.op.as_str(), "create" | "rename" | "exchange") {
+            reverse_repair_names(&mut self.recovery.alias_parents, e)?;
+            reverse_repair_names(&mut self.recovery.repaired_aliases, e)?;
+        }
         if matches!(e.op.as_str(), "rename" | "exchange") {
             let a = journal::path(&e.path)?;
             let b = journal::path(&e.path2)?;
@@ -383,15 +391,31 @@ impl Undo {
             let post = self
                 .backup_path
                 .join(format!("{}-post", self.recovery.serial));
+            let before = e
+                .note
+                .before
+                .clone()
+                .ok_or_else(|| io::Error::other("missing pre-image metadata"))?;
+            let name = journal::display(p);
+            if name != e.path && !p.starts_with(&self.backup_path) {
+                // The effect log cannot refresh lineage or directory state for
+                // an alias it never named.
+                self.recovery
+                    .repaired_aliases
+                    .insert(name.clone(), (before.clone(), st));
+                if let Some(parent) = p.parent()
+                    && let Ok(Some(state)) = self.state(parent)
+                {
+                    self.recovery
+                        .alias_parents
+                        .insert(journal::display(parent), state);
+                }
+            }
             self.push_copy(&live, &post);
             self.recovery.pending.push(Action::Write {
                 from: journal::display(source),
                 to: journal::display(&live),
-                before: e
-                    .note
-                    .before
-                    .clone()
-                    .ok_or_else(|| io::Error::other("missing pre-image metadata"))?,
+                before,
             });
             self.push_move(&live, p);
             self.push_move(&post, &live);
@@ -539,6 +563,15 @@ impl Undo {
                 observations.insert(journal::display(&p), st);
             }
         }
+        for (name, before) in &self.recovery.alias_parents {
+            let p = journal::path(name)?;
+            if let Ok(Some(current)) = self.state(&p)
+                && current.directory()
+                && current.same_inode(before)
+            {
+                observations.insert(name.clone(), Some(current));
+            }
+        }
         journal::synced_json_write(&home.join("undo-posts.json"), &observations)?;
         Ok(())
     }
@@ -548,6 +581,13 @@ impl Undo {
         restored: BTreeMap<String, State>,
         mut alias_posts: BTreeMap<String, (State, State)>,
     ) -> io::Result<()> {
+        for (name, (origin, repaired)) in &self.recovery.repaired_aliases {
+            if let Some(actual) = self.state(&journal::path(name)?)?
+                && actual.same_inode(repaired)
+            {
+                alias_posts.insert(name.clone(), (origin.clone(), actual));
+            }
+        }
         for (name, origin) in restored {
             if origin.mode & libc::S_IFMT == libc::S_IFREG
                 && let Some(actual) = self.state(&journal::path(&name)?)?
@@ -645,6 +685,21 @@ fn applied_effects(record: &journal::Record) -> impl DoubleEndedIterator<Item = 
         record.outcomes.get(&e.seq) != Some(&false)
             && !matches!(e.op.as_str(), "blocked" | "not protected" | "expired")
     })
+}
+fn reverse_repair_names<T>(names: &mut BTreeMap<String, T>, e: &Effect) -> io::Result<()> {
+    if !names.is_empty() {
+        let mut paths = std::mem::take(names)
+            .into_iter()
+            .map(|(name, value)| Ok((journal::path(&name)?, value)))
+            .collect::<io::Result<_>>()?;
+        reverse_names(&mut paths, e)?;
+        names.extend(
+            paths
+                .into_iter()
+                .map(|(path, value)| (journal::display(&path), value)),
+        );
+    }
+    Ok(())
 }
 fn take_subtree<T>(names: &mut BTreeMap<PathBuf, T>, source: &Path) -> Vec<(PathBuf, T)> {
     let keys: Vec<_> = names

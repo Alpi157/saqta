@@ -730,10 +730,14 @@ impl Capture {
         Ok(())
     }
     fn keep_link(&mut self, p: &Resolved, e: &mut Effect) -> io::Result<()> {
-        if self.created.contains(p.path.as_os_str()) {
+        if self.created.contains(p.path.as_os_str())
+            && p.stat.as_ref().is_none_or(|st| st.st_nlink <= 1)
+        {
             e.note.kept = "created earlier".into();
             return Ok(());
         }
+        // A new alias can be the last recorded name of a pre-existing shared
+        // inode. Undo must be able to repair through it before undoing creation.
         let q = format!("{}-{}", self.journal.next_seq(), journal::now());
         match sys::link_at(
             p.parent.as_raw_fd(),
