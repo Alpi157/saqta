@@ -224,6 +224,88 @@ os.close(second)
 }
 
 #[test]
+fn resume_keeps_a_partial_plan_tail_and_replays_the_last_complete_plan() {
+    let (s, p) = capture_fixture("speed-partial-plan");
+    for i in 0..200 {
+        fs::write(p.join(format!("f{i}")), format!("before {i}")).unwrap();
+    }
+    let before = tree_hash(&p);
+    assert_success(&script(&s, &p, "find . -type f -delete"));
+    let id = last_id(&s);
+    let mut c = s.saqta(&["undo", &id.to_string()]);
+    c.env("SAQTA_TEST_ABORT_AFTER", "65");
+    assert_eq!(run(c).status.code(), Some(86));
+    let home = std::path::PathBuf::from(&s.env[std::ffi::OsStr::new("SAQTA_HOME")]);
+    let backup = fs::read_dir(home.join("q/main"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"undo-")
+        })
+        .unwrap();
+    let log = backup.join("state.log");
+    let mut bytes = fs::read(&log).unwrap();
+    assert!(bytes.iter().filter(|&&b| b == b'\n').count() > 1);
+    bytes.extend_from_slice(b"{\"unfinished\"");
+    fs::write(&log, &bytes).unwrap();
+    assert_success(&run(s.saqta(&["undo", &id.to_string(), "--resume"])));
+    assert_tree(&before, &p);
+    let tail = fs::read_dir(&backup)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"state-tail-")
+        })
+        .unwrap();
+    assert_eq!(fs::read(tail).unwrap(), bytes);
+}
+
+#[test]
+fn malformed_complete_plan_refuses_resume_without_mutations() {
+    use std::io::Write;
+    let (s, p) = capture_fixture("speed-damaged-plan");
+    for i in 0..10 {
+        fs::write(p.join(format!("f{i}")), b"original").unwrap();
+    }
+    assert_success(&script(&s, &p, "find . -type f -delete"));
+    let id = last_id(&s);
+    let mut c = s.saqta(&["undo", &id.to_string()]);
+    c.env("SAQTA_TEST_ABORT_AFTER", "3");
+    assert_eq!(run(c).status.code(), Some(86));
+    let before = tree_hash(&p);
+    let home = std::path::PathBuf::from(&s.env[std::ffi::OsStr::new("SAQTA_HOME")]);
+    let log = fs::read_dir(home.join("q/main"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"undo-")
+        })
+        .unwrap()
+        .join("state.log");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(log)
+        .unwrap()
+        .write_all(b"damaged complete frame\n")
+        .unwrap();
+    assert!(
+        !run(s.saqta(&["undo", &id.to_string(), "--resume"]))
+            .status
+            .success()
+    );
+    assert_tree(&before, &p);
+}
+
+#[test]
 fn fchdir_between_deletes_invalidates_cached_cwd() {
     let (s, p) = capture_fixture("speed-fchdir");
     if !python(&s) {
@@ -308,6 +390,45 @@ int main(int argc,char **argv) {
     }
     assert_success(&o);
     restore_exact(&s, &p, &before);
+}
+
+#[test]
+fn cross_mount_publication_resumes_after_source_removal() {
+    let (s, p) = capture_fixture("speed-cross-resume");
+    if !namespace(&s, false) {
+        return;
+    }
+    for i in 0..8 {
+        fs::write(p.join(format!("f{i}")), format!("version {i}")).unwrap();
+    }
+    let before = tree_hash(&p);
+    let text = r#"
+mount --bind "$SAQTA_HOME" "$SAQTA_HOME" || exit 77
+"$1" exec -- find . -type f -delete || exit 1
+SAQTA_TEST_ABORT_AFTER=3 "$1" undo 1
+code=$?
+[ "$code" -eq 86 ] || exit 1
+"$1" undo 1 --resume
+"#;
+    let mut c = s.command("unshare");
+    c.args([
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "sh",
+        "-c",
+        text,
+        "sh",
+        BIN,
+    ])
+    .current_dir(&p);
+    let o = run(c);
+    if o.status.code() == Some(77) {
+        note("SKIP: bind mount unavailable for interrupted cross-mount undo");
+        return;
+    }
+    assert_success(&o);
+    assert_tree(&before, &p);
 }
 
 #[test]

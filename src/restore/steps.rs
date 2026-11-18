@@ -158,6 +158,7 @@ impl Undo {
     }
     pub(super) fn execute(&mut self) -> io::Result<()> {
         while let Some(action) = self.recovery.pending.get(self.recovery.cursor).cloned() {
+            let knowledge = action.clone();
             match action {
                 Action::Move { from, to } => self.execute_move(from, to)?,
                 Action::Copy { from, to } => {
@@ -171,6 +172,24 @@ impl Undo {
                     first,
                     second,
                 } => self.execute_exchange(a, b, first, second)?,
+            }
+            // Only optimize absences proved by preflight or a completed move.
+            // Publication still uses NOREPLACE if unrelated work appears later.
+            match knowledge {
+                Action::Move { from, to } => {
+                    if self.recovery.before.as_ref().is_some_and(State::directory) {
+                        self.absent.clear();
+                    }
+                    self.absent.remove(&journal::path(&to)?);
+                    self.absent.insert(journal::path(&from)?);
+                }
+                Action::Directory { path, .. } => {
+                    self.absent.remove(&journal::path(&path)?);
+                }
+                Action::Write { to, .. } => {
+                    self.absent.remove(&journal::path(&to)?);
+                }
+                Action::Copy { .. } | Action::Exchange { .. } => self.absent.clear(),
             }
             // Abort after the mutation but before its completion record. Resume must identify it.
             #[cfg(debug_assertions)]
@@ -193,8 +212,13 @@ impl Undo {
     fn execute_move(&mut self, from: String, to: String) -> io::Result<()> {
         let from = journal::path(&from)?;
         let to = journal::path(&to)?;
+        let a = self.parent(&from)?;
+        let b = self.parent(&to)?;
+        let source = sys::stat_at(a.fd.as_raw_fd(), &a.name)?
+            .as_ref()
+            .map(State::from_stat);
         if self.recovery.before.is_none() {
-            self.recovery.before = self.state(&from)?;
+            self.recovery.before = source.clone();
             if self.recovery.before.is_none() {
                 return Err(io::Error::other("missing recovery move source"));
             }
@@ -203,28 +227,33 @@ impl Undo {
         let expected = self
             .recovery
             .before
-            .as_ref()
+            .clone()
             .ok_or_else(|| io::Error::other("missing move identity"))?;
-        if self.state(&from)?.is_none() {
-            if !self.state(&to)?.is_some_and(|s| s.same_inode(expected)) {
-                // Cross-filesystem copy has its own durable publication identity.
-                self.copy_atomic(&from, &to)?;
-            }
-        } else {
-            if !self.state(&from)?.is_some_and(|s| s.same_inode(expected)) {
+        if let Some(actual) = source {
+            if !actual.same_inode(&expected) {
                 return Err(io::Error::other(
                     "recovery move input changed; kept both versions",
                 ));
             }
-            match self.rename(&from, &to) {
+            match sys::rename_at(
+                a.fd.as_raw_fd(),
+                &a.name,
+                b.fd.as_raw_fd(),
+                &b.name,
+                libc::RENAME_NOREPLACE,
+            ) {
                 Ok(()) => {}
                 Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
                     self.copy_atomic(&from, &to)?;
-                    let a = self.parent(&from)?;
                     sys::unlink_at(a.fd.as_raw_fd(), &a.name, expected.directory())?;
                 }
                 Err(e) => return Err(e),
             }
+        } else if !sys::stat_at(b.fd.as_raw_fd(), &b.name)?
+            .as_ref()
+            .is_some_and(|s| State::from_stat(s).same_inode(&expected))
+        {
+            self.copy_atomic(&from, &to)?;
         }
 
         Ok(())
