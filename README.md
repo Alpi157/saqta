@@ -36,6 +36,13 @@ The default store is `$XDG_DATA_HOME/saqta` or `$HOME/.local/share/saqta`. `SAQT
 
 Two hard links modified in place may return as separate files. Capture does not promise power-loss durability or protect against hostile filesystem races. Status: pre-alpha. Don't rely on it yet.
 
+Rename-over capture can exceed the 25 µs added-cost target, especially when the
+command and supervisor share two SMT threads of one core. On the Ryzen 9 9900X
+under WSL2, the release build with synchronous wake-up added 88.75 µs with
+`taskset -c 0,1`, compared with 25.31 µs on unrestricted CPUs. These are medians
+of three runs of 20,000 operations. Review accepted this performance limit;
+capture and undo guarantees remain unchanged. See the [M5 report](review/REPORT.md).
+
 Run `cargo test --locked` and `SAQTA_FORCE_PROC_MEM=1 cargo test --locked --test capture` for the normal and forced memory fallback suites. `scripts/overhead.sh` measures a release build on fresh disposable fixtures. Its defaults are 20,000 operations and three repetitions; `N` and `REPS` override them. It is not run in CI.
 
 The design is described in [capture](docs/decisions/0004-capture.md), [journaling](docs/decisions/0005-journal.md), and [undo safety](docs/decisions/0006-undo-safety.md).
