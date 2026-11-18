@@ -493,3 +493,8 @@ fn preserved_created_hard_link_is_immutable_after_later_write() {
     }
     assert!(snapshots.contains(&b"original 0 0\0".to_vec()));
 }
+
+#[test]
+fn regression_write_new_alias_after_removing_origin_repairs_surviving_inode() {
+    check_interrupted(vec![op(12, 11, 17), op(9, 11, 0), op(1, 17, 0)], 1);
+}

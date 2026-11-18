@@ -311,6 +311,87 @@ int main(int argc,char **argv) {
 }
 
 #[test]
+fn unpublished_positive_batch_keeps_failed_outcomes_and_recovers_successes() {
+    let (s, p) = capture_fixture("speed-positive-crash");
+    if !python(&s) {
+        return;
+    }
+    fs::create_dir(p.join("directory")).unwrap();
+    for name in ["victim", "source", "directory/keep"] {
+        fs::write(p.join(name), name).unwrap();
+    }
+    let before = tree_hash(&p);
+    let text = "import os; os.unlink('victim')\ntry: os.rename('source','directory')\nexcept OSError: pass";
+    let mut c = s.exec(&["--", "python3", "-c", text]);
+    c.current_dir(&p);
+    assert_success(&run(c));
+    let home = std::path::PathBuf::from(&s.env[std::ffi::OsStr::new("SAQTA_HOME")]);
+    let folder = home.join("cmd/1");
+    let positives: Vec<u64> =
+        serde_json::from_slice(&fs::read(folder.join("outcomes-positive.json")).unwrap()).unwrap();
+    assert!(!positives.is_empty());
+    assert!(
+        fs::read_to_string(folder.join("outcomes.log"))
+            .unwrap()
+            .contains("\t0\n")
+    );
+    // Model death before the atomic success publication. Failed observations
+    // remain durable, and unknown successes keep the existing replay behavior.
+    fs::remove_file(folder.join("outcomes-positive.json")).unwrap();
+    fs::remove_file(folder.join("end")).unwrap();
+    assert_success(&undo(&s, 1));
+    assert_tree(&before, &p);
+}
+
+#[test]
+fn damaged_published_positive_batch_refuses_undo() {
+    let (s, p) = capture_fixture("speed-positive-damage");
+    fs::write(p.join("victim"), b"original").unwrap();
+    assert_success(&script(&s, &p, "rm victim"));
+    let before = tree_hash(&p);
+    let home = std::path::PathBuf::from(&s.env[std::ffi::OsStr::new("SAQTA_HOME")]);
+    fs::write(home.join("cmd/1/outcomes-positive.json"), b"[broken").unwrap();
+    assert!(!undo(&s, 1).status.success());
+    assert_tree(&before, &p);
+}
+
+#[test]
+fn unacknowledged_rename_batch_prefix_preserves_both_original_names() {
+    let (s, p) = capture_fixture("speed-group-tail");
+    if !python(&s) {
+        return;
+    }
+    fs::write(p.join("a"), b"original a").unwrap();
+    fs::write(p.join("b"), b"original b").unwrap();
+    let before = tree_hash(&p);
+    let mut c = s.exec(&["--", "python3", "-c", "import os; os.replace('a','b')"]);
+    c.current_dir(&p);
+    assert_success(&run(c));
+    let home = std::path::PathBuf::from(&s.env[std::ffi::OsStr::new("SAQTA_HOME")]);
+    let folder = home.join("cmd/1");
+    let raw = fs::read_to_string(folder.join("effects.log")).unwrap();
+    let lines: Vec<_> = raw.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let fields: Vec<_> = lines[0].split('\t').collect();
+    assert_eq!(fields[3], "delete");
+    // Model the stopped syscall before CONTINUE, with a partial group write.
+    fs::rename(p.join("b"), p.join("a")).unwrap();
+    fs::hard_link(home.join("q/main/1").join(fields[6]), p.join("b")).unwrap();
+    let damaged = format!("{}\n{}", lines[0], &lines[1][..lines[1].len() / 2]);
+    fs::write(folder.join("effects.log"), &damaged).unwrap();
+    for file in ["end", "post.log", "outcomes-positive.json"] {
+        fs::remove_file(folder.join(file)).unwrap();
+    }
+    assert_success(&undo(&s, 1));
+    assert_tree(&before, &p);
+    assert_eq!(
+        fs::read_to_string(folder.join("effects.log")).unwrap(),
+        damaged
+    );
+    assert!(folder.join("tail-recovery.json").exists());
+}
+
+#[test]
 fn skipped_filesystem_cache_does_not_keep_a_mount_busy() {
     let (s, p) = capture_fixture("speed-unmount");
     if !python(&s) || !namespace(&s, false) {
