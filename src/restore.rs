@@ -1,4 +1,5 @@
 //! Undo checks conflicts, plans reverse effects and keeps alias lineage.
+mod checkpoints;
 mod steps;
 use crate::{
     journal::{self, Effect, State},
@@ -20,6 +21,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
+    rc::Rc,
     time::Instant,
 };
 
@@ -27,7 +29,7 @@ fn cstr(p: &OsStr) -> io::Result<CString> {
     CString::new(p.as_bytes()).map_err(io::Error::other)
 }
 struct Parent {
-    fd: OwnedFd,
+    fd: Rc<OwnedFd>,
     name: CString,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,6 +74,10 @@ struct Recovery {
 }
 struct Undo {
     root: OwnedFd,
+    qfd: Rc<OwnedFd>,
+    backup_fd: Rc<OwnedFd>,
+    checkpoints: checkpoints::Checkpoints,
+    absent: HashSet<PathBuf>,
     log: File,
     recovery: Recovery,
     backup_path: PathBuf,
@@ -85,6 +91,22 @@ impl Undo {
         let parent = p
             .parent()
             .ok_or_else(|| io::Error::other("path has no parent"))?;
+        let pinned = if parent.as_os_str() == self.qpath.as_os_str() {
+            Some(&self.qfd)
+        } else if parent.as_os_str() == self.backup_path.as_os_str() {
+            Some(&self.backup_fd)
+        } else {
+            None
+        };
+        if let Some(fd) = pinned {
+            return Ok(Parent {
+                fd: Rc::clone(fd),
+                name: cstr(
+                    p.file_name()
+                        .ok_or_else(|| io::Error::other("cannot restore root"))?,
+                )?,
+            });
+        }
         let parent = parent.strip_prefix("/").map_err(io::Error::other)?;
         let parent = if parent.as_os_str().is_empty() {
             Path::new(".")
@@ -92,7 +114,10 @@ impl Undo {
             parent
         };
         Ok(Parent {
-            fd: sys::open_restore_parent(self.root.as_raw_fd(), &cstr(parent.as_os_str())?)?,
+            fd: Rc::new(sys::open_restore_parent(
+                self.root.as_raw_fd(),
+                &cstr(parent.as_os_str())?,
+            )?),
             name: cstr(
                 p.file_name()
                     .ok_or_else(|| io::Error::other("cannot restore root"))?,
@@ -100,10 +125,19 @@ impl Undo {
         })
     }
     fn state(&self, p: &Path) -> io::Result<Option<State>> {
+        if p.parent().is_some_and(|parent| {
+            parent.as_os_str() == self.qpath.as_os_str()
+                || parent.as_os_str() == self.backup_path.as_os_str()
+        }) {
+            let at = self.parent(p)?;
+            return Ok(sys::stat_at(at.fd.as_raw_fd(), &at.name)?
+                .as_ref()
+                .map(State::from_stat));
+        }
         current_secure(self.root.as_raw_fd(), p)
     }
-    fn save_state(&self) -> io::Result<()> {
-        journal::json_write(&self.backup_path.join("state.json"), &self.recovery)
+    fn save_state(&mut self) -> io::Result<()> {
+        self.checkpoints.record(&self.recovery)
     }
     fn push_move(&mut self, from: &Path, to: &Path) {
         self.recovery.pending.push(Action::Move {
@@ -381,7 +415,9 @@ impl Undo {
                 }
             }
             "delete" if !e.quarantine.is_empty() => {
-                self.save_current(&p)?;
+                if !self.absent.contains(&p) {
+                    self.save_current(&p)?;
+                }
                 let source = self.qpath.join(&e.quarantine);
                 self.push_move(&source, &p);
             }
@@ -479,17 +515,22 @@ impl Undo {
             .into_iter()
             .map(|(name, state)| (journal::display(&name), state))
             .collect();
-        let mut parents = std::collections::BTreeSet::new();
+        let mut parents = HashSet::new();
         for e in &r.effects {
             for name in [&e.path, &e.path2].into_iter().filter(|s| !s.is_empty()) {
                 let p = journal::path(name)?;
-                parents.extend(p.ancestors().map(Path::to_owned));
+                parents.extend(p.ancestors().skip(1).map(Path::to_owned));
             }
         }
         // Reverse exchanges can move a changed directory below an ancestor
         // whose name also moved. Observe its final name, not just effect paths.
-        for name in restored.keys() {
-            parents.extend(journal::path(name)?.ancestors().map(Path::to_owned));
+        for (name, before) in restored {
+            let p = journal::path(name)?;
+            parents.extend(
+                p.ancestors()
+                    .skip(usize::from(!before.directory()))
+                    .map(Path::to_owned),
+            );
         }
         for p in parents {
             if let Ok(st) = self.state(&p)
@@ -605,32 +646,49 @@ fn applied_effects(record: &journal::Record) -> impl DoubleEndedIterator<Item = 
             && !matches!(e.op.as_str(), "blocked" | "not protected" | "expired")
     })
 }
+fn take_subtree<T>(names: &mut BTreeMap<PathBuf, T>, source: &Path) -> Vec<(PathBuf, T)> {
+    let keys: Vec<_> = names
+        .range(source.to_owned()..)
+        .take_while(|(name, _)| name.starts_with(source))
+        .map(|(name, _)| name.clone())
+        .collect();
+    keys.into_iter()
+        .filter_map(|name| names.remove(&name).map(|value| (name, value)))
+        .collect()
+}
 fn reverse_names<T>(names: &mut BTreeMap<PathBuf, T>, e: &Effect) -> io::Result<()> {
+    if !matches!(e.op.as_str(), "create" | "rename" | "exchange") {
+        return Ok(());
+    }
     let source = journal::path(&e.path)?;
     if e.op == "create" {
-        names.retain(|name, _| !name.starts_with(&source));
-    } else if matches!(e.op.as_str(), "rename" | "exchange") {
+        take_subtree(names, &source);
+    } else {
         let dest = journal::path(&e.path2)?;
-        for (name, value) in std::mem::take(names) {
-            let relocated = if let Ok(tail) = name.strip_prefix(&dest) {
-                Some(if tail.as_os_str().is_empty() {
+        let to_source = take_subtree(names, &dest);
+        let to_dest = take_subtree(names, &source);
+        for (name, value) in to_source {
+            let tail = name.strip_prefix(&dest).map_err(io::Error::other)?;
+            names.insert(
+                if tail.as_os_str().is_empty() {
                     source.clone()
                 } else {
                     source.join(tail)
-                })
-            } else if let Ok(tail) = name.strip_prefix(&source) {
-                (e.op == "exchange").then(|| {
+                },
+                value,
+            );
+        }
+        if e.op == "exchange" {
+            for (name, value) in to_dest {
+                let tail = name.strip_prefix(&source).map_err(io::Error::other)?;
+                names.insert(
                     if tail.as_os_str().is_empty() {
                         dest.clone()
                     } else {
                         dest.join(tail)
-                    }
-                })
-            } else {
-                Some(name)
-            };
-            if let Some(name) = relocated {
-                names.insert(name, value);
+                    },
+                    value,
+                );
             }
         }
     }
@@ -803,6 +861,7 @@ fn restore_effects(
     }
     // Flush the final completion too, including an empty command.
     undo.save_state()?;
+    undo.checkpoints.publish(&undo.recovery)?;
     Ok(())
 }
 
@@ -1021,7 +1080,7 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
         .transpose()?
         .unwrap_or_default();
     let recovery = if resuming {
-        serde_json::from_slice(&fs::read(backup_path.join("state.json"))?)?
+        checkpoints::load(&backup_path)?
     } else {
         fs::DirBuilder::new().mode(0o700).create(&backup_path)?;
         let mut origins = BTreeMap::new();
@@ -1053,6 +1112,23 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
         .open(backup_path.join("recovery.log"))?;
     let mut undo = Undo {
         root,
+        qfd: Rc::new(q),
+        backup_fd: Rc::new(sys::open_at(
+            libc::AT_FDCWD,
+            &cstr(backup_path.as_os_str())?,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )?),
+        absent: if resuming {
+            HashSet::new()
+        } else {
+            posts
+                .iter()
+                .filter(|(name, state)| state.is_none() && !recovery.conflicts.contains(*name))
+                .map(|(name, _)| journal::path(name))
+                .collect::<io::Result<_>>()?
+        },
+        checkpoints: checkpoints::Checkpoints::open(&backup_path, &recovery)?,
         log,
         recovery,
         backup_path: backup_path.clone(),

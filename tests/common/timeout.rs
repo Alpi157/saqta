@@ -314,7 +314,21 @@ struct Progress {
 fn progress(folder: &Path) -> Progress {
     let notifications = notification_counts(folder);
     let undo = undo_folder(folder)
-        .and_then(|p| fs::read(p.join("state.json")).ok())
+        .and_then(|p| {
+            let checkpoint = fs::read(p.join("state.json")).ok()?;
+            let log = fs::read(p.join("state.log")).unwrap_or_default();
+            if let Some(end) = log.iter().rposition(|&b| b == b'\n') {
+                Some(
+                    log[..end]
+                        .rsplit(|&b| b == b'\n')
+                        .next()
+                        .unwrap_or(&[])
+                        .to_vec(),
+                )
+            } else {
+                Some(checkpoint)
+            }
+        })
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .map(|v| {
             format!(
