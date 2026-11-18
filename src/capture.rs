@@ -1,8 +1,10 @@
 //! Decode a stopped syscall, pin its parent directories, and journal its pre-images.
+mod context;
 use crate::{
     journal::{self, Detail, Effect, Journal, State},
     sys,
 };
+use context::{NotificationResolver, ResolutionRoot, TaskCache, resolve};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::{CString, OsStr, OsString},
@@ -13,6 +15,7 @@ use std::{
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 const DEFAULT_MAX_COPY: u64 = 256 * 1024 * 1024;
@@ -54,133 +57,22 @@ fn relocated(base: &Path, tail: &Path) -> PathBuf {
     }
 }
 pub struct Resolved {
-    pub parent: OwnedFd,
+    pub parent: Rc<OwnedFd>,
     pub name: CString,
     pub path: PathBuf,
     pub stat: Option<libc::stat>,
     requests: Vec<PathBuf>,
+    parent_dev: u64,
+    mount: Option<u64>,
 }
 impl Resolved {
     pub fn state(&self) -> Option<State> {
         self.stat.as_ref().map(State::from_stat)
     }
-    fn skipped(&self) -> io::Result<bool> {
-        let fd = if self.stat.is_some() {
-            Some(sys::open_at(
-                self.parent.as_raw_fd(),
-                &self.name,
-                libc::O_PATH | libc::O_NOFOLLOW,
-                0,
-            )?)
-        } else {
-            None
-        };
-        Ok(SKIPPED_FILESYSTEMS.contains(&sys::fs_type(
-            fd.as_ref()
-                .map_or(self.parent.as_raw_fd(), AsRawFd::as_raw_fd),
-        )?))
-    }
     fn proc_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd()))
             .join(OsStr::from_bytes(self.name.to_bytes()))
     }
-}
-pub fn resolve(pid: u32, dirfd: i32, path: &OsStr, follow: bool) -> io::Result<Resolved> {
-    let base = if path.as_bytes().starts_with(b"/") {
-        format!("/proc/{pid}/root")
-    } else if dirfd == libc::AT_FDCWD {
-        format!("/proc/{pid}/cwd")
-    } else {
-        format!("/proc/{pid}/fd/{dirfd}")
-    };
-    let base = sys::open_at(
-        libc::AT_FDCWD,
-        &cstr(OsStr::new(&base))?,
-        libc::O_PATH | libc::O_DIRECTORY,
-        0,
-    )?;
-    resolve_from(pid, base, path, follow, 0)
-}
-fn resolve_from(
-    pid: u32,
-    base: OwnedFd,
-    path: &OsStr,
-    follow: bool,
-    depth: usize,
-) -> io::Result<Resolved> {
-    if depth > MAX_SYMLINKS {
-        return Err(io::Error::from_raw_os_error(libc::ELOOP));
-    }
-    let bytes = path.as_bytes();
-    if bytes.is_empty() {
-        return Err(io::Error::from_raw_os_error(libc::ENOENT));
-    }
-    let raw = path.as_bytes();
-    let raw = &raw[raw.iter().position(|&b| b != b'/').unwrap_or(raw.len())..];
-    let raw = if raw.is_empty() { b".".as_slice() } else { raw };
-    let end = raw.iter().rposition(|&b| b != b'/').map_or(0, |n| n + 1);
-    let raw = if end == 0 {
-        b".".as_slice()
-    } else {
-        &raw[..end]
-    };
-    let (parent, last) = match raw.iter().rposition(|&b| b == b'/') {
-        Some(i) => (&raw[..i], &raw[i + 1..]),
-        None => (b".".as_slice(), raw),
-    };
-    let root = sys::open_at(
-        libc::AT_FDCWD,
-        &cstr(OsStr::new(&format!("/proc/{pid}/root")))?,
-        libc::O_PATH | libc::O_DIRECTORY,
-        0,
-    )?;
-    let root_path = fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))?;
-    let base_path = fs::read_link(format!("/proc/self/fd/{}", base.as_raw_fd()))?;
-    let base_relative = base_path
-        .strip_prefix(&root_path)
-        .map_err(io::Error::other)?;
-    let parent_path = base_relative.join(OsStr::from_bytes(parent));
-    let parent = sys::open_target_parent(root.as_raw_fd(), &cstr(parent_path.as_os_str())?)?;
-    let requested = base_path.join(OsStr::from_bytes(raw));
-    let name = cstr(OsStr::from_bytes(last))?;
-    let stat = sys::stat_at(parent.as_raw_fd(), &name)?;
-    let mut canonical = fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))?;
-    if sys::stat_fd(parent.as_raw_fd())?.st_nlink == 0 {
-        let bytes = canonical.as_os_str().as_bytes();
-        if let Some(b) = bytes.strip_suffix(b" (deleted)") {
-            canonical = PathBuf::from(OsString::from_vec(b.to_vec()));
-        }
-    }
-    let result = Resolved {
-        parent,
-        name,
-        path: canonical.join(OsStr::from_bytes(last)),
-        stat,
-        requests: vec![requested],
-    };
-    if follow
-        && result
-            .stat
-            .as_ref()
-            .is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFLNK)
-    {
-        let target = fs::read_link(result.proc_path())?;
-        let mut followed = if target.is_absolute() {
-            let root = sys::open_at(
-                libc::AT_FDCWD,
-                &cstr(OsStr::new(&format!("/proc/{pid}/root")))?,
-                libc::O_PATH | libc::O_DIRECTORY,
-                0,
-            )?;
-            resolve_from(pid, root, target.as_os_str(), true, depth + 1)?
-        } else {
-            resolve_from(pid, result.parent, target.as_os_str(), true, depth + 1)?
-        };
-        followed.requests.extend(result.requests);
-        followed.requests.push(result.path);
-        return Ok(followed);
-    }
-    Ok(result)
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -295,7 +187,31 @@ impl Call {
         Ok(c)
     }
 }
+struct Entry {
+    parent: Option<Rc<OwnedFd>>,
+    name: CString,
+}
+impl Entry {
+    fn pin(p: &Resolved) -> Self {
+        Self {
+            parent: Some(Rc::clone(&p.parent)),
+            name: p.name.clone(),
+        }
+    }
+    fn state(&self, path: &Path) -> Option<State> {
+        let Some(parent) = &self.parent else {
+            return journal::state(path).ok().flatten();
+        };
+        sys::stat_at(parent.as_raw_fd(), &self.name)
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(State::from_stat)
+    }
+}
 struct Pending {
+    at: Entry,
+    at2: Option<Entry>,
     seqs: Vec<u64>,
     kind: Kind,
     path: PathBuf,
@@ -307,13 +223,14 @@ pub struct Capture {
     pub journal: Journal,
     qfd: OwnedFd,
     home: PathBuf,
-    user_home: PathBuf,
     max_copy: u64,
-    force_proc: bool,
+    vm_unavailable: bool,
+    tasks: TaskCache,
     page: usize,
     copied: HashMap<(u64, u64), (String, State)>,
     original_links: HashMap<(u64, u64), PathBuf>,
     created: HashSet<PathBuf>,
+    filesystems: HashMap<u64, (bool, OwnedFd)>,
     pending: HashMap<u32, Pending>,
     linked: BTreeMap<String, State>,
 }
@@ -326,10 +243,6 @@ impl Capture {
             0,
         )?;
         let home = fs::canonicalize(&journal.home)?;
-        let user_home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .and_then(|p| fs::canonicalize(p).ok())
-            .unwrap_or_default();
         let max_copy = match std::env::var("SAQTA_MAX_COPY") {
             Ok(s) => s.parse().map_err(io::Error::other)?,
             Err(_) => DEFAULT_MAX_COPY,
@@ -338,13 +251,17 @@ impl Capture {
             journal,
             qfd,
             home,
-            user_home,
             max_copy,
-            force_proc: std::env::var_os("SAQTA_FORCE_PROC_MEM").is_some_and(|s| s == "1"),
+            vm_unavailable: std::env::var_os("SAQTA_FORCE_PROC_MEM").is_some_and(|s| s == "1"),
             page: sys::page_size()?,
+            tasks: TaskCache {
+                eligible: None,
+                task: None,
+            },
             copied: HashMap::new(),
             original_links: HashMap::new(),
             created: HashSet::new(),
+            filesystems: HashMap::new(),
             pending: HashMap::new(),
             linked: BTreeMap::new(),
         })
@@ -425,6 +342,31 @@ impl Capture {
         for pid in observed {
             self.complete(pid);
         }
+        if crate::filter::CONTEXT_CALLS.contains(&(n.data.nr as i64)) {
+            // Other tids cannot repopulate a cache while this context call is
+            // in flight. Only its issuer's next notification permits reuse.
+            self.tasks.invalidate(n.pid);
+            if matches!(
+                n.data.nr as i64,
+                libc::SYS_mount
+                    | libc::SYS_umount2
+                    | libc::SYS_move_mount
+                    | libc::SYS_pivot_root
+                    | libc::SYS_setns
+                    | libc::SYS_unshare
+            ) {
+                self.filesystems.clear();
+                // Release observation pins too. Mount changes use M4's pathname
+                // observation rather than making an otherwise idle mount busy.
+                for pending in self.pending.values_mut() {
+                    pending.at.parent = None;
+                    if let Some(second) = pending.at2.as_mut() {
+                        second.parent = None;
+                    }
+                }
+            }
+            return sys::answer(listener, n.id, false);
+        }
         let result = self.read_call(listener, n);
         match result {
             Ok(Some((call, p, p2))) => {
@@ -454,23 +396,54 @@ impl Capture {
         }
     }
     fn read_call(
-        &self,
+        &mut self,
         listener: i32,
         n: &sys::Notification,
     ) -> io::Result<Option<(Call, Resolved, Option<Resolved>)>> {
         let call = Call::decode(n)?;
-        let p = sys::read_path(n.pid as i32, call.address, self.force_proc, self.page)?;
-        let p2 = call
-            .address2
-            .map(|a| sys::read_path(n.pid as i32, a, self.force_proc, self.page))
-            .transpose()?;
+        let mut task = self.tasks.take(n.pid)?;
+        let mut reader = sys::PathReader::new(
+            n.pid as i32,
+            self.page,
+            &mut self.vm_unavailable,
+            &mut task.mem,
+        );
+        let p = reader.read(call.address)?;
+        let p2 = call.address2.map(|a| reader.read(a)).transpose()?;
         if !sys::valid(listener, n.id) {
             return Ok(None);
         }
-        let p = resolve(n.pid, call.dir, &p, call.follow)?;
+        let persistent = self.tasks.eligible == Some(n.pid);
+        if persistent && task.root.is_none() {
+            task.root = Some(ResolutionRoot::new(n.pid)?);
+        }
+        let root_display = if let Some(root) = task.root.as_mut() {
+            if root.path != Path::new("/") {
+                root.path = fs::read_link(format!("/proc/self/fd/{}", root.fd.as_raw_fd()))?;
+            }
+            Some(root.path.clone())
+        } else {
+            None
+        };
+        if let Some(base) = task.cwd.as_mut() {
+            base.path = fs::read_link(format!("/proc/self/fd/{}", base.fd.as_raw_fd()))?;
+            if base.path.as_os_str().as_bytes().ends_with(b" (deleted)") {
+                base.stat = sys::stat_fd(base.fd.as_raw_fd())?;
+            }
+        }
+        let mut resolver = NotificationResolver {
+            pid: n.pid,
+            root: task.root.take(),
+            root_display,
+            base: task.cwd.take(),
+        };
+        let p = resolver.resolve(call.dir, &p, call.follow)?;
         let p2 = p2
-            .map(|p| resolve(n.pid, call.dir2, &p, false))
+            .map(|p| resolver.resolve(call.dir2, &p, false))
             .transpose()?;
+        task.root = resolver.root;
+        task.cwd = resolver.base.filter(|base| base.dir == libc::AT_FDCWD);
+        self.tasks.put(task);
         if !sys::valid(listener, n.id) {
             return Ok(None);
         }
@@ -497,10 +470,8 @@ impl Capture {
         {
             return true;
         }
-        (matches!(name, Some("config.toml" | "hooks.json"))
-            && path.parent().and_then(Path::file_name) == Some(OsStr::new(".codex")))
-            || path == self.user_home.join(".codex/config.toml")
-            || path == self.user_home.join(".codex/hooks.json")
+        matches!(name, Some("config.toml" | "hooks.json"))
+            && path.parent().and_then(Path::file_name) == Some(OsStr::new(".codex"))
     }
     fn effect(
         &self,
@@ -545,6 +516,34 @@ impl Capture {
             self.journal.error(&e);
         }
     }
+    fn skipped(&mut self, p: &Resolved) -> io::Result<bool> {
+        let dev = p.stat.as_ref().map_or(p.parent_dev, |st| st.st_dev);
+        if let Some(mount) = p.mount
+            && let Some((skip, _pin)) = self.filesystems.get(&mount)
+        {
+            return Ok(*skip);
+        }
+        let fd = if p.stat.is_some() {
+            sys::open_at(
+                p.parent.as_raw_fd(),
+                &p.name,
+                libc::O_PATH | libc::O_NOFOLLOW,
+                0,
+            )?
+        } else {
+            p.parent.try_clone()?
+        };
+        let (actual, mount) = sys::stat_mount_fd(fd.as_raw_fd())?;
+        if actual.st_dev != dev || p.mount.is_some() && mount != p.mount {
+            return Err(io::Error::other("filesystem changed during classification"));
+        }
+        let skip = SKIPPED_FILESYSTEMS.contains(&sys::fs_type(fd.as_raw_fd())?);
+        // Pin the mount, not st_dev: stacked filesystems can report a backing device.
+        if let Some(mount) = mount {
+            self.filesystems.insert(mount, (skip, fd));
+        }
+        Ok(skip)
+    }
     fn capture(
         &mut self,
         n: &sys::Notification,
@@ -552,7 +551,7 @@ impl Capture {
         p: &Resolved,
         p2: Option<&Resolved>,
     ) -> io::Result<()> {
-        if p.skipped()? || p2.map(Resolved::skipped).transpose()?.unwrap_or(false) {
+        if self.skipped(p)? || p2.map(|p| self.skipped(p)).transpose()?.unwrap_or(false) {
             return Ok(());
         }
         if c.kind == Kind::Link
@@ -692,14 +691,24 @@ impl Capture {
         } else {
             c.kind
         };
-        let mut seqs = Vec::new();
-        for e in effects {
-            seqs.push(self.journal.append(e)?);
+        let mut seqs = Vec::with_capacity(effects.len());
+        for effect in effects {
+            seqs.push(self.journal.append(effect)?);
         }
         if !seqs.is_empty() {
             self.pending.insert(
                 n.pid,
                 Pending {
+                    at: Entry::pin(if c.kind == Kind::Link {
+                        p2.unwrap_or(p)
+                    } else {
+                        p
+                    }),
+                    at2: if c.kind == Kind::Link {
+                        None
+                    } else {
+                        p2.map(Entry::pin)
+                    },
                     seqs,
                     kind: pending_kind,
                     path: if c.kind == Kind::Link {
@@ -846,11 +855,22 @@ impl Capture {
         }
     }
     fn applied(p: &Pending) -> bool {
-        let current = journal::state(&p.path).ok().flatten();
-        let second = p
-            .path2
-            .as_ref()
-            .and_then(|p| journal::state(p).ok().flatten());
+        if matches!(p.kind, Kind::Open | Kind::Truncate) {
+            return true;
+        }
+        let second = || {
+            p.at2
+                .as_ref()
+                .zip(p.path2.as_ref())
+                .and_then(|(at, path)| at.state(path))
+        };
+        if p.kind == Kind::Rename {
+            return second()
+                .as_ref()
+                .zip(p.before.as_ref())
+                .is_some_and(|(a, b)| a.same_inode(b));
+        }
+        let current = p.at.state(&p.path);
         match p.kind {
             Kind::Delete | Kind::Rmdir => {
                 current.is_none()
@@ -860,12 +880,8 @@ impl Capture {
                         .is_some_and(|(a, b)| !a.same_inode(b))
             }
             Kind::Create => current.is_some(),
-            Kind::Rename => second
-                .as_ref()
-                .zip(p.before.as_ref())
-                .is_some_and(|(a, b)| a.same_inode(b)),
             Kind::Exchange => {
-                second
+                second()
                     .as_ref()
                     .zip(p.before.as_ref())
                     .is_some_and(|(a, b)| a.same_inode(b))
@@ -929,12 +945,29 @@ impl Capture {
             }
         }
     }
+    pub fn task_exit_fd(&self) -> i32 {
+        self.tasks
+            .task
+            .as_ref()
+            .and_then(|task| task.pidfd.as_ref())
+            .map_or(-1, AsRawFd::as_raw_fd)
+    }
+    pub fn prune_tasks(&mut self) {
+        self.tasks.prune();
+    }
+    pub fn exited(&mut self, pid: u32) {
+        self.complete(pid);
+        if self.tasks.task.as_ref().is_some_and(|task| task.pid == pid) {
+            self.tasks.task = None;
+        }
+    }
     pub fn snapshot(&mut self) {
         if let Err(e) = self.journal.snapshot() {
             self.journal.error(&e);
         }
     }
     pub fn finish(&mut self, status: i32) {
+        self.tasks.task = None;
         let pids: Vec<_> = self.pending.keys().copied().collect();
         for pid in pids {
             self.complete(pid);

@@ -30,6 +30,21 @@ const NOTIFY: &[i64] = &[
     libc::SYS_mknodat,
 ];
 
+// These calls invalidate task memory or filesystem context before CONTINUE.
+pub const CONTEXT_CALLS: &[i64] = &[
+    libc::SYS_execve,
+    libc::SYS_execveat,
+    libc::SYS_chdir,
+    libc::SYS_fchdir,
+    libc::SYS_chroot,
+    libc::SYS_pivot_root,
+    libc::SYS_setns,
+    libc::SYS_unshare,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_move_mount,
+];
+
 pub fn program() -> Vec<sock_filter> {
     let ins = |code, jt, jf, k| sock_filter { code, jt, jf, k };
     let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
@@ -68,7 +83,7 @@ pub fn program() -> Vec<sock_filter> {
             ins(RETURN_CONSTANT, 0, 0, SECCOMP_RET_ALLOW),
         ]);
     }
-    for &nr in NOTIFY {
+    for &nr in NOTIFY.iter().chain(CONTEXT_CALLS) {
         p.extend([
             // Matching syscalls enter the notification return.
             ins(JUMP_EQUAL, 0, 1, nr as u32),
@@ -121,7 +136,8 @@ mod tests {
     #[test]
     fn every_syscall_rule() {
         for nr in 0..512 {
-            let expected = if NOTIFY.contains(&(nr as i64)) {
+            let expected = if NOTIFY.contains(&(nr as i64)) || CONTEXT_CALLS.contains(&(nr as i64))
+            {
                 SECCOMP_RET_USER_NOTIF
             } else if [libc::SYS_openat2, libc::SYS_io_uring_setup].contains(&(nr as i64)) {
                 SECCOMP_RET_ERRNO | libc::ENOSYS as u32
