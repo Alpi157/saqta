@@ -25,10 +25,14 @@ pub fn quote(bytes: &[u8]) -> Vec<u8> {
     out.push(b'\'');
     out
 }
-pub fn rewrite(binary: &Path, shell: &Path, command: &str) -> Result<String> {
+fn rewrite(binary: &Path, shell: &Path, command: &str, session: Option<&str>) -> Result<String> {
     let mut out = quote(binary.as_os_str().as_bytes());
     out.extend_from_slice(b" exec --shell ");
     out.extend(quote(shell.as_os_str().as_bytes()));
+    if let Some(session) = session {
+        out.extend_from_slice(b" --session ");
+        out.extend(quote(session.as_bytes()));
+    }
     out.extend_from_slice(b" -c ");
     out.extend(quote(command.as_bytes()));
     Ok(String::from_utf8(out)?)
@@ -85,7 +89,7 @@ fn handle() -> Result<()> {
                 bail!("NUL in command");
             }
             let binary = std::env::current_exe()?;
-            let prefix = rewrite(&binary, &sys::login_shell(), "")?;
+            let prefix = rewrite(&binary, &sys::login_shell(), "", v["session_id"].as_str())?;
             // Only recognize our exact invocation prefix, never a substring in user data.
             let prefix = prefix.strip_suffix("''").unwrap_or(&prefix);
             let plain_prefix = binary.to_str().map(|p| format!("{p} exec "));
@@ -96,7 +100,8 @@ fn handle() -> Result<()> {
             {
                 return Ok(());
             }
-            let updated = rewrite(&binary, &sys::login_shell(), command)?;
+            let session = v["session_id"].as_str().filter(|s| !s.contains('\0'));
+            let updated = rewrite(&binary, &sys::login_shell(), command, session)?;
             let output = json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"command":updated}}});
             std::io::stdout().write_all(serde_json::to_string(&output)?.as_bytes())?;
         }
@@ -132,7 +137,13 @@ fn handle() -> Result<()> {
             }
             let reference = json!({"session_id":field(&v,"session_id")?,"tool_use_id":field(&v,"tool_use_id")?});
             let home = paths::home()?;
-            let j = Journal::start(home, &["apply_patch".into()], cwd, -1)?;
+            let j = Journal::start_session(
+                home,
+                &["apply_patch".into()],
+                cwd,
+                -1,
+                v["session_id"].as_str().map(str::to_owned),
+            )?;
             fs::write(
                 j.folder.join("hook-reference"),
                 serde_json::to_vec(&reference)?,
@@ -158,6 +169,16 @@ fn handle() -> Result<()> {
                             .and_then(|p| p.to_str())
                             .ok_or_else(|| anyhow::anyhow!("invalid command id"))?
                             .parse()?;
+                        let created: std::collections::HashSet<_> = journal::read_effects(&folder)?
+                            .into_iter()
+                            .filter(|e| e.op == "create")
+                            .filter_map(|e| {
+                                crate::classify::Birth::read(&journal::path(&e.path).ok()?)
+                            })
+                            .collect();
+                        if !created.is_empty() {
+                            journal::json_write(&folder.join("created"), &created)?;
+                        }
                         Journal::reopen(home.clone(), id)?.finish(0)?;
                         return Ok(());
                     }

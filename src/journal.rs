@@ -160,6 +160,8 @@ pub struct Meta {
     pub start_ns: u64,
     pub supervisor: i32,
     pub child: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Detail {
@@ -167,6 +169,12 @@ pub struct Detail {
     pub before2: Option<State>,
     pub kept: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub regenerable: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_created: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Effect {
@@ -263,6 +271,15 @@ pub struct Journal {
 }
 impl Journal {
     pub fn start(home: PathBuf, args: &[OsString], cwd: &Path, debug_fd: i32) -> io::Result<Self> {
+        Self::start_session(home, args, cwd, debug_fd, None)
+    }
+    pub fn start_session(
+        home: PathBuf,
+        args: &[OsString],
+        cwd: &Path,
+        debug_fd: i32,
+        session: Option<String>,
+    ) -> io::Result<Self> {
         prepare(&home)?;
         sys::debug_timestamp(debug_fd, b"id_begin");
         let mut next = private_file(&home.join("next-id"))?;
@@ -314,6 +331,7 @@ impl Journal {
             start_ns: now(),
             supervisor: sys::pid(),
             child: 0,
+            session,
         };
         json_write(&folder.join("meta"), &meta)?;
         sys::debug_timestamp(debug_fd, b"meta_end");
@@ -492,6 +510,9 @@ impl Journal {
     }
     pub fn finish(&self, status: i32) -> io::Result<()> {
         self.snapshot()?;
+        self.end(status)
+    }
+    pub fn end(&self, status: i32) -> io::Result<()> {
         sys::debug_timestamp(self.debug_fd, b"end_begin");
         json_write(
             &self.folder.join("end"),
@@ -538,6 +559,10 @@ pub struct Record {
     pub exit_status: Option<i32>,
     pub end_ns: Option<u64>,
     pub undone: bool,
+    pub held: bool,
+    pub hold_rule: Option<crate::rules::Rule>,
+    pub released: bool,
+    pub rules_error: Option<String>,
     pub effects: Vec<Effect>,
     pub warning: Option<String>,
     pub recovery_note: Option<String>,
@@ -673,6 +698,7 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         }
         outcomes.insert(seq, true);
     }
+    let hold_rule = crate::hold::rule_for(home, id)?;
     Ok(Record {
         meta,
         status,
@@ -685,6 +711,10 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
             }
         }),
         undone: folder.join("undone").exists(),
+        held: hold_rule.is_some(),
+        hold_rule,
+        released: crate::hold::directory(home, id).join("released").exists(),
+        rules_error: fs::read_to_string(folder.join("rules-error")).ok(),
         effects,
         warning: fs::read_to_string(folder.join("error")).ok(),
         recovery_note: fs::read(folder.join("tail-recovery.json"))
@@ -761,9 +791,9 @@ fn recover_posts(folder: &Path, r: &Record) -> Result<()> {
 }
 fn summary(r: &Record) -> serde_json::Value {
     let count = |op: &str| r.effects.iter().filter(|e| e.op == op).count();
-    serde_json::json!({"id":r.meta.id,"start_ns":r.meta.start_ns,"end_ns":r.end_ns,"duration_ns":r.end_ns.map(|end| end.saturating_sub(r.meta.start_ns)),"exit_status":r.exit_status,"status":r.status,"undone":r.undone,"cwd":r.meta.cwd,"command":r.meta.command,"counts":{"deleted":count("delete")+count("rmdir"),"modified":count("modify")+count("size")+count("rename")+count("exchange"),"created":count("create"),"blocked":count("blocked"),"not_protected":count("not protected")+usize::from(r.warning.is_some())}})
+    serde_json::json!({"id":r.meta.id,"start_ns":r.meta.start_ns,"end_ns":r.end_ns,"duration_ns":r.end_ns.map(|end| end.saturating_sub(r.meta.start_ns)),"exit_status":r.exit_status,"status":r.status,"undone":r.undone,"held":r.held,"released":r.released,"cwd":r.meta.cwd,"command":r.meta.command,"counts":{"deleted":count("delete")+count("rmdir"),"modified":count("modify")+count("size")+count("rename")+count("exchange"),"created":count("create"),"blocked":count("blocked"),"not_protected":count("not protected")+usize::from(r.warning.is_some())}})
 }
-fn source_stamp(folder: &Path) -> io::Result<Vec<u8>> {
+fn source_stamp(folder: &Path, hold: &Path) -> io::Result<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
     let mut stamp = Vec::new();
     for name in [
@@ -778,8 +808,15 @@ fn source_stamp(folder: &Path) -> io::Result<Vec<u8>> {
         "error",
         "expired.json",
         "tail-recovery.json",
-    ] {
-        match fs::symlink_metadata(folder.join(name)) {
+    ]
+    .into_iter()
+    .map(|name| folder.join(name))
+    .chain(
+        ["ready", "released"]
+            .into_iter()
+            .map(|name| hold.join(name)),
+    ) {
+        match fs::symlink_metadata(name) {
             Ok(m) => stamp.push(Some((m.ino(), m.len(), m.mtime(), m.mtime_nsec()))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => stamp.push(None),
             Err(e) => return Err(e),
@@ -816,7 +853,7 @@ pub fn import(home: &Path) -> Result<Vec<serde_json::Value>> {
             continue;
         }
         ids.insert(id);
-        let stamp = source_stamp(&folder)?;
+        let stamp = source_stamp(&folder, &crate::hold::directory(home, id))?;
         let cached = tx
             .query_row(
                 "SELECT stamp,summary FROM imports WHERE id=?1",
@@ -922,7 +959,9 @@ pub fn log(n: usize, json: bool) -> Result<i32> {
                 .as_u64()
                 .map(|ns| format!("{:.1} s", ns as f64 / 1e9))
                 .unwrap_or_else(|| "-".into());
-            let status = if v["undone"] == true {
+            let status = if v["held"] == true && v["released"] != true {
+                "held"
+            } else if v["undone"] == true {
                 "undone"
             } else {
                 v["status"].as_str().unwrap_or("")
@@ -985,7 +1024,11 @@ pub fn show(id: u64, json: bool) -> Result<i32> {
         println!(
             "{id}: {} ({}) | {} effects, {} kept, {} blocked, {} not protected",
             one_line(&r.meta.command, 60),
-            r.status,
+            if r.held && !r.released {
+                "held"
+            } else {
+                &r.status
+            },
             r.effects.len(),
             r.effects
                 .iter()
@@ -994,6 +1037,12 @@ pub fn show(id: u64, json: bool) -> Result<i32> {
             count("blocked"),
             count("not protected") + usize::from(r.warning.is_some())
         );
+        if let Some(rule) = r.hold_rule {
+            println!("automatic restore rule {rule:?}");
+        }
+        if let Some(error) = r.rules_error {
+            println!("automatic restore: {error}");
+        }
         if let Some(note) = r.recovery_note {
             println!("{note}");
         }

@@ -14,6 +14,13 @@ impl<W: Write> Progress<W> {
         }
     }
 
+    pub fn silent(writer: W) -> Self {
+        Self {
+            writer,
+            failed: true,
+        }
+    }
+
     pub fn line(&mut self, args: fmt::Arguments<'_>) {
         if !self.failed {
             self.failed = writeln!(self.writer, "{args}")

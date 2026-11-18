@@ -2,8 +2,7 @@
 use super::*;
 
 impl Undo {
-    fn copy_tree(
-        &self,
+    pub(super) fn copy_tree(
         from: i32,
         name: &std::ffi::CStr,
         to: i32,
@@ -12,7 +11,7 @@ impl Undo {
         let st = sys::stat_at(from, name)?
             .ok_or_else(|| io::Error::other("missing displaced move input"))?;
         if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return self.copy_entry(from, name, to, dest, &st);
+            return Self::copy_entry(from, name, to, dest, &st);
         }
         let source = sys::open_at(
             from,
@@ -29,7 +28,7 @@ impl Undo {
         )?;
         for entry in fs::read_dir(format!("/proc/self/fd/{}", source.as_raw_fd()))? {
             let child = cstr(&entry?.file_name())?;
-            self.copy_tree(source.as_raw_fd(), &child, target.as_raw_fd(), &child)?;
+            Self::copy_tree(source.as_raw_fd(), &child, target.as_raw_fd(), &child)?;
         }
         sys::metadata_fd(
             target.as_raw_fd(),
@@ -39,7 +38,6 @@ impl Undo {
         )
     }
     fn copy_entry(
-        &self,
         from: i32,
         name: &std::ffi::CStr,
         to: i32,
@@ -132,7 +130,13 @@ impl Undo {
                         let b = self.parent(&partial)?;
                         let st = sys::stat_at(a.fd.as_raw_fd(), &a.name)?
                             .ok_or_else(|| io::Error::other("missing partial copy"))?;
-                        self.copy_entry(a.fd.as_raw_fd(), &a.name, b.fd.as_raw_fd(), &b.name, &st)?;
+                        Self::copy_entry(
+                            a.fd.as_raw_fd(),
+                            &a.name,
+                            b.fd.as_raw_fd(),
+                            &b.name,
+                            &st,
+                        )?;
                         sys::unlink_at(
                             a.fd.as_raw_fd(),
                             &a.name,
@@ -144,7 +148,7 @@ impl Undo {
             }
             let a = self.parent(from)?;
             let b = self.parent(&temp)?;
-            self.copy_tree(a.fd.as_raw_fd(), &a.name, b.fd.as_raw_fd(), &b.name)?;
+            Self::copy_tree(a.fd.as_raw_fd(), &a.name, b.fd.as_raw_fd(), &b.name)?;
             progress.1 = self.state(&temp)?;
             journal::json_write(&marker, &progress)?;
         }

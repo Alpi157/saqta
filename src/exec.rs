@@ -95,11 +95,17 @@ pub fn fallback(p: &Prepared, strict: bool, reason: &[u8]) -> ! {
 }
 /// Require both the marker and an active filter, as for nested exec.
 pub fn is_supervised() -> bool {
-    env::var_os("SAQTA_SUPERVISED").is_some()
-        && std::fs::read_to_string("/proc/self/status")
-            .unwrap_or_default()
-            .lines()
-            .any(|s| s.split_whitespace().eq(["Seccomp:", "2"]))
+    env::var_os("SAQTA_SUPERVISED").is_some() && under_filter()
+}
+pub fn under_filter() -> bool {
+    filter_mode() == Some(2)
+}
+
+pub fn filter_mode() -> Option<u8> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|s| s.strip_prefix("Seccomp:")?.trim().parse().ok())
 }
 pub fn run(m: &clap::ArgMatches) -> Result<i32> {
     let args = if let Some(c) = m.get_one::<OsString>("command") {
@@ -150,6 +156,10 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
             fallback(&p, strict, &reason);
         }
     };
+    let session = m.get_one::<String>("session").cloned().unwrap_or_default();
+    if !session.is_empty() {
+        crate::hold::notices(&home, &session);
+    }
     let log_fd = if env::var_os("SAQTA_DEBUG").is_some_and(|s| s == "1") {
         use std::os::fd::IntoRawFd;
         paths::home()
@@ -193,6 +203,7 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
         i32::from(sync).to_string().into(),
         log_fd.to_string().into(),
         home.into_os_string(),
+        session.into(),
     ];
     launch.extend(args);
     let supervisor = Prepared::prepare(launch, false)?;
@@ -218,7 +229,7 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
     sys::disposition(libc::SIGINT, libc::SIG_IGN);
     sys::disposition(libc::SIGQUIT, libc::SIG_IGN);
     sys::block(&[libc::SIGTERM, libc::SIGHUP])?;
-    let mut msg = [0u8; 8];
+    let mut msg = [0u8; 12];
     let mut got = 0;
     loop {
         let mut fds = [
@@ -251,7 +262,23 @@ pub fn run(m: &clap::ArgMatches) -> Result<i32> {
         }
     }
     let st = i32::from_ne_bytes(msg[..4].try_into()?);
-    let detached = i32::from_ne_bytes(msg[4..].try_into()?);
+    let detached = i32::from_ne_bytes(msg[4..8].try_into()?);
+    let len = u32::from_ne_bytes(msg[8..12].try_into()?) as usize;
+    if len > 4096 {
+        bail!("invalid supervisor message");
+    }
+    let mut message = vec![0; len];
+    let mut got = 0;
+    while got < len {
+        let n = sys::read(ws[0], &mut message[got..]);
+        if n <= 0 {
+            bail!("supervisor lost while reporting results");
+        }
+        got += n as usize;
+    }
+    if !message.is_empty() {
+        sys::write(2, &message);
+    }
     sys::close(ws[0]);
     sys::close(wf);
     if detached == 0 {

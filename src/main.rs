@@ -1,4 +1,5 @@
 mod capture;
+mod classify;
 mod codex;
 mod doctor;
 mod exec;
@@ -6,11 +7,13 @@ mod filter;
 mod gc;
 #[cfg(debug_assertions)]
 mod harness;
+mod hold;
 mod hook;
 mod journal;
 mod output;
 mod paths;
 mod restore;
+mod rules;
 mod supervisor;
 mod sys;
 
@@ -35,9 +38,9 @@ fn main() {
         hook::run();
         return;
     }
-    let undo = std::env::args_os()
-        .nth(1)
-        .is_some_and(|s| s == "undo" || s == "gc" || s == "init" || s == "uninstall");
+    let undo = std::env::args_os().nth(1).is_some_and(|s| {
+        s == "undo" || s == "release" || s == "gc" || s == "init" || s == "uninstall"
+    });
     if undo {
         sys::ignore_sigpipe();
     } else if std::env::args_os().nth(1).is_none_or(|s| s != "exec") {
@@ -60,6 +63,12 @@ fn main() {
         .subcommand(
             clap::Command::new("exec")
                 .about("Run a shell string or a program under supervision")
+                .arg(
+                    clap::Arg::new("session")
+                        .long("session")
+                        .value_name("ID")
+                        .help("Associate commands with one agent session"),
+                )
                 .arg(
                     clap::Arg::new("shell")
                         .long("shell")
@@ -154,30 +163,41 @@ fn main() {
                         .action(clap::ArgAction::SetTrue),
                 ),
         );
-    let cli = cli.subcommand(clap::Command::new("status")).subcommand(
-        clap::Command::new("gc")
-            .about("Collect expired retained content")
-            .arg(
-                clap::Arg::new("dry-run")
-                    .long("dry-run")
-                    .action(clap::ArgAction::SetTrue),
-            )
-            .arg(
-                clap::Arg::new("older-than")
-                    .long("older-than")
-                    .default_value("7d"),
-            )
-            .arg(
-                clap::Arg::new("max-size")
-                    .long("max-size")
-                    .default_value("5GB"),
-            )
-            .arg(
-                clap::Arg::new("json")
-                    .long("json")
-                    .action(clap::ArgAction::SetTrue),
-            ),
-    );
+    let cli = cli
+        .subcommand(
+            clap::Command::new("release")
+                .about("Apply the versions saved by an automatic restore")
+                .arg(
+                    clap::Arg::new("id")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64)),
+                ),
+        )
+        .subcommand(clap::Command::new("status"))
+        .subcommand(
+            clap::Command::new("gc")
+                .about("Collect expired retained content")
+                .arg(
+                    clap::Arg::new("dry-run")
+                        .long("dry-run")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    clap::Arg::new("older-than")
+                        .long("older-than")
+                        .default_value("7d"),
+                )
+                .arg(
+                    clap::Arg::new("max-size")
+                        .long("max-size")
+                        .default_value("5GB"),
+                )
+                .arg(
+                    clap::Arg::new("json")
+                        .long("json")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        );
     let cli = ["init", "uninstall"].into_iter().fold(cli, |cli, name| {
         cli.subcommand(
             clap::Command::new(name)
@@ -217,6 +237,7 @@ fn main() {
             m.get_one::<u64>("id").copied().unwrap_or(0),
             m.get_flag("json"),
         ),
+        Some(("release", m)) => hold::release(m.get_one::<u64>("id").copied().unwrap_or(0)),
         Some(("undo", m)) => restore::run(
             m.get_one::<u64>("id").copied().unwrap_or(0),
             m.get_flag("dry-run"),
