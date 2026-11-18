@@ -179,17 +179,102 @@ fn op(kind: u8, a: u8, b: u8) -> Op {
         data: vec![],
     }
 }
+fn check_parallel(processes: Vec<Vec<Op>>) {
+    let (s, root) = capture_fixture("harness-parallel");
+    for i in 0..processes.len() {
+        seed(&root.join(format!("p{i}")));
+    }
+    let before = tree_hash(&root);
+    let id = execute(&s, &root, processes);
+    assert_success(&undo(&s, id));
+    assert_tree(&before, &root);
+}
+
+#[test]
+fn undo_exchange_after_later_undos_repair_a_child_alias() {
+    let mut ops = vec![op(8, 5, 2)];
+    ops.extend((0..7).map(|_| op(0, 0, 0)));
+    ops.push(op(1, 8, 0));
+    ops.extend((0..5).map(|_| op(0, 0, 0)));
+    ops.push(op(1, 17, 0));
+    check_sequence(ops, 3);
+}
+
+#[test]
+fn resumed_alias_repair_records_the_parent_and_still_refuses_later_edits() {
+    for edit in [false, true] {
+        let (s, root) = capture_fixture("alias-parent-resume");
+        seed(&root);
+        let before = tree_hash(&root);
+        let older = execute(&s, &root, vec![vec![op(8, 5, 2)]]);
+        let after_exchange = tree_hash(&root);
+        let middle = execute(&s, &root, vec![vec![op(1, 8, 0)]]);
+        let newer = execute(&s, &root, vec![vec![op(1, 17, 0)]]);
+        assert_success(&undo(&s, newer));
+        let mut command = s.saqta(&["undo", &middle.to_string()]);
+        command.env("SAQTA_TEST_ABORT_AFTER", "1");
+        assert_eq!(run(command).status.code(), Some(86));
+        assert_success(&run(s.saqta(&["undo", &middle.to_string(), "--resume"])));
+        assert_tree(&after_exchange, &root);
+        if edit {
+            let parent = root.join("d5");
+            fs::write(parent.join("user-work"), b"keep this").unwrap();
+            fs::File::open(parent)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+                .unwrap();
+            let edited = tree_hash(&root);
+            let result = undo(&s, older);
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("paths changed"));
+            assert_tree(&edited, &root);
+        } else {
+            assert_success(&undo(&s, older));
+            assert_tree(&before, &root);
+        }
+    }
+}
+
+#[test]
+fn undo_truncation_through_new_link_restores_surviving_alias() {
+    check_parallel(vec![
+        vec![op(12, 8, 15), op(9, 8, 0), op(14, 15, 0)],
+        vec![op(0, 0, 0)],
+    ]);
+}
+
+#[test]
+fn undo_repairs_surviving_alias_even_after_the_truncated_link_is_removed() {
+    check_parallel(vec![
+        vec![op(12, 8, 15), op(9, 8, 0), op(14, 15, 0), op(9, 15, 0)],
+        vec![op(0, 0, 0)],
+    ]);
+}
+
+#[test]
+fn each_undo_refreshes_the_alias_lineage_for_the_next_undo() {
+    let mut overwrite = op(1, 11, 0);
+    overwrite.data = b"middle version".to_vec();
+    check_sequence(
+        vec![
+            op(1, 11, 0),
+            op(0, 0, 0),
+            overwrite,
+            op(0, 0, 0),
+            op(9, 11, 0),
+            op(1, 8, 0),
+        ],
+        3,
+    );
+}
+
 proptest! {
     #![proptest_config(config())]
     #[test]
     fn consecutive_commands_restore_every_snapshot(ops in proptest::collection::vec(operation(),1..=40), splits in 1usize..=3) { check_sequence(ops,splits); }
     #[test]
     fn concurrent_subtrees_restore_exactly(processes in proptest::collection::vec(proptest::collection::vec(operation(),1..=40),2..=4)) {
-        let (s,root)=capture_fixture("harness-parallel");
-        for i in 0..processes.len() { seed(&root.join(format!("p{i}"))); }
-        let before=tree_hash(&root);
-        let id=execute(&s,&root,processes);
-        assert_success(&undo(&s,id)); assert_tree(&before,&root);
+        check_parallel(processes);
     }
     #[test]
     fn interrupted_undo_preserves_versions_and_resumes(ops in proptest::collection::vec(operation(),1..=40), stop in 1usize..=20) {
