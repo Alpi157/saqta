@@ -1,129 +1,122 @@
-# ci-flakes: report
+# fix-alias-growth: report
 
 ## What works now
 
-The disabled Codex hook can finish before its caller writes the payload.
-The detached-deletion test controls when its background job resumes.
-CI shows failed test names and retains logs, harness seeds, and failure fixtures.
-The manual flake hunt reports failures across repeated runs and keeps the evidence.
+Undo restores the bytes and metadata of a surviving hard link after growth through a new name whose source was unlinked or replaced.
+The four saved seeds and eight named regressions pass, including undo interrupted after step 1.
+Six additional regressions from review pass, including interruptions after steps 1 through 4 of undo.
 
 ## How it works
 
-In `tests/codex.rs`, the parent test process writes JSON to `saqta hook codex` through a pipe. With `SAQTA_OFF=1`, the child exits before reading stdin. When it exits first, the write has no reader. Rust ignores `SIGPIPE` in the test process, so the write returns `EPIPE` as `ErrorKind::BrokenPipe`. `write_hook_input` accepts that error and fails on any other write error. The regression polls `try_wait` before calling the same helper, then checks exit code zero and empty stdout and stderr. [Codex 0.169 hook runner](https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/hooks/src/engine/command_runner.rs#L315-L323)
+The first failing command starts with `d1/f0` and `d2/f1` pointing to the same 13-byte file. It calls `linkat` to add `d4/f1`, `unlinkat` to remove `d1/f0`, and `truncate` to grow `d4/f1` to 64 bytes. All three calls succeeded in the trace.
 
-The GitHub connector recovered PR #7’s first-attempt log. Ubuntu 24.04 exited 101 in `cargo test` because `setsid_background_deletions_remain_in_same_command` failed `assert!(!o.status.success())`. The rerun passed and the run has zero artifacts. The old test let the detached job delete its tree after 500 ms. I reproduced the assertion failure by holding the early undo for 750 ms. The test now releases the job after that undo returns, with a bounded wait in the job. The same 750 ms delay passed after the change. All existing assertions stayed in place. [PR #7 failing job](https://github.com/Alpi157/saqta/actions/runs/44281430824/job/134722822540)
+1. In `src/capture.rs`, `Capture::capture` records the new name as a create and remembers `d1/f0` as its source. For the unlink, `keep_link` takes a quarantine hard link before the syscall continues. When the unlink is observed, `Capture::complete` drops the source from `original_links`. The same tracking drops a source that was replaced by a rename.
+2. Before the fix, the truncate branch froze the quarantine hard link into an independent 13-byte copy. It then skipped the growth record because `d4/f1` was created by the command and the recorded source was gone. This path returned before appending even the usual size-only record. The `kept` field describes how the delete was first captured, so it still says `hard link` after the freeze.
+3. In `src/restore.rs`, `restore_effects` reverses the effects in descending sequence order. Before the fix, `Undo::plan` first moved the frozen delete copy back to `d1/f0`, then moved the created name `d4/f1` out of the project into recovery. The old inode stayed at 64 bytes through `d2/f1`. There was no growth effect for `prepare_sizes` or alias repair to use.
 
-In `.github/workflows/ci.yml`, Bash’s `pipefail` carries Cargo’s exit status through `tee`. The full run uses `--no-fail-fast` so Cargo runs the remaining test binaries after a failure. `scripts/ci-failure-summary.sh` puts failed test names and proptest minimal inputs ahead of panic details in the job summary. The upload retains the full logs, seed file, diagnostics and harness fixtures for 14 days. The artifact name includes the OS, run ID and attempt. [GitHub Actions shell behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstepsshell)
+Before, `saqta show 1 --json` showed these two effects. Paths are relative to the fixture and the quarantine entry name is shortened.
 
-`scripts/flake-hunt.sh` builds once, runs Cargo for each iteration, and saves full output and a Markdown table. It resets `SIGINT` and `SIGQUIT` before starting Cargo in the background, so tests receive the normal signal dispositions while the script can reap its burners on interruption. Each run gets an isolated fixture root. The fixtures remove their data on success and the script prunes empty directories. It keeps nonempty failure fixtures and copies changed seed files next to the finding run’s log. The stress mode applies `SAQTA_NO_SYNC_WAKE=1` to fixture commands. The Unix socket test has a short `/proc/self/fd` address fallback for long fixture paths.
+```json
+{"effects":[
+  {"seq":1,"op":"create","path":"d4/f1","quarantine":"","note":{"before":null}},
+  {"seq":2,"op":"delete","path":"d1/f0","quarantine":"2-…","note":{"kept":"hard link","before":{"size":13}}}
+]}
+```
 
-### Stdin audit
+With the fix, the truncate branch sees that the command created the name, its recorded source is gone, and the file still has multiple links. It calls `keep_copy` to freeze the delete entry and store a write pre-image. `Capture::handle` sends CONTINUE after capture and journal append. The new effect from `saqta show 1 --json` is below.
 
-| Site | Can exit before a required read? | Result |
-| --- | --- | --- |
-| `tests/codex.rs`, `hook` | Yes. The disabled hook completes without reading. | Accept `BrokenPipe` in the shared hook input helper. |
-| `tests/codex.rs`, `raw_garbage_hook_is_silent_and_successful` | The enabled hook reads stdin to EOF before trying to parse the invalid bytes. | Keep the write strict so the invalid input is delivered. |
-| `tests/common/mod.rs`, `Running::spawn` | Its two input callers require the bytes. `tr` transforms them in the exec test and the harness driver reads its operation batch. | Keep the write strict. |
-| `tests/timeouts.rs`, the stopped-supervisor test | The tracee waits at `read -r release` before making the syscall whose blocked state the test observes. | Keep the write strict. |
-| `tests/capture.rs`, `killed_command_recovers_only_complete_intents_and_keeps_the_raw_tail` | The write appends to `effects.log`. | Keep the write strict. |
-| `tests/speed.rs`, `malformed_complete_plan_refuses_resume_without_mutations` | The write appends to `state.log`. | Keep the write strict. |
-| `tests/speed.rs`, PID reuse fixture | The Python parent reads the first PID before releasing the child from `os.read(0, 1)`. The second fork depends on that release. | Keep the write and flush strict. |
+```json
+{"seq":3,"op":"modify","path":"d4/f1","quarantine":"3-…","note":{"kept":"copy","before":{"size":13}}}
+```
+
+Undo now reverses effect 3 first. `Undo::alias_paths` includes the named `d4/f1`. `Undo::plan_repair` saves the 64-byte version and uses `execute_write` in `src/restore/steps.rs` to put the 13-byte pre-image, mode, and mtime back on the live inode. `d2/f1` shares that inode, so it gets the repair without being named in the command or journal. Undo then restores the deleted name and removes the created name. The trace finishes with both original paths at 13 bytes and with the 64-byte version in recovery. The fix reuses the existing capture and undo actions, with zero additional exec-path fsyncs or per-file subprocesses.
+
+### Reproduction on `664690a`
+
+`SAQTA_HARNESS_CASES=1 cargo test --locked --test harness` with the four additional `cc` lines, before adding the named tests or changing capture.
+
+```text
+test concurrent_subtrees_restore_exactly ... FAILED
+test interrupted_undo_preserves_versions_and_resumes ... FAILED
+test consecutive_commands_restore_every_snapshot ... FAILED
+test result: FAILED. 31 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.88s
+```
+
+`cargo test --locked --test harness regression_` after adding the named tests and before changing capture.
+
+```text
+test regression_growth_through_new_hard_link_after_unlink_resumes ... FAILED
+test regression_growth_through_new_hard_link_after_rename_over ... FAILED
+test regression_growth_through_new_hard_link_after_unlinking_second_original ... FAILED
+test regression_growth_through_new_hard_link_after_unlinking_first_original ... FAILED
+test regression_append_through_new_hard_link_after_original_removed ... ok
+test regression_shrink_through_new_hard_link_after_original_removed ... ok
+test regression_in_place_write_through_new_hard_link_after_original_removed ... ok
+test regression_truncating_write_through_new_hard_link_after_original_removed ... ok
+test result: FAILED. 23 passed; 4 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.32s
+```
+
+The two cases that unlink `d1/f0` leave `d2/f1` different. The unlink and rename-over of `d2/f1` leave `d1/f0` different. Each shrink, append, and write regression tries both unlink and rename-over. Shrink uses the `Kind::Truncate` copy path. Append and both write modes reach `keep_copy` through `Kind::Open`. The write cases supply nonempty data.
+
+### Why the failures appeared now
+
+The harness draws 1–40 operations uniformly per vector. Each operation independently draws one of 15 kinds and two slots from 18 choices. The initial fixture has one inode with two names, at slots 8 and 11. There are four empty file slots where the link can land. In one ordered triple of positions, the chance of linking one of the initial names to one of these empty slots is `8/(15×18²)`. The middle operation must unlink that source or rename one of the six other initially occupied files over it, with probability `1/(15×18) + 6/(15×18²)`. Either growth kind, 5 or 6, can then target the new link, with probability `2/(15×18)`. Their product is about `6.02 × 10⁻⁸` per ordered triple.
+
+Count all triples in the same command, including nonadjacent operations. Averaging `choose(length, 3)` gives 2,532 triples in one full vector. Averaging over the consecutive property's splits gives 1,110 per case. The concurrent property averages three independent worker vectors and 7,595 triples per case.
+
+| Property | Expected matching triples per random case | Expected triples in 5,000 cases |
+| --- | ---: | ---: |
+| Consecutive commands | 0.000067 | 0.33 |
+| Interrupted undo | 0.000152 | 0.76 |
+| Concurrent subtrees | 0.000457 | 2.29 |
+
+These are opportunities for the initial-fixture shape. Other operations can invalidate a matching triple or create different hard-link setups. The rates are therefore approximate guides to detection. The archived failures came after 806 consecutive and 1,853 concurrent successes in the scheduled run, and 363 interrupted and 4,274 concurrent successes in the branch run.
+
+Proptest 1.12.0 replays saved seeds, then samples new cases with a random RNG seed by default. All three jobs used 5,000 cases and a shrink limit of 20,000. The earlier successful run checked out `fc971b9`, whose tree object matches `bd75176`. The growth shortcut is also present in `5972930`, the M5 merge. The two failures used different Ubuntu 24.04 image revisions and the artifacts record different seeds. The saved seeds failed before any new local case passed, including failures in the single-command, single-process regressions on WSL2. The evidence is consistent with random sampling of a rare shape. [Earlier successful job](https://github.com/Alpi157/saqta/actions/runs/44281619076/job/134723487956) · [Scheduled failure](https://github.com/Alpi157/saqta/actions/runs/44505830955/job/135497073031) · [Branch failure](https://github.com/Alpi157/saqta/actions/runs/44510544721/job/135513351876)
 
 ## Acceptance checklist
 
-| # | Item | Result | Proven by (test name or command) |
+| # | Item | Result | Proven by |
 | --- | --- | --- | --- |
-| 1 | Reproduce on the unmodified code | 3 of 60 failed with `BrokenPipe`. | Two CPUs, four burners per test, `hook_rewrite_and_fail_open` with `--exact`. |
-| 2 | Match Codex and force the early exit | Pass. 0 of 60 failed after the fix. | Same loop and `hook_input_write_tolerates_an_early_exit_like_codex`. |
-| 3 | Preserve CI evidence | Pass locally. The summary preserved the failing test and minimal input within 300 lines. | Forced harness failure, byte-for-byte `tee` probe with exit 101, and all three additional CI test commands. |
-| 4 | Run the flake hunt | Pass. Both required tables are below. | Whole suite on four CPUs, focused hunt with four burners, stress run, and failure and SIGINT smoke tests. |
-| 5 | Record the CI rules and decision | Done. | `AGENTS.md` and decision 0024. |
-| 6 | Validate scripts, YAML and Rust | Pass locally. ShellCheck unavailable. | `bash -n` on both scripts, PyYAML 6.0.1, `cargo fmt --all`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`. |
+| 1 | Reproduce the saved seeds and four minimal cases | All three properties and all four named growth cases fail before the fix | Before-fix output above |
+| 2 | Trace capture and undo and check the other operations | Trace captured. Shrink, append, and both write modes pass with either removal | `saqta show 1 --json`, verbose undo, and named tests above |
+| 3 | Reuse ADR 0022's copy and alias repair path | Pass | `src/capture.rs`, the after-fix trace, and the resume regression |
+| 4 | Explain the timing of the failures | Analyzed | Operation probabilities and CI case counts above |
+| 5 | Pass added tests and saved seeds | 42 passed in 6.62 s | `SAQTA_HARNESS_CASES=1 cargo test --locked --test harness` |
+| 5 | Pass the 5,000-case harness locally | 42 passed in 955.01 s wall-clock time | `SAQTA_HARNESS_CASES=5000 cargo test --locked --test harness` |
+| 5 | Pass the four-CPU flake hunt | 3 of 3 passed | `scripts/flake-hunt.sh 3 --mode ci4` |
+| 5 | Measure delete, create, and rename-over capture cost | Median added cost varied by at most 0.4% | `scripts/overhead.sh` |
+| 5 | Pass formatting, lints, and the full suite | Pass | `cargo fmt --all`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` |
+| Review | Cover chained links, later writes and shrinks, deletion and rename of the new link, and interrupted undo | 48 harness tests passed in 20.06 s after adding the six review cases | `cargo fmt --all`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked --test harness` |
 
 ## Decisions
 
-- [0024 CI keeps test evidence](../docs/decisions/0024-ci-keeps-test-evidence.md)
+- [0025 Capture growth through new aliases whose original name is gone](../docs/decisions/0025-capture-growth-through-new-aliases.md)
 
 ## Measurements
 
-AMD Ryzen 9 9900X, x86-64 WSL2, Linux `6.18.58.1-microsoft-standard-WSL2`, ext4, Rust 1.100.0. The 60-run comparisons pinned both tests and burners to CPUs 0 and 1. The unmodified test failed on iterations 5, 35 and 44. The fixed test passed all 60.
+AMD Ryzen 9 9900X, x86-64 WSL2, Linux `6.18.58.1-microsoft-standard-WSL2`, ext4, Rust 1.100.0.
 
-### `scripts/flake-hunt.sh 3 --mode ci4`
+The 5,000-case harness took 955.01 s wall-clock time, with 5,000 cases per property and 42 tests passed. The full suite took 33.89 s. The four-CPU flake hunt took 111.74 s across three full runs, with zero failures. Its summary is in `target/flake-hunt/20261119T112645Z.I2A8He/summary.md`.
 
-| Test name | Failures out of 3 | First panic line |
-| --- | ---: | --- |
-| None | 0 | |
+### Capture overhead per file
 
-The initial script inherited ignored `SIGINT` from Bash and timed out in `group_sigint_reaches_command_and_wrapper` on all three runs. The final table uses the corrected runner.
+`scripts/overhead.sh` ran release builds of `664690a` and the fixed working tree on CPUs 0–3, with five samples per workload and 20,000 files per sample. Each build had its own bare timings. The first attempted baseline hit the automatic discard breaker. Both measured runs used `SAQTA_RULES=off` to isolate capture and used the default synchronous wakeups. Added cost per file is the difference between the wrapped and bare medians divided by 20,000.
 
-### `scripts/flake-hunt.sh 40 --test codex --filter hook_rewrite_and_fail_open --busy 4`
+| Workload | Before bare / wrapped (ms) | After bare / wrapped (ms) | Before added (µs/file) | After added (µs/file) | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Deletes | 205.84 / 868.39 | 193.93 / 853.80 | 33.13 | 32.99 | −0.40% |
+| Creates | 1004.27 / 1638.57 | 1002.73 / 1635.85 | 31.71 | 31.66 | −0.19% |
+| Rename-overs | 525.16 / 1495.13 | 531.88 / 1499.37 | 48.50 | 48.37 | −0.26% |
 
-| Test name | Failures out of 40 | First panic line |
-| --- | ---: | --- |
-| None | 0 | |
-
-The stress smoke run also passed the bulk restore test. Its log reported `no_sync=true` and CPUs `0-1`.
-
-### Evidence size
-
-A complete passing run in a fresh `target/saqta-tests` scope left zero files and 806,912 allocated bytes in empty directories. A deliberate inverted model check with proptest RNG seed 42 left 72 case folders and 2,555 files. It wrote one regression seed. The fixture tree held 2,431,474 bytes of file data and occupied 16,908,288 bytes on disk. The model check and the tracked seed file were restored after the probe.
-
-The modeled upload was 924,440 bytes compressed. It used the full suite and failure logs, the generated seed file, and the selected harness fixtures and diagnostic logs. CI uploads the four test log paths, `tests/harness.proptest-regressions`, `target/saqta-tests/**/logs/`, and `target/saqta-tests/harness-*/`. Cargo build output and unrelated fixture trees are excluded to avoid collecting binaries, journals and quarantine contents unrelated to the failure.
+These differences are smaller than the spread in repeat timings. The measurements show comparable cost across the three workloads. The raw timings and full reproduction logs are in `target/alias-growth-evidence/`.
 
 ## Known gaps and risks
 
-- ShellCheck was unavailable. Workflow YAML and behavior were checked locally. The new workflows have yet to run on hosted runners.
-- The artifact size is measured from one forced harness failure. Failure fixtures and full logs can grow when several properties fail or shrink for longer.
+- The added pre-image uses the existing copy limit. Capture reports `not protected` when that copy fails.
+- The restored deleted name comes from the frozen copy, so it has a different inode after undo. The surviving alias keeps its inode and gets its original bytes and metadata back.
+- The full suite printed its environment skips for a Unix socket fixture, a tmpfs mount, a bare i386 syscall, `pytest`, `pnpm`, and the backing-device collision fixture.
 
 ## Questions for review
 
 None.
-
-### Planned commits after review
-
-1. `tests: synchronize the Codex hook and detached undo fixtures`
-2. `ci: retain test failure logs and harness seeds`
-3. `ci: add a repeatable flake hunt`
-
-## Follow-up r1
-
-The detached-deletion and background exec tests give the wrapper a five-second sanity bound and print its return time. Each release file can appear only after the wrapper returns. Capture releases its job after the early undo. Exec checks that the victim still exists before release, then waits for the deletion and for the supervisor to finish.
-
-Fixtures inherit `SAQTA_NO_SYNC_WAKE` for stress mode and both `taskset` CI steps. CI runs all five timeout tests with synchronous wakeups disabled.
-
-### Sleep audit
-
-The line numbers refer to the requested sites before the follow-up.
-
-| Site | Depends on when the sleep ends? | Result |
-| --- | --- | --- |
-| `tests/codex.rs:227`, `pid_one_namespace_finishes_journal` | No. The status and journal assertions follow namespace exit. | Kept the ten-second sleeper as a live descendant for namespace shutdown. |
-| `tests/rules.rs:893`, `pid_one_seals_hold_before_the_namespace_exits` | No. The assertions check the hold, restored bytes, and recorded exit status after namespace exit. | Kept the five-second sleeper as a live descendant for namespace shutdown. |
-| `tests/rules.rs:1246`, `breaker_checks_a_short_git_batch_when_the_tracee_goes_idle` | Yes. The breaker had to return before a finite sleep expired. | Use `sleep infinity` to keep the tracee idle until the breaker stops it. The test runner bounds the command and the test prints the return time. |
-| `tests/retention.rs:156`, `running_and_interrupted_undo_are_protected` | Yes. GC had to check the journal before the two-second sleep expired. | Use a bounded release gate. Open it after checking that GC kept the running journal. |
-| `tests/timeouts.rs:154`, `timeout_finds_an_orphan_holding_stdout_after_wrapper_exit` | No. Readiness observes wrapper exit and the timeout handler kills the orphan holding stdout. | Kept the 30-second sleeper, which holds the pipe through the 350 ms fault window. |
-| `tests/exec.rs:132`, `supervisor_releases_stdout_pipe` | No. The short sleep runs in the foreground before the command prints `hi`. | Kept the sleep and the existing two-second stdout check. |
-
-### `scripts/flake-hunt.sh 40 --test capture --filter setsid_background_deletions_remain_in_same_command --busy 4`
-
-| Test name | Failures out of 40 | First panic line |
-| --- | ---: | --- |
-| None | 0 | |
-
-Wrapper return times on the WSL2 host ranged from 8.732 to 10.884 ms.
-
-### `scripts/flake-hunt.sh 40 --test exec --filter background_job_is_served_after_wrapper_returns --busy 4`
-
-| Test name | Failures out of 40 | First panic line |
-| --- | ---: | --- |
-| None | 0 | |
-
-Wrapper return times ranged from 8.721 to 11.139 ms on the same host.
-
-### `scripts/flake-hunt.sh 3 --mode stress`
-
-| Test name | Failures out of 3 | First panic line |
-| --- | ---: | --- |
-| None | 0 | |
-
-All three whole-suite runs used CPUs 0 and 1. The timeout diagnostics recorded `SAQTA_NO_SYNC_WAKE=1` and all five timeout tests passed in each run. The retention test passed each time, and idle breaker return times ranged from 251.682 to 260.815 ms.
