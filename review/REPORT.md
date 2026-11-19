@@ -84,3 +84,46 @@ None.
 1. `tests: synchronize the Codex hook and detached undo fixtures`
 2. `ci: retain test failure logs and harness seeds`
 3. `ci: add a repeatable flake hunt`
+
+## Follow-up r1
+
+The detached-deletion and background exec tests give the wrapper a five-second sanity bound and print its return time. Each release file can appear only after the wrapper returns. Capture releases its job after the early undo. Exec checks that the victim still exists before release, then waits for the deletion and for the supervisor to finish.
+
+Fixtures inherit `SAQTA_NO_SYNC_WAKE` for stress mode and both `taskset` CI steps. CI runs all five timeout tests with synchronous wakeups disabled.
+
+### Sleep audit
+
+The line numbers refer to the requested sites before the follow-up.
+
+| Site | Depends on when the sleep ends? | Result |
+| --- | --- | --- |
+| `tests/codex.rs:227`, `pid_one_namespace_finishes_journal` | No. The status and journal assertions follow namespace exit. | Kept the ten-second sleeper as a live descendant for namespace shutdown. |
+| `tests/rules.rs:893`, `pid_one_seals_hold_before_the_namespace_exits` | No. The assertions check the hold, restored bytes, and recorded exit status after namespace exit. | Kept the five-second sleeper as a live descendant for namespace shutdown. |
+| `tests/rules.rs:1246`, `breaker_checks_a_short_git_batch_when_the_tracee_goes_idle` | Yes. The breaker had to return before a finite sleep expired. | Use `sleep infinity` to keep the tracee idle until the breaker stops it. The test runner bounds the command and the test prints the return time. |
+| `tests/retention.rs:156`, `running_and_interrupted_undo_are_protected` | Yes. GC had to check the journal before the two-second sleep expired. | Use a bounded release gate. Open it after checking that GC kept the running journal. |
+| `tests/timeouts.rs:154`, `timeout_finds_an_orphan_holding_stdout_after_wrapper_exit` | No. Readiness observes wrapper exit and the timeout handler kills the orphan holding stdout. | Kept the 30-second sleeper, which holds the pipe through the 350 ms fault window. |
+| `tests/exec.rs:132`, `supervisor_releases_stdout_pipe` | No. The short sleep runs in the foreground before the command prints `hi`. | Kept the sleep and the existing two-second stdout check. |
+
+### `scripts/flake-hunt.sh 40 --test capture --filter setsid_background_deletions_remain_in_same_command --busy 4`
+
+| Test name | Failures out of 40 | First panic line |
+| --- | ---: | --- |
+| None | 0 | |
+
+Wrapper return times on the WSL2 host ranged from 8.732 to 10.884 ms.
+
+### `scripts/flake-hunt.sh 40 --test exec --filter background_job_is_served_after_wrapper_returns --busy 4`
+
+| Test name | Failures out of 40 | First panic line |
+| --- | ---: | --- |
+| None | 0 | |
+
+Wrapper return times ranged from 8.721 to 11.139 ms on the same host.
+
+### `scripts/flake-hunt.sh 3 --mode stress`
+
+| Test name | Failures out of 3 | First panic line |
+| --- | ---: | --- |
+| None | 0 | |
+
+All three whole-suite runs used CPUs 0 and 1. The timeout diagnostics recorded `SAQTA_NO_SYNC_WAKE=1` and all five timeout tests passed in each run. The retention test passed each time, and idle breaker return times ranged from 251.682 to 260.815 ms.

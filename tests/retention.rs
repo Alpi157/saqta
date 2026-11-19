@@ -153,7 +153,10 @@ fn cachedir_tag_and_shared_preimages_keep_nonregenerable_references() {
 fn running_and_interrupted_undo_are_protected() {
     let (s, p) = capture_fixture("gc-protection");
     fs::write(p.join("file"), "original").unwrap();
-    let mut c = s.exec(&["-c", "rm file; touch ready; sleep 2"]);
+    let mut c = s.exec(&[
+        "-c",
+        "rm file && touch ready && timeout --foreground 30 sh -c 'until [ -e ../release ]; do sleep 0.01; done'",
+    ]);
     c.current_dir(&p);
     let child = Running::spawn(c, None);
     wait_until(Duration::from_secs(3), || p.join("ready").exists());
@@ -161,6 +164,7 @@ fn running_and_interrupted_undo_are_protected() {
     pad(&s, &p);
     gc(&s, &["--max-size", "0"]);
     assert!(home(&s).join("cmd/1").exists());
+    fs::write(p.with_file_name("release"), b"").unwrap();
     assert_success(&child.output());
     pad(&s, &p);
     let mut c = s.saqta(&["undo", "1"]);

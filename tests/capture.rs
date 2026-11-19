@@ -1005,8 +1005,11 @@ fn setsid_background_deletions_remain_in_same_command() {
         // Keep the detached job alive until the early undo attempt returns.
         "setsid sh -c 'timeout --foreground 30 sh -c \"until [ -e ../release ]; do sleep 0.01; done\" && rm -rf tree' >/dev/null 2>&1 & echo started",
     );
+    let elapsed = start.elapsed();
+    note(format!("setsid background return: {elapsed:?}"));
     assert_success(&o);
-    assert!(start.elapsed() < Duration::from_millis(450));
+    // The release gate proves the wrapper returned without waiting for the job.
+    assert!(elapsed < Duration::from_secs(5));
     let id = last_id(&s);
     let o = undo(&s, id);
     fs::write(p.with_file_name("release"), b"").unwrap();

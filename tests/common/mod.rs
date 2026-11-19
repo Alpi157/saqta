@@ -60,6 +60,8 @@ impl Sandbox {
         fs::create_dir_all(dir.parent().unwrap()).unwrap();
         fs::create_dir(&dir).unwrap();
         let mut env: BTreeMap<_, _> = std::env::vars_os().collect();
+        // Pass SAQTA_NO_SYNC_WAKE through for stress mode and both taskset CI steps.
+        // The CI timeouts step runs all five tests with synchronous wakeups disabled.
         for key in [
             "SAQTA_SUPERVISED",
             "SAQTA_STRICT",
