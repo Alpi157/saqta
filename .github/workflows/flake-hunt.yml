@@ -1,0 +1,43 @@
+name: Flake hunt
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Number of runs per runner
+        type: number
+        default: 10
+      mode:
+        description: CPU and wakeup settings
+        type: choice
+        default: default
+        options: [default, ci4, stress]
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the flake hunt
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+          MODE: ${{ inputs.mode }}
+        run: scripts/flake-hunt.sh "$ITERATIONS" --mode "$MODE" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Keep flake hunt logs and seeds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-hunt-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          path: target/flake-hunt/

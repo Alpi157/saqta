@@ -45,17 +45,25 @@ impl Sandbox {
                 ^ NEXT_ID.fetch_add(1, Ordering::Relaxed) as u64)
                 & 0xffffffffff
         );
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/saqta-tests")
-            .join(name)
-            .join(&tag);
+        let mut root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/saqta-tests");
+        // A flake hunt can prune its own empty fixture directories between runs.
+        if let Some(run_dir) = std::env::var_os("SAQTA_TEST_RUN_DIR").map(PathBuf::from) {
+            assert_eq!(run_dir.parent(), Some(root.as_path()));
+            assert!(
+                run_dir
+                    .file_name()
+                    .is_some_and(|name| name.as_bytes().starts_with(b"r."))
+            );
+            root = run_dir;
+        }
+        let dir = root.join(name).join(&tag);
         fs::create_dir_all(dir.parent().unwrap()).unwrap();
         fs::create_dir(&dir).unwrap();
         let mut env: BTreeMap<_, _> = std::env::vars_os().collect();
         for key in [
             "SAQTA_SUPERVISED",
             "SAQTA_STRICT",
-            "SAQTA_NO_SYNC_WAKE",
+            "SAQTA_TEST_RUN_DIR",
             "SAQTA_DEBUG",
             "SAQTA_TEST_ABORT_AFTER",
             "SAQTA_TEST_STOP_UNDO",

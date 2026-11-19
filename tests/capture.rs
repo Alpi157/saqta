@@ -3,9 +3,13 @@ use common::*;
 use std::{
     ffi::{OsStr, OsString},
     fs,
-    os::unix::{
-        ffi::OsStringExt,
-        fs::{PermissionsExt, symlink},
+    os::{
+        fd::AsRawFd,
+        unix::{
+            ffi::OsStringExt,
+            fs::{PermissionsExt, symlink},
+            net::UnixListener,
+        },
     },
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -1244,7 +1248,15 @@ fn existing_fifo_and_socket_are_linked_without_opening_content() {
     let mut c = s.command("mkfifo");
     c.arg(p.join("fifo"));
     assert_success(&run(c));
-    let socket = match std::os::unix::net::UnixListener::bind(p.join("socket")) {
+    let socket = UnixListener::bind(p.join("socket")).or_else(|err| {
+        if err.kind() != std::io::ErrorKind::InvalidInput {
+            return Err(err);
+        }
+        // Use a short address when the checkout and fixture paths exceed SUN_LEN.
+        let project = fs::File::open(&p)?;
+        UnixListener::bind(format!("/proc/self/fd/{}/socket", project.as_raw_fd()))
+    });
+    let socket = match socket {
         Ok(socket) => Some(socket),
         Err(e)
             if matches!(
