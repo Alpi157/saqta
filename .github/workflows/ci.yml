@@ -10,6 +10,9 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -18,12 +21,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - name: Run the full test suite
+        run: |
+          mkdir -p target/ci-logs
+          cargo test --locked --no-fail-fast 2>&1 | tee target/ci-logs/full.log
       - name: Bulk restore without synchronous wakeups on two CPUs
-        run: taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test codex separate_bind_mount_five_thousand_deletes_restore -- --exact --nocapture --test-threads=1
+        run: |
+          mkdir -p target/ci-logs
+          taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test codex separate_bind_mount_five_thousand_deletes_restore -- --exact --nocapture --test-threads=1 2>&1 | tee target/ci-logs/bulk-restore.log
       - name: Verify timeout diagnostics on two CPUs
-        run: taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test timeouts -- --test-threads=1
-      - run: cargo test --locked --test capture
+        run: |
+          mkdir -p target/ci-logs
+          taskset -c 0,1 env SAQTA_NO_SYNC_WAKE=1 cargo test --locked --test timeouts -- --test-threads=1 2>&1 | tee target/ci-logs/timeouts.log
+      - name: Verify capture with proc-mem fallback
+        run: |
+          mkdir -p target/ci-logs
+          cargo test --locked --test capture 2>&1 | tee target/ci-logs/capture-proc-mem.log
         env:
           SAQTA_FORCE_PROC_MEM: '1'
       - run: cargo run --locked -- doctor
@@ -31,11 +44,18 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check licenses bans advisories
-      - name: Keep timeout diagnostics
+      - name: Summarize test failures
+        if: failure()
+        run: scripts/ci-failure-summary.sh target/ci-logs >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep test evidence
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: timeout-diagnostics-${{ matrix.os }}-${{ github.run_id }}
+          name: test-evidence-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 14
-          path: target/saqta-tests/**/logs/timeout-*.log
+          path: |
+            target/ci-logs/
+            tests/harness.proptest-regressions
+            target/saqta-tests/**/logs/
+            target/saqta-tests/harness-*/

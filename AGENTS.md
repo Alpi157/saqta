@@ -58,6 +58,7 @@ If a new dependency needs downloading and the network is blocked, stop and ask t
 
 ## How we work
 - One branch per milestone (`m1-exec`, `m2-capture`, ...). Small commits that each build and pass tests, with messages like `exec: forward SIGTERM to the whole tree`. In Codex's sandbox `.git` is read-only, so ask before each commit.
+- A red CI job is never rerun before its failing test is known, from the step summary or the test-evidence artifact. A harness failure in ordinary CI is treated as a real bug until its seed proves otherwise.
 - Each real design decision gets `docs/decisions/NNNN-short-title.md`: context, decision, alternatives considered, consequences. Under 300 words.
 - A milestone is done when every acceptance item in its prompt passes. Then write `review/REPORT.md` (template below) and run `scripts/review-bundle.sh <milestone>`. If something can't be fixed, say so plainly in the report. Never weaken or delete a test to make it pass.
 
