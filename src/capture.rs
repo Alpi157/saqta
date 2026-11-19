@@ -636,33 +636,25 @@ impl Capture {
                     .as_ref()
                     .filter(|s| s.st_mode & libc::S_IFMT == libc::S_IFREG)
                 {
-                    let mut e = self.effect(
-                        n,
-                        if c.size >= st.st_size as u64 {
-                            "size"
-                        } else {
-                            "modify"
-                        },
-                        p,
-                        None,
-                        c.flags,
-                    );
-                    if c.size < st.st_size as u64 {
+                    let key = (st.st_dev, st.st_ino);
+                    let created = self.created.contains(p.path.as_os_str());
+                    let original = self.original_links.get(&key);
+                    let new_name_without_origin = created && original.is_none();
+                    // Keep a pre-image through the new name if its recorded origin
+                    // disappeared and growth can still reach another link.
+                    let copy = c.size < st.st_size as u64
+                        || self.copied.contains_key(&key)
+                        || (new_name_without_origin && st.st_nlink > 1);
+                    let mut e =
+                        self.effect(n, if copy { "modify" } else { "size" }, p, None, c.flags);
+                    if copy {
                         self.keep_copy(p, &mut e, true)?;
                     } else {
-                        self.freeze_links(p)?;
-                        let key = (st.st_dev, st.st_ino);
-                        if self.created.contains(p.path.as_os_str())
-                            && let Some(original) = self.original_links.get(&key)
-                        {
+                        if created && let Some(original) = original {
                             e.path = journal::display(original);
                         }
-                        if self.copied.contains_key(&key) {
-                            e.op = "modify".into();
-                            self.keep_copy(p, &mut e, true)?;
-                        } else if self.created.contains(p.path.as_os_str())
-                            && !self.original_links.contains_key(&key)
-                        {
+                        self.freeze_links(p)?;
+                        if new_name_without_origin {
                             return Ok(());
                         }
                     }

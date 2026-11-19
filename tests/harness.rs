@@ -179,6 +179,11 @@ fn op(kind: u8, a: u8, b: u8) -> Op {
         data: vec![],
     }
 }
+fn op_with_data(kind: u8, a: u8, b: u8, data: &[u8]) -> Op {
+    let mut operation = op(kind, a, b);
+    operation.data = data.to_vec();
+    operation
+}
 fn check_parallel(processes: Vec<Vec<Op>>) {
     let (s, root) = capture_fixture("harness-parallel");
     for i in 0..processes.len() {
@@ -368,6 +373,113 @@ fn regression_growth_through_new_hard_link_then_replace_original_name() {
         1,
     );
 }
+
+#[test]
+fn regression_growth_through_new_hard_link_after_unlinking_first_original() {
+    check_sequence(vec![op(12, 8, 15), op(9, 8, 0), op(5, 15, 0)], 1);
+}
+
+#[test]
+fn regression_growth_through_new_hard_link_after_unlink_resumes() {
+    let operations = vec![op(12, 8, 13), op(9, 8, 0), op(5, 13, 0)];
+    check_sequence(operations.clone(), 1);
+    check_interrupted(operations, 1);
+}
+
+#[test]
+fn regression_growth_through_new_hard_link_after_rename_over() {
+    check_sequence(vec![op(12, 11, 16), op(7, 6, 11), op(5, 16, 0)], 1);
+}
+
+#[test]
+fn regression_growth_through_new_hard_link_after_unlinking_second_original() {
+    check_sequence(vec![op(12, 11, 17), op(9, 11, 0), op(5, 17, 0)], 1);
+}
+
+#[test]
+fn regression_growth_through_chained_new_links_after_unlink() {
+    check_sequence(
+        vec![op(12, 8, 15), op(12, 15, 16), op(9, 8, 0), op(5, 16, 0)],
+        1,
+    );
+}
+
+#[test]
+fn regression_write_surviving_alias_after_growth_through_new_link() {
+    check_sequence(
+        vec![
+            op(12, 8, 15),
+            op(9, 8, 0),
+            op(5, 15, 0),
+            op_with_data(1, 11, 0, b"later"),
+        ],
+        1,
+    );
+}
+
+#[test]
+fn regression_delete_new_link_after_growth_through_it() {
+    check_sequence(
+        vec![op(12, 8, 15), op(9, 8, 0), op(5, 15, 0), op(9, 15, 0)],
+        1,
+    );
+}
+
+#[test]
+fn regression_shrink_surviving_alias_after_growth_through_new_link() {
+    check_sequence(
+        vec![op(12, 8, 15), op(9, 8, 0), op(5, 15, 0), op(4, 11, 0)],
+        1,
+    );
+}
+
+#[test]
+fn regression_rename_new_link_over_surviving_alias_after_growth() {
+    check_sequence(
+        vec![op(12, 8, 15), op(9, 8, 0), op(5, 15, 0), op(7, 15, 11)],
+        1,
+    );
+}
+
+#[test]
+fn regression_interrupt_each_step_of_growth_through_new_link() {
+    let ops = vec![
+        op(12, 8, 15),
+        op(9, 8, 0),
+        op(5, 15, 0),
+        op_with_data(3, 11, 0, b"tail"),
+    ];
+    for stop in 1..=4 {
+        check_interrupted(ops.clone(), stop);
+    }
+}
+
+fn check_new_hard_link_after_original_removed(kind: u8, data: &[u8]) {
+    let change = op_with_data(kind, 15, 0, data);
+    check_sequence(vec![op(12, 8, 15), op(9, 8, 0), change.clone()], 1);
+    check_sequence(vec![op(12, 8, 15), op(7, 6, 8), change], 1);
+}
+
+#[test]
+fn regression_shrink_through_new_hard_link_after_original_removed() {
+    check_new_hard_link_after_original_removed(4, &[]);
+}
+
+#[test]
+fn regression_append_through_new_hard_link_after_original_removed() {
+    check_new_hard_link_after_original_removed(3, b"append");
+}
+
+#[test]
+fn regression_truncating_write_through_new_hard_link_after_original_removed() {
+    check_new_hard_link_after_original_removed(1, b"replacement");
+}
+
+#[test]
+fn regression_in_place_write_through_new_hard_link_after_original_removed() {
+    check_new_hard_link_after_original_removed(2, b"write");
+}
+
 #[test]
 fn resume_replays_every_step_of_shared_inode_repair_and_exchange() {
     let mut write = op(1, 6, 0);
