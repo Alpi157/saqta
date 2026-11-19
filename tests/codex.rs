@@ -3,29 +3,42 @@ use common::*;
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Write,
+    io::{ErrorKind, Write},
     os::unix::process::ExitStatusExt,
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    time::Duration,
 };
 
-fn hook(s: &Sandbox, payload: &Value, off: bool) -> Output {
+fn spawn_hook(s: &Sandbox, off: bool) -> Child {
     let mut c = s.saqta(&["hook", "codex"]);
     if off {
         c.env("SAQTA_OFF", "1");
     }
-    let mut child = c
-        .stdin(Stdio::piped())
+    c.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
-    child
+        .unwrap()
+}
+
+fn write_hook_input(child: &mut Child, payload: &Value) {
+    let result = child
         .stdin
         .take()
         .unwrap()
-        .write_all(&serde_json::to_vec(payload).unwrap())
-        .unwrap();
+        .write_all(&serde_json::to_vec(payload).unwrap());
+    // Codex 0.169 ignores BrokenPipe here (codex-rs/hooks/src/engine/command_runner.rs:315-323).
+    if let Err(err) = result
+        && err.kind() != ErrorKind::BrokenPipe
+    {
+        panic!("failed to write hook stdin: {err}");
+    }
+}
+
+fn hook(s: &Sandbox, payload: &Value, off: bool) -> Output {
+    let mut child = spawn_hook(s, off);
+    write_hook_input(&mut child, payload);
     child.wait_with_output().unwrap()
 }
 fn payload(tool: &str, event: &str, cwd: &Path, command: &str) -> Value {
@@ -75,6 +88,20 @@ fn hook_rewrite_and_fail_open() {
             .contains("unhandled")
     );
 }
+#[test]
+fn hook_input_write_tolerates_an_early_exit_like_codex() {
+    let s = Sandbox::new("hook-early-exit");
+    let mut child = spawn_hook(&s, true);
+    wait_until(Duration::from_secs(10), || {
+        child.try_wait().unwrap().is_some()
+    });
+    write_hook_input(&mut child, &payload("Bash", "PreToolUse", &s.dir, "true"));
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
 #[test]
 fn patch_add_update_delete_move_and_undo() {
     let (s, p) = capture_fixture("patch");
