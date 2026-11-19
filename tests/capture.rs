@@ -998,12 +998,14 @@ fn setsid_background_deletions_remain_in_same_command() {
     let o = script(
         &s,
         &p,
-        "setsid sh -c 'sleep 0.5; rm -rf tree' >/dev/null 2>&1 & echo started",
+        // Keep the detached job alive until the early undo attempt returns.
+        "setsid sh -c 'timeout --foreground 30 sh -c \"until [ -e ../release ]; do sleep 0.01; done\" && rm -rf tree' >/dev/null 2>&1 & echo started",
     );
     assert_success(&o);
     assert!(start.elapsed() < Duration::from_millis(450));
     let id = last_id(&s);
     let o = undo(&s, id);
+    fs::write(p.with_file_name("release"), b"").unwrap();
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("still running"));
     wait_until(Duration::from_secs(5), || s.run_markers().is_empty());
