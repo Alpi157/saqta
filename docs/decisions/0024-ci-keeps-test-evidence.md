@@ -29,3 +29,6 @@ Reviewers can identify a failed test and recover a new seed before rerunning.
 Ordinary CI still explores fresh cases. Repeated runs consume runner time only
 when dispatched. A long shrink can put more detail in the full logs than fits
 in the summary.
+
+Fixtures inherit `SAQTA_NO_SYNC_WAKE` for stress mode and both `taskset` CI
+steps. CI runs all five timeout tests with synchronous wakeups disabled.

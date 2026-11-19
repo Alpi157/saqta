@@ -1243,9 +1243,11 @@ fn breaker_checks_a_short_git_batch_when_the_tracee_goes_idle() {
         fs::write(path, b"dirty tracked contents\n").unwrap();
     }
     let started = Instant::now();
-    let o = script(&s, &p, "rm -- bulk/*; sleep 6");
+    let o = script(&s, &p, "rm -- bulk/*; sleep infinity");
+    let elapsed = started.elapsed();
+    note(format!("idle breaker return: {elapsed:?}"));
     held(&o, "[saqta 1] Stopped this command and restored 201 files");
     assert!(err(&o).contains("To set changes aside, use: git stash -u"));
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(elapsed < Duration::from_secs(5));
     same_bytes(&paths[1..], b"dirty tracked contents\n");
 }

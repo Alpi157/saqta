@@ -115,13 +115,15 @@ fn background_job_is_served_after_wrapper_returns() {
     let start = Instant::now();
     let o = s.run(&[
         "-c",
-        "sh -c 'sleep 1; rm victim' >/dev/null 2>&1 & echo started",
+        r#"sh -c 'timeout --foreground 30 sh -c "until [ -e release ]; do sleep 0.01; done" && rm victim' >/dev/null 2>&1 & echo started"#,
     ]);
     let elapsed = start.elapsed();
     note(format!("background return: {elapsed:?}"));
     assert_success(&o);
     assert_eq!(o.stdout, b"started\n");
-    assert!(elapsed < Duration::from_millis(500));
+    assert!(elapsed < Duration::from_secs(5));
+    assert!(s.dir.join("victim").exists());
+    fs::write(s.dir.join("release"), b"").unwrap();
     wait_until(Duration::from_secs(2), || !s.dir.join("victim").exists());
     wait_until(Duration::from_secs(2), || s.run_markers().is_empty());
 }
