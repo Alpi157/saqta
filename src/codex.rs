@@ -23,11 +23,7 @@ struct Install {
     command: String,
 }
 fn installs(home: &Path) -> Result<Vec<Install>> {
-    match fs::read(home.join("codex-installs.json")) {
-        Ok(b) => Ok(serde_json::from_slice(&b)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e.into()),
-    }
+    Ok(journal::read_json_optional(&home.join("codex-installs.json"))?.unwrap_or_default())
 }
 fn save(home: &Path, rows: &[Install]) -> Result<()> {
     journal::json_write(&home.join("codex-installs.json"), &rows)?;
@@ -321,10 +317,8 @@ pub fn status() -> Result<i32> {
     let cmd = command()?;
     for row in installs(&home)? {
         let project = journal::path(&row.project)?;
-        let v: Value = fs::read(project.join(".codex/hooks.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(Value::Null);
+        let v: Value =
+            journal::read_json_optional(&project.join(".codex/hooks.json"))?.unwrap_or(Value::Null);
         let present = entries(&cmd)
             .iter()
             .filter(|(event, e)| v["hooks"][event].as_array().is_some_and(|a| a.contains(e)))

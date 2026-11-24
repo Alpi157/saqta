@@ -23,6 +23,18 @@ use std::{
 };
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_saqta");
+pub fn encoded_path(path: &Path) -> String {
+    let mut name = String::new();
+    for &byte in path.as_os_str().as_bytes() {
+        if (b' '..=b'~').contains(&byte) && byte != b'%' {
+            name.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(name, "%{byte:02X}").unwrap();
+        }
+    }
+    name
+}
 pub fn notification_counts(folder: &Path) -> std::io::Result<[u64; 5]> {
     timeout::notification_counts(folder)
 }

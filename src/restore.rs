@@ -971,7 +971,7 @@ pub fn run(id: u64, dry_run: bool, force: bool, verbose: bool, resume: bool) -> 
     let folder = home.join("cmd").join(id.to_string());
     let release_from = folder.join("release-from");
     if release_from.exists() {
-        let held: u64 = serde_json::from_slice(&fs::read(release_from)?)?;
+        let held: u64 = journal::read_json(&release_from)?;
         if !crate::hold::directory(&home, held)
             .join("released")
             .exists()
@@ -1080,11 +1080,7 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
     }
     let root = sys::open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY, 0)?;
     let observations: std::collections::BTreeMap<String, Option<State>> =
-        fs::read(home.join("undo-posts.json"))
-            .ok()
-            .map(|b| serde_json::from_slice(&b))
-            .transpose()?
-            .unwrap_or_default();
+        journal::read_json_optional(&home.join("undo-posts.json"))?.unwrap_or_default();
     let mut conflicts = Vec::new();
     let mut inaccessible = HashSet::new();
     for e in r.effects.iter().filter(|_| !resuming) {
@@ -1260,11 +1256,8 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
         .filter(|e| matches!(e.op.as_str(), "modify" | "size"))
         .filter_map(|e| e.note.before.as_ref().map(|s| (s.dev, s.ino)))
         .collect();
-    let alias_posts: BTreeMap<String, (State, State)> = fs::read(home.join("undo-aliases.json"))
-        .ok()
-        .map(|b| serde_json::from_slice(&b))
-        .transpose()?
-        .unwrap_or_default();
+    let alias_posts: BTreeMap<String, (State, State)> =
+        journal::read_json_optional(&home.join("undo-aliases.json"))?.unwrap_or_default();
     let recovery = if resuming {
         checkpoints::load(&backup_path)?
     } else {
@@ -1341,7 +1334,7 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
     // home observations succeeded before undo was marked complete.
     let observed_before = backup_path.join("directory-observations.json");
     let observations = if observed_before.exists() {
-        serde_json::from_slice(&fs::read(&observed_before)?)?
+        journal::read_json(&observed_before)?
     } else {
         journal::synced_json_write(&observed_before, &observations)?;
         observations
