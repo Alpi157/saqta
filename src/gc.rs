@@ -216,6 +216,7 @@ fn collect_content(home: &Path, c: &Candidate, dry: bool) -> Result<Collection> 
         }
     }
     if !dry && !remove.is_empty() {
+        journal::persist_pins(&c.folder, &effects)?;
         // Expiry is durable before unlink. A crash can leave extra content, never an unlabelled gap.
         journal::synced_json_write(&c.folder.join("expired.json"), &expired)?;
         for p in remove {

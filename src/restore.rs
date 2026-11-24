@@ -1330,6 +1330,8 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
         return Ok(0);
     }
     output.line(format_args!("undoing command {id}"));
+    // Keep identity before reverse moves consume quarantine hard links.
+    journal::persist_pins(&home.join("cmd").join(id.to_string()), &r.effects)?;
     let alias_keys: BTreeSet<_> = r
         .effects
         .iter()

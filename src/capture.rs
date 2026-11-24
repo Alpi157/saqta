@@ -66,16 +66,25 @@ pub struct Resolved {
     requests: Vec<PathBuf>,
     parent_dev: u64,
     mount: Option<u64>,
-    incarnation: std::cell::OnceCell<sys::Incarnation>,
+    birth: Option<(i64, u32)>,
+    incarnation: std::cell::Cell<Option<sys::Incarnation>>,
 }
 impl Resolved {
+    fn pinned_state(&self) -> Option<State> {
+        self.stat.as_ref().map(|stat| {
+            let mut state = State::from_stat(stat);
+            state.incarnation.birth = self.birth;
+            state
+        })
+    }
     pub fn state(&self) -> Option<State> {
         self.stat.as_ref().map(|s| {
             let mut state = State::from_stat(s);
-            state.incarnation = self
-                .incarnation
-                .get_or_init(|| sys::incarnation_at(self.parent.as_raw_fd(), &self.name, s))
-                .clone();
+            let marker = self.incarnation.get().unwrap_or_else(|| {
+                sys::Incarnation::captured(self.parent.as_raw_fd(), &self.name, s, self.birth)
+            });
+            self.incarnation.set(Some(marker));
+            state.incarnation = marker;
             state
         })
     }
@@ -210,11 +219,20 @@ impl Entry {
     }
     fn state(&self, path: &Path) -> Option<State> {
         let Some(parent) = &self.parent else {
-            return journal::state(path).ok().flatten();
+            return journal::capture_state(path).ok().flatten();
         };
-        journal::state_at(parent.as_raw_fd(), &self.name)
+        journal::capture_state_at(parent.as_raw_fd(), &self.name)
             .ok()
             .flatten()
+    }
+    fn exists(&self, path: &Path) -> bool {
+        match &self.parent {
+            Some(parent) => sys::stat_at(parent.as_raw_fd(), &self.name)
+                .ok()
+                .flatten()
+                .is_some(),
+            None => fs::symlink_metadata(path).is_ok(),
+        }
     }
 }
 enum Destruction {
@@ -223,6 +241,7 @@ enum Destruction {
 }
 
 struct Pending {
+    inode_pinned: bool,
     at: Entry,
     at2: Option<Entry>,
     seqs: Vec<u64>,
@@ -384,7 +403,7 @@ impl Capture {
                         self.policy.is_none()
                             || (!p.destruction.is_empty() && p.at.state(&p.path) != p.before)
                     } else {
-                        Self::applied(p)
+                        Self::applied(p) == Some(true)
                     }
             })
             .map(|(pid, _)| *pid)
@@ -511,7 +530,15 @@ impl Capture {
     fn denied(&self, p: &Resolved, kind: Kind) -> bool {
         std::iter::once(&p.path)
             .chain(p.requests.iter())
-            .any(|path| self.denied_path(path, kind, p.state().is_some_and(|s| s.directory())))
+            .any(|path| {
+                self.denied_path(
+                    path,
+                    kind,
+                    p.stat
+                        .as_ref()
+                        .is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR),
+                )
+            })
     }
     fn denied_path(&self, path: &Path, kind: Kind, directory: bool) -> bool {
         if self.deny_roots.iter().any(|root| {
@@ -549,8 +576,18 @@ impl Capture {
             quarantine: String::new(),
             flags,
             note: Detail {
-                before: p.state(),
-                before2: p2.and_then(Resolved::state),
+                before: if op == "delete" {
+                    p.pinned_state()
+                } else {
+                    p.state()
+                },
+                before2: p2.and_then(|p| {
+                    if op == "rename" {
+                        p.pinned_state()
+                    } else {
+                        p.state()
+                    }
+                }),
                 ..Detail::default()
             },
         }
@@ -697,9 +734,13 @@ impl Capture {
                     {
                         return Ok(());
                     }
-                    if p.state()
-                        .zip(dest.state())
-                        .is_some_and(|(a, b)| a.same_inode(&b))
+                    if p.stat
+                        .as_ref()
+                        .zip(dest.stat.as_ref())
+                        .is_some_and(|(a, b)| a.st_dev == b.st_dev && a.st_ino == b.st_ino)
+                        && p.state()
+                            .zip(dest.state())
+                            .is_some_and(|(a, b)| a.same_inode(&b))
                     {
                         return Ok(());
                     }
@@ -838,6 +879,7 @@ impl Capture {
         } else {
             c.kind
         };
+        let inode_pinned = c.kind == Kind::Delete && effects.iter().any(|e| e.note.pinned);
         let seqs = self.journal.append_batch(effects)?;
         if let Some(seq) = last_candidate.and_then(|i| seqs.get(i)) {
             self.last_rule_candidate = *seq;
@@ -847,6 +889,7 @@ impl Capture {
             self.pending.insert(
                 n.pid,
                 Pending {
+                    inode_pinned,
                     at: Entry::pin(if c.kind == Kind::Link {
                         p2.unwrap_or(p)
                     } else {
@@ -872,9 +915,19 @@ impl Capture {
                     before: if c.kind == Kind::Link {
                         None
                     } else {
-                        p.state()
+                        if inode_pinned {
+                            p.pinned_state()
+                        } else {
+                            p.state()
+                        }
                     },
-                    before2: p2.and_then(Resolved::state),
+                    before2: p2.and_then(|p| {
+                        if c.kind == Kind::Rename {
+                            p.pinned_state()
+                        } else {
+                            p.state()
+                        }
+                    }),
                     destruction,
                     git_lock,
                 },
@@ -887,6 +940,7 @@ impl Capture {
             && p.stat.as_ref().is_none_or(|st| st.st_nlink <= 1)
         {
             e.note.kept = "created earlier".into();
+            e.note.before = p.state();
             return Ok(());
         }
         // A new alias can be the last recorded name of a pre-existing shared
@@ -901,7 +955,8 @@ impl Capture {
             Ok(()) => {
                 e.quarantine = q.clone();
                 e.note.kept = "hard link".into();
-                if let Some(st) = p.state() {
+                e.note.pinned = true;
+                if let Some(st) = p.pinned_state() {
                     self.linked.insert(q, st);
                 }
                 Ok(())
@@ -932,6 +987,13 @@ impl Capture {
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             0,
         )?;
+        if let Some(mut marker) = p.state().map(|state| state.incarnation) {
+            if let Some(generation) = sys::generation_fd(src.as_raw_fd()) {
+                marker.generation = Some(generation);
+                marker.unverified = false;
+            }
+            p.incarnation.set(Some(marker));
+        }
         let dst = sys::open_at(
             self.qfd.as_raw_fd(),
             &CString::new(q).map_err(io::Error::other)?,
@@ -948,12 +1010,24 @@ impl Capture {
         let links: Vec<_> = self
             .linked
             .iter()
-            .filter(|(_, s)| s.same_inode(&st))
+            // These quarantine hard links still pin the inode, so its number
+            // cannot have been reused. No birth-time-only discovery occurs here.
+            .filter(|(_, s)| s.dev == st.dev && s.ino == st.ino)
             .map(|(q, _)| q.clone())
             .collect();
         for q in links {
             let temp = format!("freeze-{}-{}", q, journal::now());
             self.copy_to(p, &temp)?;
+            if let Some(mut original) = self.linked.get(&q).cloned() {
+                if let Some(state) = p.state() {
+                    original.incarnation.generation = state.incarnation.generation;
+                    original.incarnation.unverified = state.incarnation.unverified;
+                    if original.incarnation.birth.is_none() {
+                        original.incarnation.birth = state.incarnation.birth;
+                    }
+                }
+                self.journal.record_pin(&q, original)?;
+            }
             sys::rename_at(
                 self.qfd.as_raw_fd(),
                 &CString::new(temp).map_err(io::Error::other)?,
@@ -973,7 +1047,7 @@ impl Capture {
         let key = (st.dev, st.ino);
         if self.created.contains(p.path.as_os_str()) {
             let original = self.original_links.get(&key).filter(|path| {
-                journal::state(path)
+                journal::capture_state(path)
                     .ok()
                     .flatten()
                     .is_some_and(|s| s.same_inode(&st))
@@ -1001,8 +1075,9 @@ impl Capture {
             Ok(()) => {
                 e.quarantine = q.clone();
                 e.note.kept = "copy".into();
-                if deduplicate {
-                    self.copied.insert(key, (q, st));
+                e.note.before = p.state();
+                if deduplicate && let Some(state) = p.state() {
+                    self.copied.insert(key, (q, state));
                 }
                 Ok(())
             }
@@ -1013,9 +1088,23 @@ impl Capture {
             }
         }
     }
-    fn applied(p: &Pending) -> bool {
+    fn outcome_identity(actual: Option<&State>, before: Option<&State>) -> Option<bool> {
+        let Some((actual, before)) = actual.zip(before) else {
+            return Some(false);
+        };
+        if actual.dev == before.dev
+            && actual.ino == before.ino
+            && (!actual.incarnation.available() || !before.incarnation.available())
+        {
+            // Incomplete identity proves neither success nor failure. Leave the
+            // outcome unknown, so undo cannot silently skip an applied rename.
+            return None;
+        }
+        Some(actual.same_inode(before))
+    }
+    fn applied(p: &Pending) -> Option<bool> {
         if matches!(p.kind, Kind::Open | Kind::Truncate) {
-            return true;
+            return Some(true);
         }
         let second = || {
             p.at2
@@ -1024,39 +1113,49 @@ impl Capture {
                 .and_then(|(at, path)| at.state(path))
         };
         if p.kind == Kind::Rename {
-            return second()
-                .as_ref()
-                .zip(p.before.as_ref())
-                .is_some_and(|(a, b)| a.same_inode(b));
+            return Self::outcome_identity(second().as_ref(), p.before.as_ref());
+        }
+        if p.kind == Kind::Create {
+            // Creation outcome only needs existence. The final snapshot records
+            // full identity; do not read generation for this discarded check.
+            return Some(p.at.exists(&p.path));
         }
         let current = p.at.state(&p.path);
         match p.kind {
             Kind::Delete | Kind::Rmdir => {
-                current.is_none()
-                    || current
-                        .as_ref()
-                        .zip(p.before.as_ref())
-                        .is_some_and(|(a, b)| !a.same_inode(b))
+                if current.is_none() {
+                    Some(true)
+                } else if p.inode_pinned {
+                    // The retained link prevents reuse while the syscall
+                    // completes, including a failed unlink.
+                    Some(
+                        current
+                            .as_ref()
+                            .zip(p.before.as_ref())
+                            .is_some_and(|(a, b)| a.dev != b.dev || a.ino != b.ino),
+                    )
+                } else {
+                    Self::outcome_identity(current.as_ref(), p.before.as_ref()).map(|same| !same)
+                }
             }
-            Kind::Create => current.is_some(),
             Kind::Exchange => {
-                second()
-                    .as_ref()
-                    .zip(p.before.as_ref())
-                    .is_some_and(|(a, b)| a.same_inode(b))
-                    && current
-                        .as_ref()
-                        .zip(p.before2.as_ref())
-                        .is_some_and(|(a, b)| a.same_inode(b))
+                let a = Self::outcome_identity(second().as_ref(), p.before.as_ref());
+                let b = Self::outcome_identity(current.as_ref(), p.before2.as_ref());
+                match (a, b) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
             }
-            _ => true,
+            _ => Some(true),
         }
     }
     pub fn complete(&mut self, pid: u32) {
         let Some(p) = self.pending.remove(&pid) else {
             return;
         };
-        let applied = Self::applied(&p);
+        let outcome = Self::applied(&p);
+        let applied = outcome.unwrap_or(true);
         if applied && let Some(policy) = &self.policy {
             let changed_in_place =
                 !matches!(p.kind, Kind::Open | Kind::Truncate) || p.at.state(&p.path) != p.before;
@@ -1139,7 +1238,9 @@ impl Capture {
             }
         }
         for seq in p.seqs {
-            if let Err(e) = self.journal.outcome(seq, applied) {
+            if let Some(applied) = outcome
+                && let Err(e) = self.journal.outcome(seq, applied)
+            {
                 self.journal.error(&e);
             }
         }
