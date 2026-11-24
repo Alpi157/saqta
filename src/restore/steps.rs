@@ -105,7 +105,7 @@ impl Undo {
             self.recovery.effect, self.recovery.cursor
         ));
         let mut progress: (String, Option<State>) = if marker.exists() {
-            serde_json::from_slice(&fs::read(&marker)?).map_err(io::Error::other)?
+            journal::read_json(&marker)?
         } else {
             let temp =
                 to.with_file_name(format!(".saqta-restore-{}-{}", sys::pid(), journal::now()));

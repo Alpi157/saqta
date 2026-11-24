@@ -143,7 +143,7 @@ fn candidates(home: &Path) -> Result<Vec<Candidate>> {
             continue;
         }
         if let Ok(bytes) = fs::read(folder.join("meta")) {
-            let meta: Meta = serde_json::from_slice(&bytes)?;
+            let meta: Meta = journal::parse_json(&folder.join("meta"), &bytes)?;
             if meta.id != id {
                 bail!("command id disagrees with folder");
             }
@@ -164,11 +164,7 @@ fn qpath(home: &Path, id: u64) -> PathBuf {
     home.join("q/main").join(id.to_string())
 }
 pub fn expired(folder: &Path) -> Result<BTreeSet<String>> {
-    match fs::read(folder.join("expired.json")) {
-        Ok(b) => Ok(serde_json::from_slice(&b)?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-        Err(e) => Err(e.into()),
-    }
+    Ok(journal::read_json_optional(&folder.join("expired.json"))?.unwrap_or_default())
 }
 fn collect_content(home: &Path, c: &Candidate, dry: bool) -> Result<Collection> {
     let effects = journal::read_effects(&c.folder)?;
@@ -489,7 +485,7 @@ pub fn maybe_gc() {
     };
     let last = fs::read(home.join("gc-attempt"))
         .ok()
-        .and_then(|b| serde_json::from_slice::<u64>(&b).ok())
+        .and_then(|b| journal::parse_json::<u64>(&home.join("gc-attempt"), &b).ok())
         .unwrap_or(0);
     if journal::now().saturating_sub(last) < DAY {
         return;
@@ -502,7 +498,7 @@ pub fn maybe_gc() {
     }
     let last = fs::read(home.join("gc-attempt"))
         .ok()
-        .and_then(|b| serde_json::from_slice::<u64>(&b).ok())
+        .and_then(|b| journal::parse_json::<u64>(&home.join("gc-attempt"), &b).ok())
         .unwrap_or(0);
     if journal::now().saturating_sub(last) < DAY {
         return;
@@ -522,9 +518,7 @@ pub fn maybe_gc() {
     }
 }
 pub fn status(home: &Path) -> Result<()> {
-    let last = fs::read(home.join("last-gc"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<u64>(&b).ok())
+    let last = journal::read_json_optional::<u64>(&home.join("last-gc"))?
         .map(sys::local_time)
         .transpose()?
         .unwrap_or_else(|| "never".into());
@@ -532,9 +526,7 @@ pub fn status(home: &Path) -> Result<()> {
         println!("open hold: {id} (saqta show {id})");
     }
     println!("store size: {} bytes; last gc: {last}", store_size(home)?);
-    if let Ok(bytes) = fs::read(home.join("last-gc-error"))
-        && let Ok(error) = serde_json::from_slice::<String>(&bytes)
-    {
+    if let Some(error) = journal::read_json_optional::<String>(&home.join("last-gc-error"))? {
         println!("last gc kept retained versions: {error}");
     }
     Ok(())

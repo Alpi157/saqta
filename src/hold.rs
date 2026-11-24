@@ -43,7 +43,7 @@ pub(crate) fn directory(home: &Path, id: u64) -> PathBuf {
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    Ok(journal::read_json(path)?)
 }
 
 pub fn pending(home: &Path, id: u64) -> bool {

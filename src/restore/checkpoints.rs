@@ -9,8 +9,7 @@ pub(super) struct Checkpoints {
 }
 
 pub(super) fn load(folder: &Path) -> io::Result<Recovery> {
-    let mut recovery =
-        serde_json::from_slice(&fs::read(folder.join("state.json"))?).map_err(io::Error::other)?;
+    let mut recovery = journal::read_json(&folder.join("state.json"))?;
     let bytes = match fs::read(folder.join("state.log")) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(recovery),
@@ -20,7 +19,7 @@ pub(super) fn load(folder: &Path) -> io::Result<Recovery> {
     // on open; malformed complete frames are damage and must refuse recovery.
     if let Some(end) = bytes.iter().rposition(|&b| b == b'\n') {
         for line in bytes[..end].split(|&b| b == b'\n') {
-            recovery = serde_json::from_slice(line).map_err(io::Error::other)?;
+            recovery = journal::parse_json(&folder.join("state.log"), line)?;
         }
     }
     Ok(recovery)

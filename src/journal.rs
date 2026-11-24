@@ -2,7 +2,7 @@
 use crate::{paths, sys};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsString,
@@ -65,6 +65,25 @@ pub fn path(text: &str) -> io::Result<PathBuf> {
 }
 pub fn display(p: &Path) -> String {
     encode(p.as_os_str().as_bytes())
+}
+pub fn parse_json<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> io::Result<T> {
+    serde_json::from_slice(bytes)
+        .map_err(|error| io::Error::other(format!("{}: {error}", display(path))))
+}
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
+    let bytes = fs::read(path)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", display(path))))?;
+    parse_json(path, &bytes)
+}
+pub fn read_json_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+    match fs::read(path) {
+        Ok(bytes) => parse_json(path, &bytes).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("{}: {error}", display(path)),
+        )),
+    }
 }
 pub fn private_dir(p: &Path) -> io::Result<()> {
     fs::DirBuilder::new().recursive(true).mode(0o700).create(p)
@@ -207,7 +226,7 @@ impl Effect {
             )
         ))
     }
-    fn parse(line: &str) -> Result<Self> {
+    fn parse(line: &str, source: &Path) -> Result<Self> {
         let f: Vec<_> = line.split('\t').collect();
         if f.len() != 9 {
             bail!("invalid effect line");
@@ -221,7 +240,7 @@ impl Effect {
             path2: f[5].into(),
             quarantine: f[6].into(),
             flags: f[7].parse()?,
-            note: serde_json::from_slice(&decode(f[8])?)?,
+            note: parse_json(source, &decode(f[8])?)?,
         })
     }
 }
@@ -371,8 +390,7 @@ impl Journal {
     }
     pub fn reopen(home: PathBuf, id: u64) -> io::Result<Self> {
         let folder = home.join("cmd").join(id.to_string());
-        let meta =
-            serde_json::from_slice(&fs::read(folder.join("meta"))?).map_err(io::Error::other)?;
+        let meta = read_json(&folder.join("meta"))?;
         let effects = read_effects(&folder).map_err(io::Error::other)?;
         let mut touched = HashSet::new();
         for e in &effects {
@@ -529,11 +547,7 @@ impl Journal {
     }
 }
 fn read_positive_outcomes(folder: &Path) -> io::Result<Vec<u64>> {
-    match fs::read(folder.join("outcomes-positive.json")) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e),
-    }
+    Ok(read_json_optional(&folder.join("outcomes-positive.json"))?.unwrap_or_default())
 }
 fn write_once(file: &File, bytes: &[u8]) -> io::Result<()> {
     loop {
@@ -595,17 +609,22 @@ pub fn read_effects(folder: &Path) -> Result<Vec<Effect>> {
     // dead-command recovery marker permits reading its acknowledged prefix.
     if !text.is_empty() && !text.ends_with('\n') {
         if let Ok(bytes) = fs::read(folder.join("tail-recovery.json")) {
-            let recovery: TailRecovery = serde_json::from_slice(&bytes)?;
+            let recovery: TailRecovery = parse_json(&folder.join("tail-recovery.json"), &bytes)?;
             if text.as_bytes().get(recovery.cut..) == Some(recovery.tail.as_slice())
                 && let Some(prefix) = text.get(..recovery.cut)
                 && (prefix.is_empty() || prefix.ends_with('\n'))
             {
-                return prefix.lines().map(Effect::parse).collect();
+                return prefix
+                    .lines()
+                    .map(|line| Effect::parse(line, &folder.join("effects.log")))
+                    .collect();
             }
         }
         bail!("partial effects.log in {}", folder.display());
     }
-    text.lines().map(Effect::parse).collect()
+    text.lines()
+        .map(|line| Effect::parse(line, &folder.join("effects.log")))
+        .collect()
 }
 #[derive(Serialize, Deserialize)]
 struct TailRecovery {
@@ -621,7 +640,7 @@ fn recover_unacknowledged_tail(folder: &Path) -> Result<Vec<Effect>> {
     let cut = text.rfind('\n').map_or(0, |i| i + 1);
     let effects = text[..cut]
         .lines()
-        .map(Effect::parse)
+        .map(|line| Effect::parse(line, &folder.join("effects.log")))
         .collect::<Result<Vec<_>>>()?;
     if effects.iter().any(|e| process_live(e.pid as i32)) {
         bail!("partial effects.log still has live command processes");
@@ -639,12 +658,9 @@ fn recover_unacknowledged_tail(folder: &Path) -> Result<Vec<Effect>> {
 }
 pub fn load(home: &Path, id: u64) -> Result<Record> {
     let folder = home.join("cmd").join(id.to_string());
-    let mut meta: Meta =
-        serde_json::from_slice(&fs::read(folder.join("meta")).context("command not found")?)?;
-    match fs::read(folder.join("child")) {
-        Ok(bytes) => meta.child = serde_json::from_slice(&bytes)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+    let mut meta: Meta = read_json(&folder.join("meta")).context("command not found")?;
+    if let Some(child) = read_json_optional(&folder.join("child"))? {
+        meta.child = child;
     }
     let mut effects = match read_effects(&folder) {
         Ok(effects) => effects,
@@ -666,11 +682,7 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
             e.note.message = "expired (collected by gc)".into();
         }
     }
-    let end = match fs::read(folder.join("end")) {
-        Ok(b) => Some(serde_json::from_slice::<End>(&b)?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
+    let end: Option<End> = read_json_optional(&folder.join("end"))?;
     let active = running(home, &meta);
     let status = if end.is_some() {
         "finished"
@@ -717,24 +729,21 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         rules_error: fs::read_to_string(folder.join("rules-error")).ok(),
         effects,
         warning: fs::read_to_string(folder.join("error")).ok(),
-        recovery_note: fs::read(folder.join("tail-recovery.json"))
-            .ok()
-            .map(|b| serde_json::from_slice::<TailRecovery>(&b))
-            .transpose()?
+        recovery_note: read_json_optional::<TailRecovery>(&folder.join("tail-recovery.json"))?
             .map(|r| r.note),
         outcomes,
     })
 }
 pub fn post_states(folder: &Path) -> Result<BTreeMap<String, Option<State>>> {
     let mut states = BTreeMap::new();
-    if let Ok(bytes) = fs::read(folder.join("recovered-post.json")) {
-        for p in serde_json::from_slice::<Vec<Post>>(&bytes)? {
+    if let Some(posts) = read_json_optional::<Vec<Post>>(&folder.join("recovered-post.json"))? {
+        for p in posts {
             states.insert(p.path, p.state);
         }
     }
     if let Ok(text) = fs::read_to_string(folder.join("post.log")) {
         for line in text.lines() {
-            let p: Post = serde_json::from_str(line)?;
+            let p: Post = parse_json(&folder.join("post.log"), line.as_bytes())?;
             states.insert(p.path, p.state);
         }
     }
@@ -862,7 +871,7 @@ pub fn import(home: &Path) -> Result<Vec<serde_json::Value>> {
             )
             .optional()?;
         if let Some((previous, bytes)) = cached {
-            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let value: serde_json::Value = parse_json(&home.join("journal.db"), &bytes)?;
             if stamp == previous && value["status"] != "running" {
                 values.push(value);
                 continue;
