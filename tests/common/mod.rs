@@ -489,6 +489,62 @@ pub fn last_id(s: &Sandbox) -> u64 {
 pub fn undo(s: &Sandbox, id: u64) -> Output {
     run(s.saqta(&["undo", &id.to_string()]))
 }
+pub fn assert_recovery_data_only(s: &Sandbox) {
+    let home = PathBuf::from(&s.env[OsStr::new("SAQTA_HOME")]);
+    fn check(name: &str, home: &Path) {
+        let mut bytes = Vec::new();
+        let mut input = name.as_bytes().iter().copied();
+        while let Some(byte) = input.next() {
+            if byte == b'%' {
+                let hex = [input.next().unwrap(), input.next().unwrap()];
+                bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).unwrap(), 16).unwrap());
+            } else {
+                bytes.push(byte);
+            }
+        }
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(OsString::from_vec(bytes));
+        if !path.starts_with(home) {
+            return;
+        }
+        let tail = path
+            .strip_prefix(home.join("q/main"))
+            .expect("repair entered bookkeeping outside quarantine");
+        let mut parts = tail.components();
+        assert!(
+            parts
+                .next()
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .starts_with(b"undo-")
+        );
+        let data = parts.next().expect("repair targeted the undo directory");
+        let name = data.as_os_str().as_bytes();
+        let number = name.strip_prefix(b"inode-").unwrap_or(name);
+        assert!(
+            !number.is_empty() && number.iter().all(u8::is_ascii_digit),
+            "control file selected: {}",
+            path.display()
+        );
+    }
+    if let Ok(bytes) = fs::read(home.join("undo-aliases.json")) {
+        let map: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        for name in map.keys() {
+            check(name, &home);
+        }
+    }
+    if let Ok(entries) = fs::read_dir(home.join("q/main")) {
+        for entry in entries {
+            let log = entry.unwrap().path().join("recovery.log");
+            if let Ok(text) = fs::read_to_string(log) {
+                for line in text.lines() {
+                    check(line.split('\t').nth(1).unwrap(), &home);
+                }
+            }
+        }
+    }
+}
 pub fn shown(s: &Sandbox, id: u64) -> serde_json::Value {
     let o = run(s.saqta(&["show", &id.to_string(), "--json"]));
     assert_success(&o);

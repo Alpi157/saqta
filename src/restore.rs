@@ -28,6 +28,21 @@ use std::{
 fn cstr(p: &OsStr) -> io::Result<CString> {
     CString::new(p.as_bytes()).map_err(io::Error::other)
 }
+fn data_handle_path(home: &Path, path: &Path) -> bool {
+    let Ok(tail) = path.strip_prefix(home) else {
+        return false;
+    };
+    let parts: Vec<_> = tail.iter().map(OsStr::as_bytes).collect();
+    let digits = |value: &[u8]| !value.is_empty() && value.iter().all(u8::is_ascii_digit);
+    let slot = match parts.as_slice() {
+        [b"q", b"main", undo, slot, ..] if undo.starts_with(b"undo-") => *slot,
+        [b"holds", id, b"restore", slot, ..] if digits(id) => *slot,
+        [b"holds", id, b"release", b"recovery", slot, ..] if digits(id) => *slot,
+        _ => return false,
+    };
+    digits(slot.strip_prefix(b"inode-").unwrap_or(slot))
+}
+
 struct Parent {
     fd: Rc<OwnedFd>,
     name: CString,
@@ -75,8 +90,11 @@ struct Recovery {
     cursor: usize,
     before: Option<State>,
     steps: u64,
+    data_handles: BTreeMap<String, State>,
 }
 struct Undo {
+    home: PathBuf,
+    data_handles: BTreeMap<String, State>,
     root: OwnedFd,
     qfd: Rc<OwnedFd>,
     backup_fd: Rc<OwnedFd>,
@@ -134,9 +152,7 @@ impl Undo {
                 || parent.as_os_str() == self.backup_path.as_os_str()
         }) {
             let at = self.parent(p)?;
-            return Ok(sys::stat_at(at.fd.as_raw_fd(), &at.name)?
-                .as_ref()
-                .map(State::from_stat));
+            return journal::state_at(at.fd.as_raw_fd(), &at.name);
         }
         current_secure(self.root.as_raw_fd(), p)
     }
@@ -156,6 +172,7 @@ impl Undo {
         });
     }
     fn save_current(&mut self, p: &Path) -> io::Result<Option<(PathBuf, State)>> {
+        self.repair_target(p)?;
         let at = match self.parent(p) {
             Ok(at) => at,
             Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
@@ -167,7 +184,7 @@ impl Undo {
             return Ok(None);
         };
         let shared = raw.st_nlink > 1;
-        let st = State::from_stat(&raw);
+        let st = State::at(at.fd.as_raw_fd(), &at.name, &raw);
         self.recovery.serial += 1;
         let saved = self.backup_path.join(self.recovery.serial.to_string());
         writeln!(
@@ -191,6 +208,7 @@ impl Undo {
         } else {
             saved.clone()
         };
+        self.retain_data_handles(p, &retained)?;
         if self.recovery.git_indexes.remove(&journal::display(p)) {
             self.output.line(format_args!(
                 "kept the newer git index in {} (git rewrites it on commands like git status)",
@@ -198,6 +216,46 @@ impl Undo {
             ));
         }
         Ok(Some((retained, st)))
+    }
+    fn retain_data_handles(&mut self, source: &Path, retained: &Path) -> io::Result<()> {
+        let Some(state) = self.state(source)? else {
+            return Ok(());
+        };
+        if state.mode & libc::S_IFMT == libc::S_IFREG && state.incarnation.available() {
+            self.recovery
+                .data_handles
+                .insert(journal::display(retained), state);
+        } else if state.directory() {
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                self.retain_data_handles(&entry.path(), &retained.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+    fn verified_handle(&self, name: &str, current: &State) -> bool {
+        journal::path(name).is_ok_and(|path| data_handle_path(&self.home, &path))
+            && self
+                .recovery
+                .data_handles
+                .get(name)
+                .or_else(|| self.data_handles.get(name))
+                .is_some_and(|recorded| current.same_inode(recorded))
+    }
+    fn repair_target(&self, path: &Path) -> io::Result<()> {
+        if path.starts_with(&self.home) {
+            let name = journal::display(path);
+            if !self
+                .state(path)?
+                .is_some_and(|current| self.verified_handle(&name, &current))
+            {
+                return Err(io::Error::other(format!(
+                    "paths changed: unverified recovery data handle {}; kept both versions",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
     }
     fn keep_move_input(&mut self, p: &Path) -> io::Result<()> {
         if self.recovery.conflicts.remove(&journal::display(p))
@@ -298,10 +356,12 @@ impl Undo {
     }
     fn alias_paths(&self, p: &Path, before: &State) -> io::Result<BTreeSet<PathBuf>> {
         let mut aliases = BTreeSet::from([p.to_owned()]);
-        let mut live_original = false;
         for name in self.aliases.iter().chain(self.recovery.origins.keys()) {
             let candidate = journal::path(name)?;
             if let Ok(Some(current)) = self.state(&candidate) {
+                if candidate.starts_with(&self.home) && !self.verified_handle(name, &current) {
+                    continue;
+                }
                 let restored = self
                     .recovery
                     .origins
@@ -309,27 +369,32 @@ impl Undo {
                     .is_some_and(|(origin, actual)| {
                         origin.same_inode(before) && current.same_inode(actual)
                     });
-                live_original |= current.same_inode(before);
+                if candidate != p
+                    && !restored
+                    && current.dev == before.dev
+                    && current.ino == before.ino
+                    && !current.same_inode(before)
+                {
+                    return Err(io::Error::other(format!(
+                        "paths changed: cannot verify alias {name}; kept both versions"
+                    )));
+                }
                 if current.same_inode(before) || restored {
                     aliases.insert(candidate);
                 }
             }
         }
-        if !live_original {
-            let mut dirs = vec![self.backup_path.clone()];
-            while let Some(dir) = dirs.pop() {
-                for entry in fs::read_dir(dir)? {
-                    let entry = entry?;
-                    let st = fs::symlink_metadata(entry.path())?;
-                    if st.is_dir() {
-                        dirs.push(entry.path());
-                    } else if st.is_file()
-                        && self
-                            .state(&entry.path())?
-                            .is_some_and(|s| s.same_inode(before))
-                    {
-                        aliases.insert(entry.path());
-                    }
+        for (name, retained) in &self.recovery.data_handles {
+            if retained.same_inode(before) {
+                let path = journal::path(name)?;
+                if !data_handle_path(&self.home, &path) {
+                    continue;
+                }
+                if self
+                    .state(&path)?
+                    .is_some_and(|current| current.same_inode(retained))
+                {
+                    aliases.insert(path);
                 }
             }
         }
@@ -383,8 +448,10 @@ impl Undo {
         Ok(())
     }
     fn plan_repair(&mut self, e: &Effect, p: &Path, source: &Path) -> io::Result<()> {
+        self.repair_target(p)?;
         if let Some((live, st)) = self.save_current(p)?
             && st.mode & libc::S_IFMT == libc::S_IFREG
+            && st.incarnation.available()
         {
             // Keep the inode even when its other alias is temporarily absent. Older
             // effects still identify it when reversing a later deletion or growth.
@@ -581,34 +648,45 @@ impl Undo {
         restored: BTreeMap<String, State>,
         mut alias_posts: BTreeMap<String, (State, State)>,
     ) -> io::Result<()> {
+        alias_posts
+            .retain(|name, _| journal::path(name).is_ok_and(|path| !path.starts_with(&self.home)));
         for (name, (origin, repaired)) in &self.recovery.repaired_aliases {
-            if let Some(actual) = self.state(&journal::path(name)?)?
+            let path = journal::path(name)?;
+            if !path.starts_with(home)
+                && let Some(actual) = self.state(&path)?
                 && actual.same_inode(repaired)
             {
                 alias_posts.insert(name.clone(), (origin.clone(), actual));
             }
         }
         for (name, origin) in restored {
-            if origin.mode & libc::S_IFMT == libc::S_IFREG
+            if !journal::path(&name)?.starts_with(home)
+                && origin.mode & libc::S_IFMT == libc::S_IFREG
                 && let Some(actual) = self.state(&journal::path(&name)?)?
             {
                 alias_posts.insert(name, (origin, actual));
             }
         }
-        let mut dirs = vec![self.backup_path.clone()];
-        while let Some(dir) = dirs.pop() {
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let st = fs::symlink_metadata(entry.path())?;
-                if st.is_dir() {
-                    dirs.push(entry.path());
-                } else if st.is_file()
-                    && let Some(actual) = self.state(&entry.path())?
-                {
-                    alias_posts.insert(journal::display(&entry.path()), (actual.clone(), actual));
-                }
+        let mut handles = self.data_handles.clone();
+        handles.extend(self.recovery.data_handles.clone());
+        let mut verified = BTreeMap::new();
+        for (name, retained) in handles {
+            let path = journal::path(&name)?;
+            if data_handle_path(home, &path)
+                && let Some(actual) = self.state(&path)?
+                && actual.same_inode(&retained)
+            {
+                verified.insert(name.clone(), actual.clone());
+                let origin = self
+                    .recovery
+                    .origins
+                    .get(&name)
+                    .or_else(|| alias_posts.get(&name))
+                    .map_or_else(|| actual.clone(), |(origin, _)| origin.clone());
+                alias_posts.insert(name, (origin, actual));
             }
         }
+        journal::synced_json_write(&home.join("undo-data-handles.json"), &verified)?;
         journal::synced_json_write(&home.join("undo-aliases.json"), &alias_posts)?;
         Ok(())
     }
@@ -669,15 +747,17 @@ pub(crate) fn current_secure(root: i32, p: &Path) -> io::Result<Option<State>> {
     let name = p
         .file_name()
         .ok_or_else(|| io::Error::other("cannot inspect root"))?;
-    Ok(sys::stat_at(fd.as_raw_fd(), &cstr(name)?)?
-        .as_ref()
-        .map(State::from_stat))
+    journal::state_at(fd.as_raw_fd(), &cstr(name)?)
 }
 fn same_post(a: Option<&State>, b: Option<&State>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => {
-            a.mode == b.mode && a.size == b.size && a.mtime == b.mtime && a.mtime_ns == b.mtime_ns
+            (a.dev != b.dev || a.ino != b.ino || !a.incarnation.available() || a.same_inode(b))
+                && a.mode == b.mode
+                && a.size == b.size
+                && a.mtime == b.mtime
+                && a.mtime_ns == b.mtime_ns
         }
         _ => false,
     }
@@ -1258,15 +1338,75 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
         .collect();
     let alias_posts: BTreeMap<String, (State, State)> =
         journal::read_json_optional(&home.join("undo-aliases.json"))?.unwrap_or_default();
+    let mut data_handles: BTreeMap<String, State> =
+        journal::read_json_optional(&home.join("undo-data-handles.json"))?.unwrap_or_default();
+    data_handles.retain(|name, state| {
+        state.incarnation.available()
+            && journal::path(name).is_ok_and(|path| data_handle_path(home, &path))
+    });
+    let relevant_origin = |origin: &State| {
+        r.effects
+            .iter()
+            .filter(|effect| matches!(effect.op.as_str(), "modify" | "size"))
+            .filter_map(|effect| effect.note.before.as_ref())
+            .any(|before| {
+                before.dev == origin.dev
+                    && before.ino == origin.ino
+                    && (!before.incarnation.available()
+                        || !origin.incarnation.available()
+                        || before.same_inode(origin))
+            })
+    };
     let recovery = if resuming {
         checkpoints::load(&backup_path)?
     } else {
+        let named: BTreeSet<_> = r
+            .effects
+            .iter()
+            .flat_map(|effect| [&effect.path, &effect.path2])
+            .filter(|name| !name.is_empty())
+            .collect();
+        for (name, (origin, actual)) in &alias_posts {
+            let path = journal::path(name)?;
+            if !relevant_origin(origin)
+                || named
+                    .iter()
+                    .any(|name| journal::path(name).is_ok_and(|named| path.starts_with(named)))
+                || (path.starts_with(home)
+                    && !data_handles
+                        .get(name)
+                        .is_some_and(|handle| handle.same_inode(actual)))
+            {
+                continue;
+            }
+            if let Some(current) = current_secure(root.as_raw_fd(), &path)?
+                && (!origin.incarnation.available()
+                    || !current.same_inode(actual)
+                    || r.effects
+                        .iter()
+                        .filter_map(|effect| effect.note.before.as_ref())
+                        .any(|before| {
+                            before.dev == origin.dev
+                                && before.ino == origin.ino
+                                && !before.incarnation.available()
+                        }))
+            {
+                bail!("paths changed: cannot verify alias {name}; kept both versions");
+            }
+        }
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700).recursive(automatic && resume);
         builder.create(&backup_path)?;
         let mut origins = BTreeMap::new();
         for (name, (origin, actual)) in &alias_posts {
-            if alias_keys.contains(&(origin.dev, origin.ino))
+            let path = journal::path(name)?;
+            if (!path.starts_with(home)
+                || data_handles
+                    .get(name)
+                    .is_some_and(|handle| handle.same_inode(actual)))
+                && origin.incarnation.available()
+                && actual.incarnation.available()
+                && relevant_origin(origin)
                 && current_secure(root.as_raw_fd(), &journal::path(name)?)
                     .ok()
                     .flatten()
@@ -1292,6 +1432,8 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
         .mode(0o600)
         .open(backup_path.join("recovery.log"))?;
     let mut undo = Undo {
+        home: home.to_owned(),
+        data_handles,
         root,
         qfd: Rc::new(q),
         backup_fd: Rc::new(sys::open_at(
@@ -1339,6 +1481,13 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
         journal::synced_json_write(&observed_before, &observations)?;
         observations
     };
+    let alias_before = backup_path.join("alias-observations.json");
+    let alias_posts = if alias_before.exists() {
+        journal::read_json(&alias_before)?
+    } else {
+        journal::synced_json_write(&alias_before, &alias_posts)?;
+        alias_posts
+    };
     if let Some(note) = &r.recovery_note {
         undo.output.line(format_args!("{note}"));
     }
@@ -1348,6 +1497,10 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
     let result = restore_effects(&mut undo, &r, verbose, &mut summary).and_then(|()| {
         let restored = restored_origins(&r)?;
         undo.save_directory_observations(home, &r, &restored, observations)?;
+        let mut alias_posts = alias_posts;
+        for effect in applied_effects(&r).rev() {
+            reverse_repair_names(&mut alias_posts, effect)?;
+        }
         undo.save_alias_observations(home, restored, alias_posts)?;
         if let Some(path) = seal {
             crate::hold::seal_posts(undo.root.as_raw_fd(), &r.effects, path)?;
@@ -1376,6 +1529,41 @@ pub fn apply(r: journal::Record, options: Apply<'_>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_roles_exclude_bookkeeping_in_undo_hold_and_release_folders() {
+        let home = Path::new("/private/saqta");
+        for folder in [
+            "q/main/undo-1-2",
+            "holds/1/restore",
+            "holds/1/release/recovery",
+        ] {
+            for data in ["1", "inode-2", "inode-3/subdir/state.log"] {
+                assert!(data_handle_path(home, &home.join(folder).join(data)));
+            }
+            for control in [
+                "state.log",
+                "state.json",
+                "recovery.log",
+                "directory-observations.json",
+                "alias-observations.json",
+                "copy-1-1.json",
+                "size-1",
+                "unknown-bookkeeping",
+            ] {
+                assert!(!data_handle_path(home, &home.join(folder).join(control)));
+            }
+        }
+        for source in [
+            "holds/1/agent/1",
+            "cmd/1/1",
+            "q/main/1/1",
+            "logs/1",
+            "undo-data-handles.json",
+        ] {
+            assert!(!data_handle_path(home, &home.join(source)));
+        }
+    }
 
     #[test]
     fn summary_examples_prefer_source_paths() {

@@ -7,6 +7,66 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Incarnation {
+    pub birth: Option<(i64, u32)>,
+    pub generation: Option<u32>,
+}
+impl Incarnation {
+    pub fn available(&self) -> bool {
+        self.birth.is_some() || self.generation.is_some()
+    }
+}
+
+/// Read immutable identity fields from a pinned, non-followed inode.
+pub fn incarnation_at(base: i32, name: &CStr, expected: &libc::stat) -> Incarnation {
+    let regular = expected.st_mode & libc::S_IFMT == libc::S_IFREG;
+    let directory = expected.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    let fd = open_at(
+        base,
+        name,
+        (if regular || directory {
+            libc::O_RDONLY | libc::O_NONBLOCK
+        } else {
+            libc::O_PATH
+        }) | libc::O_NOFOLLOW,
+        0,
+    )
+    .or_else(|_| open_at(base, name, libc::O_PATH | libc::O_NOFOLLOW, 0));
+    let Ok(fd) = fd else {
+        return Incarnation::default();
+    };
+    if !stat_fd(fd.as_raw_fd())
+        .is_ok_and(|st| st.st_dev == expected.st_dev && st.st_ino == expected.st_ino)
+    {
+        return Incarnation::default();
+    }
+    // SAFETY: statx is plain output storage initialized by the kernel.
+    let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is owned, the empty name is terminated, and sx is writable.
+    let result = unsafe {
+        libc::statx(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BTIME,
+            &mut sx,
+        )
+    };
+    let birth = (result == 0 && sx.stx_mask & libc::STATX_BTIME != 0)
+        .then_some((sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec));
+    // Linux fs.h encodes GETVERSION with sizeof(long), but returns an int.
+    const FS_IOC_GETVERSION: libc::c_ulong = 0x80087601;
+    let mut generation: libc::c_int = 0;
+    // SAFETY: the ioctl writes one int to live output storage; fd is owned.
+    let supported = (regular || directory)
+        && unsafe { libc::ioctl(fd.as_raw_fd(), FS_IOC_GETVERSION, &mut generation) } == 0;
+    Incarnation {
+        birth,
+        generation: supported.then_some(generation as u32),
+    }
+}
+
 pub fn open_at(base: i32, name: &CStr, flags: i32, mode: u32) -> io::Result<OwnedFd> {
     // SAFETY: name is terminated; the kernel validates base and flags.
     let fd = cv(unsafe { libc::openat(base, name.as_ptr(), flags | libc::O_CLOEXEC, mode) })?;

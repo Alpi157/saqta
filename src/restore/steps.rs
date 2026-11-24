@@ -218,9 +218,7 @@ impl Undo {
         let to = journal::path(&to)?;
         let a = self.parent(&from)?;
         let b = self.parent(&to)?;
-        let source = sys::stat_at(a.fd.as_raw_fd(), &a.name)?
-            .as_ref()
-            .map(State::from_stat);
+        let source = journal::state_at(a.fd.as_raw_fd(), &a.name)?;
         if self.recovery.before.is_none() {
             self.recovery.before = source.clone();
             if self.recovery.before.is_none() {
@@ -253,13 +251,28 @@ impl Undo {
                 }
                 Err(e) => return Err(e),
             }
-        } else if !sys::stat_at(b.fd.as_raw_fd(), &b.name)?
-            .as_ref()
-            .is_some_and(|s| State::from_stat(s).same_inode(&expected))
+        } else if !journal::state_at(b.fd.as_raw_fd(), &b.name)?
+            .is_some_and(|s| s.same_inode(&expected))
         {
             self.copy_atomic(&from, &to)?;
         }
-
+        let name = journal::display(&to);
+        if self
+            .recovery
+            .data_handles
+            .get(&name)
+            .is_some_and(|retained| retained.same_inode(&expected))
+            && let Some(actual) = self.state(&to)?
+            && actual.incarnation.available()
+            && !actual.same_inode(&expected)
+        {
+            // A replayable cross-filesystem copy has a new incarnation. Its
+            // publication marker proves this is our retained data, not reuse.
+            self.recovery
+                .data_handles
+                .insert(name.clone(), actual.clone());
+            self.recovery.origins.insert(name, (expected, actual));
+        }
         Ok(())
     }
 
@@ -282,6 +295,7 @@ impl Undo {
 
     fn execute_write(&mut self, from: String, to: String, before: State) -> io::Result<()> {
         let to = journal::path(&to)?;
+        self.repair_target(&to)?;
         let at = self.parent(&to)?;
         let fd = sys::open_at(
             at.fd.as_raw_fd(),

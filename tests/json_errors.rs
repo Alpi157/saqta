@@ -44,6 +44,7 @@ fn inspection_and_undo_json_errors_identify_the_source_file() {
         (&["undo", "1"], "cmd/1/recovered-post.json"),
         (&["undo", "1"], "undo-posts.json"),
         (&["undo", "1"], "undo-aliases.json"),
+        (&["undo", "1"], "undo-data-handles.json"),
         (&["status"], "codex-installs.json"),
         (&["status"], "last-gc"),
         (&["status"], "last-gc-error"),
@@ -73,6 +74,7 @@ fn resume_json_errors_identify_state_json_and_state_log() {
         "state.json",
         "state.log",
         "directory-observations.json",
+        "alias-observations.json",
         "copy-1-1.json",
     ] {
         let s = fixture();
