@@ -7,14 +7,27 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Incarnation {
     pub birth: Option<(i64, u32)>,
     pub generation: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unverified: bool,
 }
 impl Incarnation {
     pub fn available(&self) -> bool {
-        self.birth.is_some() || self.generation.is_some()
+        !self.unverified && (self.birth.is_some() || self.generation.is_some())
+    }
+    pub fn captured(base: i32, name: &CStr, stat: &libc::stat, birth: Option<(i64, u32)>) -> Self {
+        let generation = generation_at(base, name, stat);
+        Self {
+            birth,
+            generation,
+            // An unpinned name cannot be completed later. Do not turn a failed
+            // generation lookup into a birth-time-only alias identity.
+            unverified: generation.is_none()
+                && matches!(stat.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR),
+        }
     }
 }
 
@@ -55,15 +68,12 @@ pub fn incarnation_at(base: i32, name: &CStr, expected: &libc::stat) -> Incarnat
     };
     let birth = (result == 0 && sx.stx_mask & libc::STATX_BTIME != 0)
         .then_some((sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec));
-    // Linux fs.h encodes GETVERSION with sizeof(long), but returns an int.
-    const FS_IOC_GETVERSION: libc::c_ulong = 0x80087601;
-    let mut generation: libc::c_int = 0;
-    // SAFETY: the ioctl writes one int to live output storage; fd is owned.
-    let supported = (regular || directory)
-        && unsafe { libc::ioctl(fd.as_raw_fd(), FS_IOC_GETVERSION, &mut generation) } == 0;
     Incarnation {
         birth,
-        generation: supported.then_some(generation as u32),
+        generation: (regular || directory)
+            .then(|| generation_fd(fd.as_raw_fd()))
+            .flatten(),
+        unverified: false,
     }
 }
 
@@ -95,21 +105,69 @@ pub fn stat_fd(fd: i32) -> io::Result<libc::stat> {
     cv(unsafe { libc::fstat(fd, &mut st) })?;
     Ok(st)
 }
-pub fn stat_mount_at(base: i32, name: &CStr) -> io::Result<(Option<libc::stat>, Option<u64>)> {
+pub type CaptureStat = (Option<libc::stat>, Option<u64>, Option<(i64, u32)>);
+
+pub fn stat_capture_at(base: i32, name: &CStr) -> io::Result<CaptureStat> {
     stat_with_mount(base, name, 0)
 }
+pub fn generation_fd(fd: i32) -> Option<u32> {
+    // Linux fs.h encodes GETVERSION with sizeof(long), but returns an int.
+    const FS_IOC_GETVERSION: libc::c_ulong = 0x80087601;
+    let mut generation: libc::c_int = 0;
+    // SAFETY: the ioctl writes one int to live output storage; the caller keeps fd live.
+    (unsafe { libc::ioctl(fd, FS_IOC_GETVERSION, &mut generation) } == 0)
+        .then_some(generation as u32)
+}
+pub fn generation_at(base: i32, name: &CStr, expected: &libc::stat) -> Option<u32> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SAQTA_TEST_NO_FILE_HANDLES").is_some_and(|value| value == "1") {
+        return None;
+    }
+    if !matches!(
+        expected.st_mode & libc::S_IFMT,
+        libc::S_IFREG | libc::S_IFDIR
+    ) {
+        return None;
+    }
+    #[repr(C)]
+    struct Handle {
+        bytes: u32,
+        kind: i32,
+        words: [u32; 2],
+    }
+    let mut handle = Handle {
+        bytes: 8,
+        kind: 0,
+        words: [0; 2],
+    };
+    let mut mount = 0i32;
+    // SAFETY: Handle has the file_handle header followed by eight writable bytes;
+    // name is terminated, mount is writable, and the kernel validates base.
+    let result = unsafe {
+        libc::name_to_handle_at(
+            base,
+            name.as_ptr(),
+            (&mut handle as *mut Handle).cast(),
+            &mut mount,
+            0,
+        )
+    };
+    // FILEID_INO32_GEN is the kernel's generic (inode, generation) format.
+    // Reject private formats, oversized handles, and a raced inode lookup.
+    (result == 0
+        && handle.kind == 1
+        && handle.bytes == 8
+        && u64::from(handle.words[0]) == expected.st_ino)
+        .then_some(handle.words[1])
+}
 pub fn stat_mount_fd(fd: i32) -> io::Result<(libc::stat, Option<u64>)> {
-    let (stat, mount) = stat_with_mount(fd, c"", libc::AT_EMPTY_PATH)?;
+    let (stat, mount, _) = stat_with_mount(fd, c"", libc::AT_EMPTY_PATH)?;
     Ok((
         stat.ok_or_else(|| io::Error::other("missing pinned directory"))?,
         mount,
     ))
 }
-fn stat_with_mount(
-    base: i32,
-    name: &CStr,
-    flags: i32,
-) -> io::Result<(Option<libc::stat>, Option<u64>)> {
+fn stat_with_mount(base: i32, name: &CStr, flags: i32) -> io::Result<CaptureStat> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
     if !UNAVAILABLE.load(Ordering::Relaxed) {
@@ -121,7 +179,7 @@ fn stat_with_mount(
                 base,
                 name.as_ptr(),
                 flags | libc::AT_SYMLINK_NOFOLLOW,
-                libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+                libc::STATX_BASIC_STATS | libc::STATX_MNT_ID | libc::STATX_BTIME,
                 &mut sx,
             )
         };
@@ -146,17 +204,24 @@ fn stat_with_mount(
             st.st_ctime_nsec = sx.stx_ctime.tv_nsec.into();
             #[cfg(debug_assertions)]
             if std::env::var_os("SAQTA_TEST_NO_MOUNT_ID").is_some_and(|s| s == "1") {
-                return Ok((Some(st), None));
+                return Ok((
+                    Some(st),
+                    None,
+                    (sx.stx_mask & libc::STATX_BTIME != 0)
+                        .then_some((sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec)),
+                ));
             }
             return Ok((
                 Some(st),
                 (sx.stx_mask & libc::STATX_MNT_ID != 0).then_some(sx.stx_mnt_id),
+                (sx.stx_mask & libc::STATX_BTIME != 0)
+                    .then_some((sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec)),
             ));
         }
         if result < 0 {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
-                Some(libc::ENOENT) => return Ok((None, None)),
+                Some(libc::ENOENT) => return Ok((None, None, None)),
                 Some(libc::EPERM | libc::ENOSYS) => UNAVAILABLE.store(true, Ordering::Relaxed),
                 Some(libc::EOPNOTSUPP | libc::EINVAL) => {}
                 _ => return Err(error),
@@ -169,7 +234,7 @@ fn stat_with_mount(
     } else {
         stat_at(base, name)?
     };
-    Ok((stat, None))
+    Ok((stat, None, None))
 }
 pub fn fs_type(fd: i32) -> io::Result<i64> {
     // SAFETY: zeroed statfs is valid output storage.

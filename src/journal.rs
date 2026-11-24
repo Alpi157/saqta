@@ -27,6 +27,13 @@ pub fn now() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 pub fn encode(bytes: &[u8]) -> String {
+    if bytes
+        .iter()
+        .all(|&byte| (b' '..=b'~').contains(&byte) && byte != b'%')
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        return text.to_owned();
+    }
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
         if (b' '..=b'~').contains(&b) && b != b'%' {
@@ -153,6 +160,18 @@ pub fn state(p: &Path) -> io::Result<Option<State>> {
 pub fn state_at(base: i32, name: &std::ffi::CStr) -> io::Result<Option<State>> {
     sys::stat_at(base, name).map(|s| s.as_ref().map(|s| State::at(base, name, s)))
 }
+pub fn capture_state_at(base: i32, name: &std::ffi::CStr) -> io::Result<Option<State>> {
+    let (stat, _, birth) = sys::stat_capture_at(base, name)?;
+    Ok(stat.as_ref().map(|stat| {
+        let mut state = State::from_stat(stat);
+        state.incarnation = sys::Incarnation::captured(base, name, stat, birth);
+        state
+    }))
+}
+pub fn capture_state(path: &Path) -> io::Result<Option<State>> {
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    capture_state_at(libc::AT_FDCWD, &name)
+}
 fn snapshot_state(root: i32, p: &Path) -> io::Result<Option<State>> {
     let parent = p
         .parent()
@@ -183,7 +202,7 @@ fn snapshot_state(root: i32, p: &Path) -> io::Result<Option<State>> {
             .as_bytes(),
     )
     .map_err(io::Error::other)?;
-    state_at(fd.as_raw_fd(), &name)
+    capture_state_at(fd.as_raw_fd(), &name)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Meta {
@@ -202,6 +221,8 @@ pub struct Detail {
     pub before2: Option<State>,
     pub kept: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub git: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -301,6 +322,7 @@ pub struct Journal {
     seq: u64,
     debug_fd: i32,
     notifications: Option<File>,
+    pin_markers: BTreeMap<String, State>,
 }
 impl Journal {
     pub fn start(home: PathBuf, args: &[OsString], cwd: &Path, debug_fd: i32) -> io::Result<Self> {
@@ -389,6 +411,7 @@ impl Journal {
             .and_then(Result::ok);
         Ok(Self {
             notifications,
+            pin_markers: BTreeMap::new(),
             home,
             folder,
             quarantine,
@@ -415,6 +438,7 @@ impl Journal {
             }
         }
         Ok(Self {
+            pin_markers: read_json_optional(&folder.join("inode-pins.json"))?.unwrap_or_default(),
             quarantine: home.join("q/main").join(id.to_string()),
             home,
             meta,
@@ -473,6 +497,12 @@ impl Journal {
         self.prepare_effect(&mut e)?;
         write_once(&self.effects, e.line()?.as_bytes())?;
         Ok(e.seq)
+    }
+    pub fn record_pin(&mut self, name: &str, state: State) -> io::Result<()> {
+        self.pin_markers.insert(name.to_owned(), state);
+        // Publish the original incarnation before replacing its last quarantine
+        // hard link. Atomic replacement preserves the process-crash guarantee.
+        json_write(&self.folder.join("inode-pins.json"), &self.pin_markers)
     }
     pub fn append_batch(&mut self, mut effects: Vec<Effect>) -> io::Result<Vec<u64>> {
         if effects.len() == 1 {
@@ -613,7 +643,7 @@ pub fn process_live(pid: i32) -> bool {
         })
         .is_some_and(|s| s != b'Z' && s != b'X')
 }
-pub fn read_effects(folder: &Path) -> Result<Vec<Effect>> {
+fn read_raw_effects(folder: &Path) -> Result<Vec<Effect>> {
     let text = match fs::read_to_string(folder.join("effects.log")) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -639,6 +669,91 @@ pub fn read_effects(folder: &Path) -> Result<Vec<Effect>> {
     text.lines()
         .map(|line| Effect::parse(line, &folder.join("effects.log")))
         .collect()
+}
+fn complete_pins(folder: &Path, effects: &mut [Effect]) -> Result<()> {
+    let marker_file = folder.join("inode-pins.json");
+    let mut markers: BTreeMap<String, State> =
+        read_json_optional(&marker_file)?.unwrap_or_default();
+    let id = folder
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing command id"))?;
+    let home = folder
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("missing store parent"))?;
+    for effect in effects.iter_mut().filter(|effect| effect.note.pinned) {
+        let name = Path::new(&effect.quarantine);
+        if name.components().count() != 1 || name.file_name().is_none() {
+            bail!(
+                "{}: invalid quarantine pin name; kept both versions",
+                display(&folder.join("effects.log"))
+            );
+        }
+        let before = effect
+            .note
+            .before
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing pinned state"))?;
+        if !markers.contains_key(&effect.quarantine) {
+            let path = home.join("q/main").join(id).join(&effect.quarantine);
+            let current = state(&path)?.ok_or_else(|| {
+                io::Error::other(format!(
+                    "missing retained inode {}; kept both versions",
+                    display(&path)
+                ))
+            })?;
+            if current.dev != before.dev
+                || current.ino != before.ino
+                || before.incarnation.birth.is_some()
+                    && before.incarnation.birth != current.incarnation.birth
+            {
+                bail!(
+                    "retained inode changed at {}; kept both versions",
+                    display(&path)
+                );
+            }
+            let mut original = before.clone();
+            original.incarnation = current.incarnation;
+            markers.insert(effect.quarantine.clone(), original);
+        }
+        let original = markers
+            .get(&effect.quarantine)
+            .ok_or_else(|| io::Error::other("missing completed pin marker"))?;
+        if original.dev != before.dev
+            || original.ino != before.ino
+            || before.incarnation.birth.is_some()
+                && before.incarnation.birth != original.incarnation.birth
+        {
+            bail!(
+                "{}: contradictory retained inode marker; kept both versions",
+                display(&marker_file)
+            );
+        }
+        before.incarnation = original.incarnation;
+    }
+    Ok(())
+}
+pub fn persist_pins(folder: &Path, effects: &[Effect]) -> io::Result<()> {
+    let file = folder.join("inode-pins.json");
+    let mut markers: BTreeMap<String, State> = read_json_optional(&file)?.unwrap_or_default();
+    let mut changed = false;
+    for effect in effects.iter().filter(|effect| effect.note.pinned) {
+        if let Some(state) = &effect.note.before
+            && markers.get(&effect.quarantine) != Some(state)
+        {
+            markers.insert(effect.quarantine.clone(), state.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        synced_json_write(&file, &markers)?;
+    }
+    Ok(())
+}
+pub fn read_effects(folder: &Path) -> Result<Vec<Effect>> {
+    let mut effects = read_raw_effects(folder)?;
+    complete_pins(folder, &mut effects)?;
+    Ok(effects)
 }
 #[derive(Serialize, Deserialize)]
 struct TailRecovery {
@@ -676,7 +791,7 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
     if let Some(child) = read_json_optional(&folder.join("child"))? {
         meta.child = child;
     }
-    let mut effects = match read_effects(&folder) {
+    let mut effects = match read_raw_effects(&folder) {
         Ok(effects) => effects,
         Err(_)
             if !folder.join("end").exists()
@@ -689,6 +804,7 @@ pub fn load(home: &Path, id: u64) -> Result<Record> {
         }
         Err(e) => return Err(e),
     };
+    complete_pins(&folder, &mut effects)?;
     let expired = crate::gc::expired(&folder)?;
     for e in &mut effects {
         if expired.contains(&e.quarantine) {
@@ -831,6 +947,7 @@ fn source_stamp(folder: &Path, hold: &Path) -> io::Result<Vec<u8>> {
         "error",
         "expired.json",
         "tail-recovery.json",
+        "inode-pins.json",
     ]
     .into_iter()
     .map(|name| folder.join(name))
@@ -1136,6 +1253,7 @@ mod tests {
         first.incarnation = sys::Incarnation {
             birth: Some((10, 20)),
             generation: Some(0),
+            unverified: false,
         };
         let mut alias = first.clone();
         alias.size = 100;

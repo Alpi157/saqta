@@ -39,6 +39,7 @@ fn inspection_and_undo_json_errors_identify_the_source_file() {
         (&["show", "1"], "cmd/1/end"),
         (&["show", "1"], "cmd/1/outcomes-positive.json"),
         (&["show", "1"], "cmd/1/expired.json"),
+        (&["show", "1"], "cmd/1/inode-pins.json"),
         (&["show", "1"], "cmd/1/tail-recovery.json"),
         (&["undo", "1"], "cmd/1/post.log"),
         (&["undo", "1"], "cmd/1/recovered-post.json"),

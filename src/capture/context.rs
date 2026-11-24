@@ -192,7 +192,7 @@ impl NotificationResolver {
                 let fd = &base.fd;
                 let parent = &base.stat;
                 let name = cstr(OsStr::from_bytes(bytes))?;
-                let (stat, mount) = sys::stat_mount_at(fd.as_raw_fd(), &name)?;
+                let (stat, mount, birth) = sys::stat_capture_at(fd.as_raw_fd(), &name)?;
                 if !follow
                     || !stat
                         .as_ref()
@@ -217,7 +217,8 @@ impl NotificationResolver {
                             Vec::new()
                         },
                         parent_dev: parent.st_dev,
-                        incarnation: std::cell::OnceCell::new(),
+                        birth,
+                        incarnation: std::cell::Cell::new(None),
                     });
                 }
             }
@@ -268,7 +269,7 @@ fn resolve_from(
     let parent = sys::open_target_parent(root.fd.as_raw_fd(), &cstr(parent_path.as_os_str())?)?;
     let requested = base_path.join(OsStr::from_bytes(raw));
     let name = cstr(OsStr::from_bytes(last))?;
-    let (stat, mount) = sys::stat_mount_at(parent.as_raw_fd(), &name)?;
+    let (stat, mount, birth) = sys::stat_capture_at(parent.as_raw_fd(), &name)?;
     let mut canonical = fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))?;
     let (parent_stat, parent_mount) = sys::stat_mount_fd(parent.as_raw_fd())?;
     if parent_stat.st_nlink == 0 {
@@ -285,7 +286,8 @@ fn resolve_from(
         stat,
         requests: vec![requested],
         parent_dev: parent_stat.st_dev,
-        incarnation: std::cell::OnceCell::new(),
+        birth,
+        incarnation: std::cell::Cell::new(None),
     };
     if follow
         && result
