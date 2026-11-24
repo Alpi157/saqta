@@ -217,6 +217,7 @@ impl NotificationResolver {
                             Vec::new()
                         },
                         parent_dev: parent.st_dev,
+                        incarnation: std::cell::OnceCell::new(),
                     });
                 }
             }
@@ -284,6 +285,7 @@ fn resolve_from(
         stat,
         requests: vec![requested],
         parent_dev: parent_stat.st_dev,
+        incarnation: std::cell::OnceCell::new(),
     };
     if follow
         && result

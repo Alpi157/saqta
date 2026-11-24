@@ -66,10 +66,18 @@ pub struct Resolved {
     requests: Vec<PathBuf>,
     parent_dev: u64,
     mount: Option<u64>,
+    incarnation: std::cell::OnceCell<sys::Incarnation>,
 }
 impl Resolved {
     pub fn state(&self) -> Option<State> {
-        self.stat.as_ref().map(State::from_stat)
+        self.stat.as_ref().map(|s| {
+            let mut state = State::from_stat(s);
+            state.incarnation = self
+                .incarnation
+                .get_or_init(|| sys::incarnation_at(self.parent.as_raw_fd(), &self.name, s))
+                .clone();
+            state
+        })
     }
     fn proc_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd()))
@@ -204,11 +212,9 @@ impl Entry {
         let Some(parent) = &self.parent else {
             return journal::state(path).ok().flatten();
         };
-        sys::stat_at(parent.as_raw_fd(), &self.name)
+        journal::state_at(parent.as_raw_fd(), &self.name)
             .ok()
             .flatten()
-            .as_ref()
-            .map(State::from_stat)
     }
 }
 enum Destruction {
@@ -981,7 +987,10 @@ impl Capture {
             // A new name can still share a pre-command inode after its recorded
             // origin was removed. Retain and repair it before dropping that name.
         }
-        if deduplicate && let Some((q, original)) = self.copied.get(&key) {
+        if deduplicate
+            && let Some((q, original)) = self.copied.get(&key)
+            && original.same_inode(&st)
+        {
             e.quarantine = q.clone();
             e.note.before = Some(original.clone());
             e.note.kept = "copy (same inode)".into();

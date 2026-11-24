@@ -116,6 +116,8 @@ pub struct State {
     pub size: i64,
     pub mtime: i64,
     pub mtime_ns: i64,
+    #[serde(default)]
+    pub incarnation: sys::Incarnation,
 }
 impl State {
     pub fn from_stat(s: &libc::stat) -> Self {
@@ -126,18 +128,30 @@ impl State {
             size: s.st_size,
             mtime: s.st_mtime,
             mtime_ns: s.st_mtime_nsec,
+            incarnation: sys::Incarnation::default(),
         }
     }
     pub fn directory(&self) -> bool {
         self.mode & libc::S_IFMT == libc::S_IFDIR
     }
     pub fn same_inode(&self, other: &Self) -> bool {
-        self.dev == other.dev && self.ino == other.ino
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.incarnation.available()
+            && self.incarnation == other.incarnation
+    }
+    pub fn at(base: i32, name: &std::ffi::CStr, s: &libc::stat) -> Self {
+        let mut state = Self::from_stat(s);
+        state.incarnation = sys::incarnation_at(base, name, s);
+        state
     }
 }
 pub fn state(p: &Path) -> io::Result<Option<State>> {
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other)?;
-    sys::stat_at(libc::AT_FDCWD, &c).map(|s| s.as_ref().map(State::from_stat))
+    state_at(libc::AT_FDCWD, &c)
+}
+pub fn state_at(base: i32, name: &std::ffi::CStr) -> io::Result<Option<State>> {
+    sys::stat_at(base, name).map(|s| s.as_ref().map(|s| State::at(base, name, s)))
 }
 fn snapshot_state(root: i32, p: &Path) -> io::Result<Option<State>> {
     let parent = p
@@ -169,7 +183,7 @@ fn snapshot_state(root: i32, p: &Path) -> io::Result<Option<State>> {
             .as_bytes(),
     )
     .map_err(io::Error::other)?;
-    sys::stat_at(fd.as_raw_fd(), &name).map(|s| s.as_ref().map(State::from_stat))
+    state_at(fd.as_raw_fd(), &name)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Meta {
@@ -1113,6 +1127,32 @@ pub fn show(id: u64, json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incarnation_identity_requires_all_markers_and_ignores_written_metadata() {
+        let legacy =
+            serde_json::json!({"mode":33188,"dev":1,"ino":2,"size":3,"mtime":4,"mtime_ns":5});
+        let mut first: State = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(!first.same_inode(&first));
+        first.incarnation = sys::Incarnation {
+            birth: Some((10, 20)),
+            generation: Some(0),
+        };
+        let mut alias = first.clone();
+        alias.size = 100;
+        alias.mtime = 200;
+        alias.mtime_ns = 300;
+        assert!(first.same_inode(&alias));
+        alias.incarnation.generation = Some(1);
+        assert!(!first.same_inode(&alias));
+        alias.incarnation.generation = Some(0);
+        alias.incarnation.birth = Some((10, 21));
+        assert!(!first.same_inode(&alias));
+        alias.incarnation.birth = None;
+        assert!(!first.same_inode(&alias));
+        first.incarnation.birth = None;
+        assert!(first.same_inode(&alias));
+        assert!(!first.same_inode(&serde_json::from_value(legacy).unwrap()));
+    }
     #[test]
     fn every_path_byte_round_trips() {
         let bytes: Vec<u8> = (1..=255).collect();

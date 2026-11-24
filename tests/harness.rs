@@ -93,6 +93,7 @@ fn check_sequence(ops: Vec<Op>, splits: usize) {
     }
     for (i, id) in ids.into_iter().enumerate().rev() {
         assert_success(&undo(&s, id));
+        assert_recovery_data_only(&s);
         assert_tree(&snapshots[i], &root);
     }
 }
@@ -124,6 +125,7 @@ fn check_interrupted(ops: Vec<Op>, stop: usize) -> usize {
     .unwrap();
     let baseline = execute(&s, &root, vec![ops.clone()]);
     assert_success(&undo(&s, baseline));
+    assert_recovery_data_only(&s);
     assert_tree(&before, &root);
     let uninterrupted = tree_hash(&root);
     let mut all = versions(&root);
@@ -132,6 +134,7 @@ fn check_interrupted(ops: Vec<Op>, stop: usize) -> usize {
     let mut c = s.saqta(&["undo", &id.to_string()]);
     c.env("SAQTA_TEST_ABORT_AFTER", stop.to_string());
     let result = run(c);
+    assert_recovery_data_only(&s);
     assert!(
         result.status.success() || result.status.code() == Some(86),
         "unexpected undo failure: {}",
@@ -155,6 +158,7 @@ fn check_interrupted(ops: Vec<Op>, stop: usize) -> usize {
     }
     if !result.status.success() {
         assert_success(&run(s.saqta(&["undo", &id.to_string(), "--resume"])));
+        assert_recovery_data_only(&s);
     }
     assert_tree(&uninterrupted, &root);
     let folder = fs::read_dir(home.join("q/main"))
@@ -192,6 +196,7 @@ fn check_parallel(processes: Vec<Vec<Op>>) {
     let before = tree_hash(&root);
     let id = execute(&s, &root, processes);
     assert_success(&undo(&s, id));
+    assert_recovery_data_only(&s);
     assert_tree(&before, &root);
 }
 
@@ -203,6 +208,16 @@ fn undo_exchange_after_later_undos_repair_a_child_alias() {
     ops.extend((0..5).map(|_| op(0, 0, 0)));
     ops.push(op(1, 17, 0));
     check_sequence(ops, 3);
+}
+
+#[test]
+fn alias_preflight_accepts_names_moved_by_a_directory_exchange() {
+    check_interrupted(vec![op(8, 2, 1), op(1, 8, 0)], 1);
+}
+
+#[test]
+fn alias_observations_follow_an_intervening_directory_undo() {
+    check_sequence(vec![op(1, 8, 0), op(8, 0, 2), op(1, 7, 0)], 3);
 }
 
 #[test]
@@ -805,6 +820,7 @@ fn syscall_helper_exercises_creation_and_write_through_symlink() {
     );
     assert!(root.join("d5/f0").is_file());
     assert_success(&undo(&s, id));
+    assert_recovery_data_only(&s);
     assert_tree(&before, &root);
 }
 
@@ -885,6 +901,7 @@ fn preserved_created_hard_link_is_immutable_after_later_write() {
     seed(&root);
     let id = execute(&s, &root, vec![vec![op(12, 6, 16)]]);
     assert_success(&undo(&s, id));
+    assert_recovery_data_only(&s);
     let mut write = op(1, 6, 0);
     write.data = b"later write".to_vec();
     execute(&s, &root, vec![vec![write]]);
